@@ -2,6 +2,8 @@
 
 A **DSH-powered code generator** that turns a rigged 3D mesh (`.glb`) into a **per-joint animation controller** you can drop into a `three.js` scene. It discovers the controllable joints (rotors, gimbals, hinges) at *maximal scope*, drafts a language-neutral motion spec, asks an AI agent (via the **DeepSeek Harness, DSH**) to emit controller code, then **deterministically validates** it in a headless `three.js` harness and behind a **live 3D visual gate**.
 
+![Mesh Controller Codegen web app — live 3D mesh viewer (left), data-driven joint controls (middle), and the AI assistant (right).](docs/images/app-shell.png)
+
 The tool ships two front-ends over **one shared pipeline**:
 
 - a **CLI** ([`src/cli.mjs`](src/cli.mjs)) for one-shot generation, and

@@ -1,7 +1,7 @@
 {
   "_comment": "Copy to config.json and fill in api_key. config.json is gitignored. Paths are relative to the repo root.",
   "api_key": "",
-  "model": "qwen3.7-max",
+  "model": "qwen3.8-max",
   "bailian_base_url": "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
   "paths": {
     "dsh_bin": "runtime/node_modules/.bin/dsh",
