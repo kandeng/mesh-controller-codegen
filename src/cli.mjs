@@ -10,7 +10,7 @@
 //     --out <file>          copy the accepted controller here
 //     --lang <id>           javascript (default) | python | csharp  (py/cs are stubs)
 //     --model <id>          Bailian model id (default from config.json)
-//     --rounds <n>          max repair rounds (default 3)
+//     --rounds <n>          max repair rounds (default 1)
 //     --gate <mode>         interactive (default) | auto
 //     --port <n>            viewer http port (default from config.json)
 //     --config <file>       config path (default <repo>/config.json)
@@ -48,7 +48,7 @@ const LANG = LANG_ALIAS[(opt('lang', 'javascript') || '').toLowerCase()] || 'jav
 const CONTROLLER_ARG = opt('controller', null);
 const OUT = opt('out', null);
 const MODEL = opt('model', null);
-const ROUNDS = parseInt(opt('rounds', '3'), 10);
+const ROUNDS = parseInt(opt('rounds', '1'), 10);
 const GATE = opt('gate', 'interactive');
 const PORT = parseInt(opt('port', '0'), 10);
 const VERBOSE = flag('verbose');

@@ -42,7 +42,7 @@ if (rotor) {
   const g = (await jget(`/api/joints/${encodeURIComponent(rotor.id)}/slots`)).graph;
   const renders = (g?.knobs || []).map((k) => k.render).sort().join(',');
   const overlays = (g?.overlays || []).map((o) => o.render).join(',');
-  ok('rotor slot graph', renders === 'rpm-readout,speed-slider,turn-segment', `knobs=[${renders}] overlays=[${overlays}]`);
+  ok('rotor slot graph', renders === 'speed-slider,turn-toggle', `knobs=[${renders}] overlays=[${overlays}]`);
   const speed = (g?.knobs || []).find((k) => k.render === 'speed-slider');
   ok('  speed-slider bound to axis w/ range', speed?.axis === 'speed' && typeof speed.max === 'number', `axis=${speed?.axis} max=${speed?.max} step=${speed?.step}`);
 }

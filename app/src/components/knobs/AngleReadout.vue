@@ -1,6 +1,6 @@
 <script setup>
 // Angle readout — derived (bind:'readout'). Shows the live gimbal pitch/yaw the
-// viewer bridge publishes from controller.getState().gimbal.
+// viewer's isolated single-joint preview publishes for the active joint.
 import { computed } from 'vue';
 import { useProjectStore } from '../../composables/useProjectStore.js';
 

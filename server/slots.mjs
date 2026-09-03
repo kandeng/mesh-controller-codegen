@@ -56,8 +56,7 @@ export function resolveSlotGraph(kernel, joint) {
 // any joint-type plugin can emit. Kept here so backend + frontend stay in sync.
 export const KNOWN_RENDERS = Object.freeze({
   'speed-slider': { component: 'SpeedSlider', bind: 'command', control: 'setSpeed' },
-  'turn-segment': { component: 'TurnSegment', bind: 'command', control: 'turn' },
-  'rpm-readout': { component: 'RpmReadout', bind: 'readout' },
+  'turn-toggle': { component: 'TurnToggle', bind: 'command', control: 'turn' },
   'pitch-slider': { component: 'PitchSlider', bind: 'command', control: 'gimbalPitch' },
   'yaw-slider': { component: 'YawSlider', bind: 'command', control: 'gimbalYaw' },
   'angle-slider': { component: 'AngleSlider', bind: 'command', control: 'angle' },

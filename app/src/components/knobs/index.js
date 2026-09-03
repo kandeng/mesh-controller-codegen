@@ -1,9 +1,8 @@
 // Renderer registry — maps every render id the backend Slot Routing Graph can
 // emit (see server/slots.mjs KNOWN_RENDERS) to a Vue component. The *-slider ids
-// all route to the one data-driven KnobSlider; segment/readouts are distinct.
+// all route to the one data-driven KnobSlider; toggle/readouts are distinct.
 import KnobSlider from './KnobSlider.vue';
-import TurnSegment from './TurnSegment.vue';
-import RpmReadout from './RpmReadout.vue';
+import TurnToggle from './TurnToggle.vue';
 import AngleReadout from './AngleReadout.vue';
 
 export const KNOB_COMPONENTS = {
@@ -12,8 +11,7 @@ export const KNOB_COMPONENTS = {
   'yaw-slider': KnobSlider,
   'angle-slider': KnobSlider,
   'value-slider': KnobSlider,
-  'turn-segment': TurnSegment,
-  'rpm-readout': RpmReadout,
+  'turn-toggle': TurnToggle,
   'angle-readout': AngleReadout,
 };
 

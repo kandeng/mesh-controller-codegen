@@ -1,7 +1,8 @@
 <script setup>
-// Three-position turn control bound to the 'turn' command axis (-1 / 0 / +1).
-// Maps onto the controller's turnLeft / goStraight / turnRight methods via the
-// viewer bridge (which reads store.knobValues.turn).
+// Two-position spin-DIRECTION toggle bound to the 'turn' command axis.
+// -1 = Counter ClockWise, +1 = ClockWise (no neutral / straight state).
+// The viewer preview reads store.knobValues.turn to pick the spin direction
+// of the single active joint.
 import { computed } from 'vue';
 import { useProjectStore } from '../../composables/useProjectStore.js';
 
@@ -9,17 +10,15 @@ const props = defineProps({ knob: { type: Object, required: true } });
 const { state, setKnob } = useProjectStore();
 
 const axis = computed(() => props.knob.axis || 'turn');
-const current = computed(() => Number(state.knobValues[axis.value] ?? 0));
-const pick = (v) => setKnob(axis.value, v);
+const current = computed(() => Number(state.knobValues[axis.value] ?? 1));
 </script>
 
 <template>
   <div class="knob">
     <label><span>{{ knob.label || 'Turn' }}</span></label>
     <div class="seg">
-      <button :class="{ active: current < 0 }" @click="pick(-1)">&#10226; Left</button>
-      <button :class="{ active: current === 0 }" @click="pick(0)">Straight</button>
-      <button :class="{ active: current > 0 }" @click="pick(1)">Right &#10227;</button>
+      <button :class="{ active: current < 0 }" @click="setKnob(axis, -1)">&#8634; Counter ClockWise</button>
+      <button :class="{ active: current > 0 }" @click="setKnob(axis, 1)">ClockWise &#8635;</button>
     </div>
   </div>
 </template>

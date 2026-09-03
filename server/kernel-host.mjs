@@ -84,7 +84,7 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
     },
 
     // Bounded generate->validate loop (DSH). onRound streams to the caller.
-    async generate({ lang = 'javascript', model = null, rounds = 3, onRound = null } = {}) {
+    async generate({ lang = 'javascript', model = null, rounds = 1, onRound = null } = {}) {
       if (!current.glb) throw new Error('no project loaded; POST /api/project first');
       const gen = await generateController(host, {
         glbPath: current.glbPath, glb: current.glb, dump: current.dump,

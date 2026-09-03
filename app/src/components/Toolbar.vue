@@ -15,7 +15,6 @@ const { selectJoint } = useSlotRouting();
 const glbPath = ref('samples/drone_dji_inspire3.glb');
 const controllerPath = ref('drone-controller.js');
 const lang = ref('javascript');
-const rounds = ref(3);
 const note = ref('');
 
 async function loadMesh() {
@@ -50,7 +49,7 @@ async function validate() {
 async function generate() {
   state.busy = true; state.error = null; note.value = 'generating via DSH (this can take minutes)…';
   try {
-    const r = await api.generate({ lang: lang.value, rounds: Number(rounds.value) });
+    const r = await api.generate({ lang: lang.value });
     if (!r.ok) throw new Error(r.error || 'generate failed');
     state.validation = { pass: r.accepted, failures: r.failures, warnings: r.warnings, metrics: r.metrics };
     state.viewer = r.viewer;
@@ -76,7 +75,6 @@ async function generate() {
         <option value="python" disabled>python (M2)</option>
         <option value="csharp" disabled>csharp (M2)</option>
       </select>
-      <input v-model="rounds" type="number" min="1" max="6" class="rounds" :disabled="state.busy" />
       <button class="gen" @click="generate" :disabled="state.busy || !state.loaded">Generate (DSH)</button>
     </div>
 
@@ -98,7 +96,6 @@ input, select {
   padding: 7px 9px; font-size: 12px; font-family: ui-monospace, monospace;
 }
 input:focus, select:focus { outline: none; border-color: var(--border-accent); }
-.rounds { width: 52px; }
 button {
   background: var(--panel-2); border: 1px solid var(--border-accent); border-radius: 7px; color: var(--text-btn);
   padding: 7px 12px; cursor: pointer; font-size: 12px; white-space: nowrap;

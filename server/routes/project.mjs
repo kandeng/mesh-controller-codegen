@@ -10,6 +10,7 @@ function jointSummary(j) {
     type: j.type,
     status: j.status || 'candidate',
     nodeCount: (j.nodes || []).length,
+    nodes: j.nodes || [],   // node names: the viewer preview rotates exactly these
     anchor: j.anchor,
     axis: j.axis,
     commands: (j.commands || []).map((c) => ({ name: c.name, kind: c.kind, min: c.min, max: c.max, step: c.step, unit: c.unit, default: c.default })),
@@ -48,10 +49,11 @@ export function projectRoutes(app, kernel) {
     }
   });
 
-  // Generate a controller via the DSH bridge (bounded repair loop). Round
-  // progress is broadcast over the events WS as it happens.
+  // Generate a controller via the DSH bridge. Always a SINGLE emit→validate
+  // pass (rounds fixed at 1); round progress is broadcast over the events WS.
   app.post('/api/generate', async (req, reply) => {
-    const { lang = 'javascript', model = null, rounds = 3 } = req.body || {};
+    const { lang = 'javascript', model = null } = req.body || {};
+    const rounds = 1;
     try {
       const gen = await kernel.generate({
         lang, model, rounds,

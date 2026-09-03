@@ -27,7 +27,8 @@ export function speedAxis(over = {}) {
   return { name: 'speed', kind: 'scalar', min: 0, max: 10, step: 0.1, unit: 'normalized', default: 0, stopAt: 0, ...over };
 }
 export function turnAxis(over = {}) {
-  return { name: 'turn', kind: 'scalar', min: -1, max: 1, step: 0.05, unit: 'normalized', default: 0, stopAt: 0, ...over };
+  // Spin DIRECTION toggle: -1 = counter-clockwise, +1 = clockwise (no neutral).
+  return { name: 'turn', kind: 'scalar', min: -1, max: 1, step: 2, unit: 'direction', default: 1, stopAt: 0, ...over };
 }
 export function angleAxis(name, min, max, dflt, over = {}) {
   return { name, kind: 'angle', min, max, step: 0.5, unit: 'degrees', default: dflt, ...over };

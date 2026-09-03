@@ -79,7 +79,7 @@ export async function validateController(host, file, { glb, THREE }) {
 export async function generateController(host, opts) {
   const {
     glbPath, glb, dump, runDir,
-    lang = 'javascript', model = null, rounds = 3,
+    lang = 'javascript', model = null, rounds = 1,
     THREE: THREE_IN = null, onRound = null,
   } = opts;
 

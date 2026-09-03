@@ -16,8 +16,7 @@ const state = reactive({
   activeJointId: null,
   slotGraph: null,        // resolved { knobs, overlays } for the active joint
   knobValues: {},         // command axis -> value (speed, turn, pitch, yaw, angle)
-  readouts: {},           // derived source -> value (rpm, speed, angle)
-  props: [],              // per-propeller { name, rpm } from controller.getState()
+  readouts: {},           // derived source -> value (speed, angle, lastValidate)
   gimbal: { pitch: 0, yaw: 0 },
   validation: null,
   viewer: { glb: null, ctl: null },

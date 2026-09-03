@@ -115,7 +115,7 @@ The **9th primitive** — deferred from the CLI phase and consumed by the web ap
 - `contributes.slots` — **which** renderers a joint type wants (render ids → Vue components), and
 - `api.knobs(joint)` — the **data** for each command axis (`min / max / step / unit / default`).
 
-It routes each declared slot to its bound command axis, marks derived `*-readout` slots and non-knob `viewer-overlay` slots, and — for completeness — **fills in a default renderer** for any command axis the plugin forgot to declare (`angle → angle-slider`, otherwise `value-slider`). `KNOWN_RENDERS` is the backend↔frontend contract listing every render id a joint type may emit (`speed-slider`, `turn-segment`, `rpm-readout`, `pitch-slider`, `yaw-slider`, `angle-slider`, `angle-readout`, `value-slider`, `spin-axis`). Served at `GET /api/joints/:id/slots`.
+It routes each declared slot to its bound command axis, marks derived `*-readout` slots and non-knob `viewer-overlay` slots, and — for completeness — **fills in a default renderer** for any command axis the plugin forgot to declare (`angle → angle-slider`, otherwise `value-slider`). `KNOWN_RENDERS` is the backend↔frontend contract listing every render id a joint type may emit (`speed-slider`, `turn-toggle`, `pitch-slider`, `yaw-slider`, `angle-slider`, `angle-readout`, `value-slider`, `spin-axis`). Served at `GET /api/joints/:id/slots`.
 
 #### 7. Thread Pool / RPC
 
@@ -148,7 +148,7 @@ repairWithNotes     one human-note-driven repair round (interactive gate)
 finalizeRun         persist context + write report.json
 ```
 
-Validation is tiered: **Tier-0** (static/structural) then **Tier-1** (behavioral — load the controller in headless `three.js`, tick scenarios, assert the contract). Generation is a bounded loop (default 3 rounds) that feeds failures back to the emitter.
+Validation is tiered: **Tier-0** (static/structural) then **Tier-1** (behavioral — load the controller in headless `three.js`, tick scenarios, assert the contract). Generation is a single emit→validate pass (rounds fixed at 1).
 
 ### Plugin set
 
@@ -223,7 +223,7 @@ node src/cli.mjs <glb> [options]
 | `--out <file>` | — | Copy the accepted controller here. |
 | `--lang <id>` | `javascript` | `javascript` \| `python` \| `csharp` (py/cs are stubs). |
 | `--model <id>` | from config | Bailian model id. |
-| `--rounds <n>` | `3` | Max repair rounds. |
+| `--rounds <n>` | `1` | Max repair rounds (single pass by default). |
 | `--gate <mode>` | `interactive` | `interactive` (opens the live 3D viewer + prompts) \| `auto`. |
 | `--port <n>` | from config | Viewer HTTP port. |
 | `--config <file>` | `<repo>/config.json` | Config path. |
@@ -232,7 +232,7 @@ node src/cli.mjs <glb> [options]
 **Generate a controller** (interactive visual gate):
 
 ```bash
-node src/cli.mjs samples/drone_dji_inspire3.glb --lang javascript --rounds 3
+node src/cli.mjs samples/drone_dji_inspire3.glb --lang javascript
 ```
 
 **Validate-only + auto gate** (the bundled smoke test):
@@ -277,7 +277,7 @@ npm run prove:shell -- http://127.0.0.1:8788
 | `GET /api/state` | Current server-side project state (for load/resume). |
 | `POST /api/project` `{ glb }` | Register asset + discover joints. |
 | `POST /api/validate` `{ file }` | Validate a controller against the loaded mesh. |
-| `POST /api/generate` `{ lang, model, rounds }` | Bounded generate→validate loop (streams rounds). |
+| `POST /api/generate` `{ lang, model }` | Single emit→validate generate pass (rounds fixed at 1). |
 | `GET /api/joints/:id/slots` | Slot Routing Graph for a joint. |
 | `GET /api/session/resume` | Persisted session (transcript + project pointer). |
 | `WS /api/events` | Live kernel bus events (hello + stream). |

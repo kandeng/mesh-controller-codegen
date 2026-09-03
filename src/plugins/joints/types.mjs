@@ -25,7 +25,7 @@ export const rotorJoint = definePlugin({
   version: '1.0.0',
   contributes: {
     type: JOINT_TYPE.ROTOR,
-    slots: [{ slot: 'knob', render: 'speed-slider' }, { slot: 'knob', render: 'turn-segment' }, { slot: 'knob', render: 'rpm-readout' }, { slot: 'viewer-overlay', render: 'spin-axis' }],
+    slots: [{ slot: 'knob', render: 'speed-slider' }, { slot: 'knob', render: 'turn-toggle' }, { slot: 'viewer-overlay', render: 'spin-axis' }],
   },
   api: {
     type: JOINT_TYPE.ROTOR,
