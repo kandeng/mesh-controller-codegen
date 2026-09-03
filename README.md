@@ -123,7 +123,7 @@ Work that must run in a **separate execution context** crosses a bridge, and eve
 
 - **DSH bridge** ([`src/bridges/dsh-bridge.mjs`](src/bridges/dsh-bridge.mjs)) — the invisible-agent boundary. It `spawn`s `dsh --profile headless --patch bailian.patch.yml [model.patch.yml] <task>` with `cwd = runDir` and `BAILIAN_API_KEY` injected into the child env, streams stdout/stderr to `dsh.log`, and enforces a `dshTimeoutMs` kill timer. The child is tracked via `resources.trackChild(child, 'dsh')`. In the app phase the same plugin slot becomes a **persistent JSON-RPC session**.
 - **Kinematic bridges** ([`src/bridges/kinematic/`](src/bridges/kinematic)) — for the JS target, "verifying a controller" *is* the headless `three.js` harness (`tier1`) run in-process; the browser viewer is the live preview. Python/C# targets will stream per-node transforms into the same `tier1` assertions through their own bridges (`bridge:transformFrame`).
-- **Persistent agent supervisor** ([`server/dsh-agent.mjs`](server/dsh-agent.mjs)) — the app-phase JSON-RPC host (`dsh --profile web --port 0 --trusted-host …`), driven over `POST /api/<method>` (`session.create`, `session.prompt`, `session.history`, `session.cancel`, `session.selectModel`) with assistant/tool events streamed back over WebSocket/SSE. `session.create` is **idempotent** on a persisted `sessionId` + `cwd` — the resumability primitive. *(M1 ships a stub so the shell is testable without spending model runs; the live supervisor is M2.)*
+- **Persistent agent supervisor** ([`server/dsh-agent.mjs`](server/dsh-agent.mjs)) — the app-phase live agent: it lazily `spawn`s `dsh --profile web --port 0 --no-open --patch bailian.patch.yml [model.patch.yml] --patch web.patch.yml` (GC-tracked child, log in `runDir/dsh-web.log`), parses the port from stdout, and drives it over `POST /api/<method>` (`session.create/prompt/history/cancel/selectModel`) with live events consumed from `GET /api/events.mux` (SSE). `session.create` is **idempotent** on the persisted `sessionId` + `cwd` — the resumability primitive. Token deltas + tool-activity lines are forwarded to the chat WS; the authoritative reply is extracted from `session.history` on `turn/end`. When the dsh binary is missing or the host fails to start, the supervisor degrades to a clearly-labelled **stub** reply so the shell keeps working.
 
 #### 8. Session Garbage Collector
 
@@ -201,7 +201,8 @@ cp config.example.json config.json
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `api_key` | `""` | Bailian API key (or use `BAILIAN_API_KEY`). |
-| `model` | `qwen3.7-max` | Default model id for generation. |
+| `model` | `qwen3.8-max` | Default model id (natively multimodal: text + image). |
+| `vision_model` | `""` | Optional: routes screenshot turns to a different model; empty uses `model`. |
 | `bailian_base_url` | token-plan gateway | OpenAI-compatible endpoint. |
 | `viewer.port` | `8788` | Default port for the viewer/backend. |
 | `dsh_timeout_ms` | `900000` | Kill timer for a DSH child process. |
@@ -239,7 +240,7 @@ node src/cli.mjs samples/drone_dji_inspire3.glb --lang javascript
 
 ```bash
 npm run prove
-# = node src/cli.mjs samples/drone_dji_inspire3.glb --controller drone-controller.js --gate auto
+# = node src/cli.mjs samples/drone_dji_inspire3.glb --controller samples/drone-controller.js --gate auto
 ```
 
 When the interactive gate passes, the CLI prints a **human visual-verification checklist** and serves the live viewer at `http://127.0.0.1:<port>/viewer/viewer.html?glb=…&ctl=…`. Type `pass` to accept, or describe what's wrong to trigger a note-driven repair round.
@@ -262,6 +263,10 @@ npm run app:dev       # terminal B — Vite dev server (proxies /api to the back
 ```
 
 The shell has three draggable panes — **3D mesh viewer · control knobs · AI assistant** — with a dark/light theme toggle (persisted in browser `localStorage`). The knob panel is rendered entirely from the **Slot Graph** for the active joint.
+
+**The AI assistant is a live DSH debugging agent** (the same loop a human debugger would run): its session cwd is the run dir, pre-populated by [`server/agent-workspace.mjs`](server/agent-workspace.mjs) with an `AGENTS.md` persona and a `kernel-cli.mjs` tool belt (`validate` · `rig <jointId>` · `joints` · `state`) that calls this server's REST API. The web profile is patched to enable its bash tool; the supervisor keeps DSH's atomic `workspace-write` preset (writes sandboxed to the run dir) and auto-allows each approval request over the host's `/api/respond` channel — so the agent runs tools autonomously without ever escaping the workspace. (Overriding the approval policy alone composes a `custom` preset that aborts host boot, which is why auto-allow is done supervisor-side.) The supervisor drives the host over its verified wire contract: unary RPCs via `POST /api/<method>`, and the live event stream via the **downlink-only WebSocket** `ws://…/api/events.mux` (a plain GET returns HTTP 426). Workflow: reproduce via `validate` → inspect the rig report (`GET /api/joints/:id/rig` — node parent chains, rest world positions, rotor disc membership, and the cousin-blade warning that prevents per-node rotation) → patch `controller.js` → re-validate until tier-1 passes.
+
+**Screenshots are human-initiated**: paste from the clipboard (Ctrl+V) or upload via the 📎 button; thumbnails queue above the composer and ride along with the next message (`POST /api/agent/attach` → inline base64 image parts in `session.prompt`). The default `qwen3.8-max` is **natively multimodal (text + image)** and is declared with `input: [text, image]` in `bailian.patch.yml`, so screenshot turns work out of the box on the same model as text. (DSH under-claims text-only unless a model declares its input modalities, which is why that declaration is required — without it the host refuses the image at prompt time with `MODEL_DOES_NOT_SUPPORT_IMAGES`.) Set `vision_model` in `config.json` only to route image turns to a *different* model, which must likewise be declared with `input: [text, image]`. The chat streams token deltas and ⚙ tool lines live; transcript entries (text, attachment refs, tool summaries) persist in `sessions/latest.json` and are replayed on reload.
 
 **Backend integration test** (health, SPA serving, discovery, slot graphs, validation, resume, WebSocket events):
 
@@ -287,7 +292,7 @@ npm run prove:shell -- http://127.0.0.1:8788
 Emitted controllers are **ES modules** exporting a single factory. The test harness and viewer import exactly this shape:
 
 ```js
-import { createDroneController } from './drone-controller.js';
+import { createDroneController } from './samples/drone-controller.js';
 
 const ctl = createDroneController(gltfSceneRoot, THREE);
 
@@ -330,7 +335,6 @@ src/
 server/         Fastify backend: index · kernel-host · slots · session-store · routes/ · dsh-agent
 app/            Vue 3 + Vite shell (src/components, src/composables, style.css)
 viewer/         standalone viewer.html (live 3D gate)
-tool/           legacy gen-controller + libs
 samples/        drone_dji_inspire3.glb (demo mesh)
 runtime/        DSH runtime (its own package.json; node_modules gitignored)
 test/           verify-shell.mjs backend integration harness

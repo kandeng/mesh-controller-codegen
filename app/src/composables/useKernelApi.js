@@ -17,5 +17,6 @@ export function useKernelApi() {
     renders: () => get('/api/renders'),
     resume: () => get('/api/session/resume'),
     agentStatus: () => get('/api/agent/status'),
+    attach: (mediaType, dataBase64, name) => post('/api/agent/attach', { mediaType, dataBase64, name }),
   };
 }

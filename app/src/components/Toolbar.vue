@@ -13,7 +13,7 @@ const api = useKernelApi();
 const { selectJoint } = useSlotRouting();
 
 const glbPath = ref('samples/drone_dji_inspire3.glb');
-const controllerPath = ref('drone-controller.js');
+const controllerPath = ref('samples/drone-controller.js');
 const lang = ref('javascript');
 const note = ref('');
 

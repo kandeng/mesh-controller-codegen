@@ -6,7 +6,7 @@
 //   node test/verify-shell.mjs [baseUrl]     (default http://127.0.0.1:8788)
 const BASE = process.argv[2] || 'http://127.0.0.1:8788';
 const GLB = 'samples/drone_dji_inspire3.glb';
-const CTL = 'drone-controller.js';
+const CTL = 'samples/drone-controller.js';
 
 let pass = 0, fail = 0;
 const ok = (name, cond, extra = '') => {
@@ -64,6 +64,31 @@ ok('GET /api/state loaded', st.ok === true && st.loaded === true, `${st.joints?.
 // 7) Session resume (stable transcript pointer).
 const res = await jget('/api/session/resume');
 ok('GET /api/session/resume', res.ok === true && !!res.session, `glb=${res.session?.glb ? 'set' : 'null'} transcript=${res.session?.transcript?.length ?? 0}`);
+
+// 7b) Rig report — the assistant's deterministic rig inspector.
+if (rotor) {
+  const rig = await jget(`/api/joints/${encodeURIComponent(rotor.id)}/rig`);
+  ok('GET /api/joints/:id/rig', rig.ok === true && Array.isArray(rig.nodes) && rig.nodes.length > 0, `${rig.nodes?.length} nodes, warnings=${rig.warnings?.length ?? 0}`);
+  ok('  rig reports rotor disc geometry', rig.disc && typeof rig.disc.rotorRadius === 'number', `R=${rig.disc?.rotorRadius} extra=${rig.disc?.extraNodes?.length ?? 0} excluded=${rig.disc?.excludedFromSpin?.length ?? 0}`);
+  ok('  rig carries the runtime contract', Array.isArray(rig.contract) && rig.contract.includes('createDroneController(root, THREE)'));
+  ok('  rig always advises the anchor-pivot rule for rotors', (rig.warnings || []).some((w) => /pivot Object3D/i.test(w) && /NEVER set rotation on each node/i.test(w)), `${rig.warnings?.length ?? 0} warnings`);
+  ok('  rig lists cousin blades when present', Array.isArray(rig.cousins), `cousins=${rig.cousins?.length ?? 0}`);
+}
+
+// 7c) Attachment round-trip — screenshot intake for the assistant.
+const PNG_1PX = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+const att = await jpost('/api/agent/attach', { mediaType: 'image/png', dataBase64: PNG_1PX, name: 'probe.png' });
+ok('POST /api/agent/attach', att.ok === true && !!att.attachmentId && typeof att.url === 'string', `id=${att.attachmentId?.slice(0, 8)}… url=${att.url}`);
+if (att.ok) {
+  const back = await fetch(BASE + att.url);
+  ok('  attachment served back', back.status === 200 && (back.headers.get('content-type') || '').startsWith('image/'), `${back.headers.get('content-type')}`);
+}
+const badAtt = await jpost('/api/agent/attach', { mediaType: 'text/plain', dataBase64: PNG_1PX });
+ok('  attach rejects non-images', badAtt.ok === false);
+
+// 7d) Agent status surface (mode may be stub until the first send spawns dsh).
+const agStat = await jget('/api/agent/status');
+ok('GET /api/agent/status', agStat.ok === true && ['stub', 'live'].includes(agStat.mode) && Array.isArray(agStat.methods), `mode=${agStat.mode} session=${agStat.sessionId ?? 'none'}`);
 
 // 8) Live events WebSocket streams a hello + kernel events.
 const wsProof = await new Promise((resolve) => {

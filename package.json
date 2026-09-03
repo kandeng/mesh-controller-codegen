@@ -9,7 +9,7 @@
   },
   "scripts": {
     "gen": "node src/cli.mjs",
-    "prove": "node src/cli.mjs samples/drone_dji_inspire3.glb --controller drone-controller.js --gate auto",
+    "prove": "node src/cli.mjs samples/drone_dji_inspire3.glb --controller samples/drone-controller.js --gate auto",
     "prove:shell": "node test/verify-shell.mjs",
     "server": "node server/index.mjs",
     "app:dev": "npm --prefix app run dev",

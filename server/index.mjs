@@ -49,7 +49,7 @@ export async function startServer({ configPath = null, port = 0, verbose = false
   const disposeEvents = registerEventsSocket(app, kernel);
   projectRoutes(app, kernel);
   jointRoutes(app, kernel);
-  agentRoutes(app, kernel, agent);
+  await agentRoutes(app, kernel, agent);
 
   // Resumability + health.
   app.get('/api/session/resume', async () => ({ ok: true, session: kernel.sessionStore.get() }));

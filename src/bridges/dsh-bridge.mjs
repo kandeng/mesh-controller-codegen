@@ -23,7 +23,7 @@ export const dshBridge = definePlugin({
       const logFile = resolve(runDir, 'dsh.log');
 
       let modelPatch = null;
-      if (activeModel && activeModel !== 'qwen3.7-max') {
+      if (activeModel && activeModel !== 'qwen3.8-max') {
         modelPatch = resolve(runDir, 'model.patch.yml');
         writeFileSync(modelPatch, `- id: agent-default-model\n  config:\n    provider: bailian\n    model: ${activeModel}\n`);
       }

@@ -2,6 +2,8 @@
   "_comment": "Copy to config.json and fill in api_key. config.json is gitignored. Paths are relative to the repo root.",
   "api_key": "",
   "model": "qwen3.8-max",
+  "vision_model": "",
+  "_comment_vision_model": "Optional override for turns carrying screenshots. Leave empty to use 'model' — the default qwen3.8-max is natively multimodal (text + image) and is declared with `input: [text, image]` in bailian.patch.yml, so screenshots work out of the box. Set this ONLY to route image turns to a DIFFERENT model, which must also be declared with `input: [text, image]` there (DSH refuses images otherwise: MODEL_DOES_NOT_SUPPORT_IMAGES).",
   "bailian_base_url": "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
   "paths": {
     "dsh_bin": "runtime/node_modules/.bin/dsh",

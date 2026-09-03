@@ -23,7 +23,8 @@ export function loadConfig(explicitPath) {
   return {
     path: cfgPath,
     apiKey: raw.api_key || process.env.BAILIAN_API_KEY || '',
-    model: raw.model || 'qwen3.7-max',
+    model: raw.model || 'qwen3.8-max',
+    visionModel: raw.vision_model || '', // optional override; empty = image turns use `model` (qwen3.8-max is multimodal)
     bailianBaseUrl: raw.bailian_base_url || '',
     dshTimeoutMs: raw.dsh_timeout_ms || 900_000,
     viewerPort: raw.viewer?.port || 8788,

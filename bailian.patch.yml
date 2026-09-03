@@ -1,12 +1,12 @@
 # Overlay: point DSH at our Bailian OpenAI-compatible endpoint.
 # The API key is NOT stored here; it is read from $BAILIAN_API_KEY at runtime.
 #
-# Any model the token-plan gateway serves can be listed under `models:` below
-# (gateway catalog: qwen3.8-max-preview, qwen3.7-max, qwen3.7-plus,
-# qwen3.6-flash, glm-5.2, deepseek-v4-pro). Switch the active model by editing
-# the agent-default-model row. Kimi-K3 is NOT served by this gateway; to use it,
-# either wait for the gateway to add it (then just list the id here) or add a
-# second provider route with Moonshot's own credentials, e.g.:
+# Any model the token-plan gateway serves can be listed under `models:` below.
+# Switch the active model by editing the agent-default-model row. The default
+# qwen3.8-max is natively multimodal (text + image), so it powers both text and
+# screenshot turns. Kimi-K3 is NOT served by this gateway; to use it, either
+# wait for the gateway to add it (then just list the id here) or add a second
+# provider route with Moonshot's own credentials, e.g.:
 #
 #   moonshot:
 #     displayName: Moonshot
@@ -27,11 +27,21 @@
         defaultContextWindow: 262144
         defaultMaxTokens: 32768
         models:
+          # qwen3.8-max is natively multimodal (text + image + video upstream).
+          # DSH under-claims text-only unless a model declares its input
+          # modalities, so we list `input: [text, image]` — this is what lets the
+          # assistant READ attached screenshots. (DSH models text/image only;
+          # there is no video content part on the wire.)
           - id: qwen3.8-max
+            input: [text, image]
           - id: qwen3.8-flash
           - id: kimi-k3
           - id: glm-5.3
           - id: deepseek-v4-pro
+          # To route image turns to a DIFFERENT model, declare its image input
+          # here (e.g. `- id: qwen3-vl-plus` + `input: [text, image]`) and set
+          # "vision_model" in config.json to that id. Otherwise screenshots use
+          # the default qwen3.8-max above.
 - id: agent-default-model
   config:
     provider: bailian
