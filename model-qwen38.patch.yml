@@ -1,6 +1,0 @@
-# Optional overlay: switch the active model to qwen3.8-max-preview.
-# Use AFTER bailian.patch.yml: dsh ... --patch ../bailian.patch.yml --patch ../model-qwen38.patch.yml
-- id: agent-default-model
-  config:
-    provider: bailian
-    model: qwen3.8-max-preview
