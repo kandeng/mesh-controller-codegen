@@ -1,0 +1,23 @@
+# dependencies
+node_modules/
+runtime/node_modules/
+
+# secrets — never commit the real key
+config.json
+.env
+.env.*
+
+# generated run artifacts + runtime session state
+runs/
+sessions/
+*.log
+
+# dev dumps
+gltf.json
+nodes.txt
+
+# build output (Vue 3 phase)
+dist/
+
+# misc
+.DS_Store

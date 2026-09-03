@@ -1,0 +1,38 @@
+# Overlay: point DSH at our Bailian OpenAI-compatible endpoint.
+# The API key is NOT stored here; it is read from $BAILIAN_API_KEY at runtime.
+#
+# Any model the token-plan gateway serves can be listed under `models:` below
+# (gateway catalog: qwen3.8-max-preview, qwen3.7-max, qwen3.7-plus,
+# qwen3.6-flash, glm-5.2, deepseek-v4-pro). Switch the active model by editing
+# the agent-default-model row. Kimi-K3 is NOT served by this gateway; to use it,
+# either wait for the gateway to add it (then just list the id here) or add a
+# second provider route with Moonshot's own credentials, e.g.:
+#
+#   moonshot:
+#     displayName: Moonshot
+#     api: openai-completions
+#     baseURL: https://api.moonshot.cn/v1
+#     apiKeyEnv: MOONSHOT_API_KEY
+#     models:
+#       - id: kimi-k3
+#
+- id: llm-pi-ai
+  config:
+    providers:
+      bailian:
+        displayName: Bailian (Aliyun compatible-mode)
+        api: openai-completions
+        baseURL: https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+        apiKeyEnv: BAILIAN_API_KEY
+        defaultContextWindow: 262144
+        defaultMaxTokens: 32768
+        models:
+          - id: qwen3.8-max
+          - id: qwen3.8-flash
+          - id: kimi-k3
+          - id: glm-5.3
+          - id: deepseek-v4-pro
+- id: agent-default-model
+  config:
+    provider: bailian
+    model: qwen3.8-max

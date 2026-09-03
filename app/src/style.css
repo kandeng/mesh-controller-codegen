@@ -1,0 +1,132 @@
+/* Global theme — matches the proven viewer.html palette so the app shell and the
+   3D viewer feel like one surface. Component-scoped styles handle their own
+   details; this file owns the resets, base colors, typography, and scrollbars. */
+
+/* Design tokens. Dark is the default (also applied when no data-theme is set, so
+   the very first paint is dark); [data-theme="light"] overrides every token for
+   the white theme. Components consume ONLY these vars, so flipping the
+   <html data-theme> attribute re-skins all three panes at once. The --scene-*
+   tokens are read by MeshViewer (JS) to re-tint the 3D backdrop + grid. */
+:root,
+[data-theme="dark"] {
+  /* surfaces */
+  --bg: #101418;
+  --panel: #141b23;
+  --panel-2: #1b2530;
+  --input-bg: #131a22;
+  --surface-3: #16202b;
+  --item-active: #1b2c3d;
+  --btn-hover: #243242;
+  /* borders */
+  --border: #223;
+  --border-2: #2a3644;
+  --border-accent: #468;
+  /* accent + values */
+  --accent: #2b6cb0;
+  --accent-2: #63b3ed;
+  --value: #8fd3ff;
+  /* text */
+  --text: #dde;
+  --text-dim: #cdd6e4;
+  --text-btn: #cde;
+  --muted: #789;
+  --faint: #567;
+  /* status */
+  --good: #9fb;
+  --bad: #f88;
+  --warn: #a86;
+  --busy: #fc6;
+  --pass-bg: #14261c;
+  --pass-border: #2c5e3f;
+  --fail-bg: #2a1618;
+  --fail-border: #5e2c2c;
+  --gen-border: #6b4;
+  --gen-text: #cfc;
+  --dot-on: #4c6;
+  --dot-off: #533;
+  /* misc */
+  --overlay-bg: rgba(16, 20, 24, .72);
+  --grip: #789;
+  --grip-active: #e6edf5;
+  --scrollbar: #2a3644;
+  --scrollbar-hover: #3a4a5c;
+  /* 3D scene (read by MeshViewer via getComputedStyle) */
+  --scene-bg: #101418;
+  --scene-grid-major: #334455;
+  --scene-grid-minor: #222233;
+}
+
+[data-theme="light"] {
+  /* surfaces */
+  --bg: #eef1f5;
+  --panel: #ffffff;
+  --panel-2: #f2f5f8;
+  --input-bg: #ffffff;
+  --surface-3: #e9edf2;
+  --item-active: #e2edfb;
+  --btn-hover: #e7edf4;
+  /* borders */
+  --border: #dce2e9;
+  --border-2: #c6d0da;
+  --border-accent: #9db4c9;
+  /* accent + values */
+  --accent: #2b6cb0;
+  --accent-2: #2f80ed;
+  --value: #1a6fb5;
+  /* text */
+  --text: #1a2028;
+  --text-dim: #333d49;
+  --text-btn: #243040;
+  --muted: #64748b;
+  --faint: #8a97a6;
+  /* status */
+  --good: #2f855a;
+  --bad: #c53030;
+  --warn: #a86a2a;
+  --busy: #b7791f;
+  --pass-bg: #e7f5ec;
+  --pass-border: #a3d7b8;
+  --fail-bg: #fdecec;
+  --fail-border: #f0b6b6;
+  --gen-border: #5aa87c;
+  --gen-text: #2f6b48;
+  --dot-on: #38a169;
+  --dot-off: #cbd5e0;
+  /* misc */
+  --overlay-bg: rgba(255, 255, 255, .82);
+  --grip: #94a3b8;
+  --grip-active: #ffffff;
+  --scrollbar: #c6d0da;
+  --scrollbar-hover: #a9b5c1;
+  /* 3D scene */
+  --scene-bg: #eef2f6;
+  --scene-grid-major: #c2cbd5;
+  --scene-grid-minor: #dce3ea;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 14px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+/* Slim, theme-matched scrollbars for the scrolling panes. */
+*::-webkit-scrollbar { width: 9px; height: 9px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb { background: var(--scrollbar); border-radius: 6px; border: 2px solid var(--panel); }
+*::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-hover); }
+* { scrollbar-width: thin; scrollbar-color: var(--scrollbar) transparent; }
+
+/* Shared focus ring so keyboard nav is visible against the dark chrome. */
+:focus-visible { outline: 2px solid var(--accent-2); outline-offset: 1px; }

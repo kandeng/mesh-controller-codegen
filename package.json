@@ -1,0 +1,30 @@
+{
+  "name": "mesh-controller-codegen",
+  "version": "0.1.0",
+  "description": "DSH-powered tool that generates per-joint controller code (JS/Python/C#) for rigged meshes, with deterministic validation and a live 3D visual gate.",
+  "type": "module",
+  "bin": {
+    "mesh-controller-codegen": "src/cli.mjs",
+    "mcc": "src/cli.mjs"
+  },
+  "scripts": {
+    "gen": "node src/cli.mjs",
+    "prove": "node src/cli.mjs samples/drone_dji_inspire3.glb --controller drone-controller.js --gate auto",
+    "prove:shell": "node test/verify-shell.mjs",
+    "server": "node server/index.mjs",
+    "app:dev": "npm --prefix app run dev",
+    "app:build": "npm --prefix app run build",
+    "app:preview": "npm --prefix app run preview"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@fastify/cors": "^11.3.0",
+    "@fastify/static": "^10.1.3",
+    "@fastify/websocket": "^11.3.0",
+    "fastify": "^5.12.1",
+    "three": "0.183.2"
+  },
+  "license": "MIT"
+}
