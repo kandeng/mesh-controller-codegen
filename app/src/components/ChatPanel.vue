@@ -4,20 +4,23 @@
 // clipboard (Ctrl+V in the composer) or upload a local image file; thumbnails
 // queue above the composer and ride along with the next message. The transcript
 // (text, images, tool activity lines) is restored from the session store on load.
-import { ref, nextTick, watch, onMounted } from 'vue';
+import { ref, nextTick, watch, onMounted, onBeforeUnmount } from 'vue';
 import { useProjectStore } from '../composables/useProjectStore.js';
 import { useAgentSocket } from '../composables/useAgentSocket.js';
 import { useKernelApi } from '../composables/useKernelApi.js';
+import { useViewerCapture } from '../composables/useViewerCapture.js';
 
 const { state } = useProjectStore();
 const { connect, send, resume } = useAgentSocket();
 const api = useKernelApi();
+const { capture: captureViewerFrame } = useViewerCapture();
 
 const draft = ref('');
 const scroller = ref(null);
 const fileInput = ref(null);
 const pending = ref([]);   // [{ id, url, name, mediaType }] uploaded, not yet sent
 const uploading = ref(0);
+const lightbox = ref(null);   // { url, name } of the image shown full-size
 
 const readAsBase64 = (file) => new Promise((res, rej) => {
   const fr = new FileReader();
@@ -51,6 +54,28 @@ function onPaste(e) {
 
 function removePending(id) { pending.value = pending.value.filter((p) => p.id !== id); }
 
+// Click-to-zoom: show any thumbnail / sent attachment full-size in a lightbox.
+function openLightbox(url, name) { lightbox.value = { url, name: name || 'screenshot' }; }
+function closeLightbox() { lightbox.value = null; }
+function onKeydown(e) { if (e.key === 'Escape') lightbox.value = null; }
+
+// Snapshot the live 3D viewer (left panel) and queue it like an uploaded image,
+// so it rides along with the next message to the assistant.
+async function captureViewer() {
+  const dataUrl = captureViewerFrame();
+  if (!dataUrl) { state.transcript.push({ role: 'system', text: 'viewer not ready to capture', ts: Date.now() }); return; }
+  const [meta, b64] = dataUrl.split(',');
+  const mediaType = (meta.match(/data:([^;]+);/) || [])[1] || 'image/png';
+  uploading.value++;
+  try {
+    const r = await api.attach(mediaType, b64, 'viewer-screenshot.png');
+    if (r.ok) pending.value.push({ id: r.attachmentId, url: r.url, name: 'viewer-screenshot.png', mediaType });
+    else state.transcript.push({ role: 'system', text: `attach failed: ${r.error}`, ts: Date.now() });
+  } catch (e) {
+    state.transcript.push({ role: 'system', text: `attach failed: ${e.message}`, ts: Date.now() });
+  } finally { uploading.value--; }
+}
+
 async function submit() {
   const t = draft.value.trim();
   if (!t && !pending.value.length) return;
@@ -68,7 +93,8 @@ async function scrollDown() {
 watch(() => state.transcript.length, scrollDown);
 watch(() => state.transcript[state.transcript.length - 1]?.text, scrollDown); // streaming deltas
 
-onMounted(async () => { connect(); await resume(); scrollDown(); });
+onMounted(async () => { connect(); await resume(); scrollDown(); addEventListener('keydown', onKeydown); });
+onBeforeUnmount(() => { removeEventListener('keydown', onKeydown); });
 </script>
 
 <template>
@@ -87,7 +113,7 @@ onMounted(async () => { connect(); await resume(); scrollDown(); });
         <div v-else class="msg" :class="[m.role, { streaming: m.streaming }]">
           <div class="bubble">
             <div v-if="m.attachments?.length" class="shots">
-              <img v-for="a in m.attachments" :key="a.id || a.url" :src="a.url" :alt="a.name || 'screenshot'" loading="lazy" />
+              <img v-for="a in m.attachments" :key="a.id || a.url" class="zoomable" :src="a.url" :alt="a.name || 'screenshot'" loading="lazy" @click="openLightbox(a.url, a.name)" />
             </div>
             <template v-if="m.text">{{ m.text }}</template>
             <div v-if="m.tools?.length && !m.streaming" class="tools">
@@ -100,17 +126,26 @@ onMounted(async () => { connect(); await resume(); scrollDown(); });
     </div>
     <div v-if="pending.length" class="thumbs">
       <div v-for="p in pending" :key="p.id" class="thumb">
-        <img :src="p.url" :alt="p.name" />
+        <img :src="p.url" :alt="p.name" class="zoomable" @click="openLightbox(p.url, p.name)" />
         <button type="button" class="x" title="Remove" @click="removePending(p.id)">×</button>
       </div>
       <span v-if="uploading" class="uploading">uploading…</span>
     </div>
     <form class="composer" @submit.prevent="submit">
       <input ref="fileInput" type="file" accept="image/*" multiple hidden @change="attachFiles([...fileInput.files]); fileInput.value = ''" />
-      <button type="button" class="attach" title="Upload an image (or paste with Ctrl+V)" :disabled="state.busy" @click="fileInput.click()">📎</button>
+      <button type="button" class="attach" title="Capture the 3D viewer as a screenshot" :disabled="state.busy || !state.viewer.glb" @click="captureViewer"><span class="ic ic-shot" aria-hidden="true"></span></button>
+      <button type="button" class="attach" title="Upload an image (or paste with Ctrl+V)" :disabled="state.busy" @click="fileInput.click()"><span class="ic ic-folder" aria-hidden="true"></span></button>
       <input v-model="draft" type="text" placeholder="Message the assistant… (paste screenshots with Ctrl+V)" :disabled="state.busy" @paste="onPaste" />
       <button type="submit" :disabled="state.busy || uploading > 0 || (!draft.trim() && !pending.length)">Send</button>
     </form>
+
+    <!-- Click-to-zoom lightbox (teleported to <body> so it escapes the pane). -->
+    <Teleport to="body">
+      <div v-if="lightbox" class="lightbox" role="dialog" aria-modal="true" @click.self="closeLightbox">
+        <button type="button" class="lb-close" title="Close (Esc)" @click="closeLightbox">×</button>
+        <img :src="lightbox.url" :alt="lightbox.name" />
+      </div>
+    </Teleport>
   </div>
 </template>
 
@@ -141,6 +176,28 @@ onMounted(async () => { connect(); await resume(); scrollDown(); });
 .composer input[type="text"] { flex: 1; background: var(--input-bg); border: 1px solid var(--border-2); border-radius: 7px; color: var(--text); padding: 8px 10px; font-size: 13px; }
 .composer input:focus { outline: none; border-color: var(--border-accent); }
 .composer button { background: var(--accent); border: 1px solid var(--accent-2); color: #fff; border-radius: 7px; padding: 0 14px; cursor: pointer; font-size: 13px; }
-.composer button.attach { background: var(--panel-2); border-color: var(--border-2); color: var(--text); padding: 0 10px; }
+.composer button.attach { background: var(--panel-2); border-color: var(--border-2); color: var(--text); padding: 0 10px; display: inline-flex; align-items: center; justify-content: center; }
+/* Icon glyphs: the SVG artwork is applied as a CSS mask so the tint follows the
+   button's currentColor (theme-aware) instead of the file's baked-in gray. */
+.ic { width: 16px; height: 16px; display: inline-block; background-color: currentColor; mask-size: contain; mask-repeat: no-repeat; mask-position: center; -webkit-mask-size: contain; -webkit-mask-repeat: no-repeat; -webkit-mask-position: center; }
+.ic-shot { mask-image: url('../assets/screen_shot.svg'); -webkit-mask-image: url('../assets/screen_shot.svg'); }
+/* The folder artwork is wide-but-short, so give it an aspect-matched box that is
+   a touch larger than the square icons; it then fills the button and centers. */
+.ic-folder { width: 18px; height: 16px; mask-image: url('../assets/file_folder.svg'); -webkit-mask-image: url('../assets/file_folder.svg'); }
 .composer button:disabled { opacity: .45; cursor: default; }
+
+/* click-to-zoom lightbox */
+.zoomable { cursor: zoom-in; }
+.lightbox {
+  position: fixed; inset: 0; z-index: 1000; cursor: zoom-out;
+  background: rgba(0, 0, 0, .78); display: flex; align-items: center; justify-content: center;
+  padding: 4vh 4vw;
+}
+.lightbox img { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 8px; box-shadow: 0 8px 40px rgba(0, 0, 0, .5); cursor: default; }
+.lightbox .lb-close {
+  position: absolute; top: 14px; right: 16px; width: 34px; height: 34px; line-height: 1;
+  border-radius: 50%; background: var(--panel-2); color: var(--text); border: 1px solid var(--border-2);
+  cursor: pointer; font-size: 18px;
+}
+.lightbox .lb-close:hover { border-color: var(--accent-2); }
 </style>

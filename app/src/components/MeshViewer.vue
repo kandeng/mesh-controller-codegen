@@ -10,6 +10,7 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { useProjectStore } from '../composables/useProjectStore.js';
 import { useTheme } from '../composables/useTheme.js';
+import { registerViewerCapture } from '../composables/useViewerCapture.js';
 
 const { state } = useProjectStore();
 const { state: themeState } = useTheme();
@@ -86,6 +87,15 @@ function tick() {
   try { applyPreview(dt); } catch (e) { status.value = `preview() threw: ${e.message}`; }
   orbit.update();
   renderer.render(scene, camera);
+}
+
+// Screenshot the live scene as a PNG data URL. WebGL clears its drawing buffer
+// after each composite, so we render and read the buffer in the SAME synchronous
+// task — no preserveDrawingBuffer flag and no cost to the normal render loop.
+function captureFrame() {
+  if (!renderer) return null;
+  renderer.render(scene, camera);
+  return renderer.domElement.toDataURL('image/png');
 }
 
 async function loadModel(url) {
@@ -244,12 +254,14 @@ onMounted(() => {
   initScene();
   tick();
   addEventListener('resize', resize);
+  registerViewerCapture(captureFrame);
   if (state.viewer.glb) reload();
 });
 
 onBeforeUnmount(() => {
   cancelAnimationFrame(raf);
   removeEventListener('resize', resize);
+  registerViewerCapture(null);
   try { renderer?.dispose(); } catch { /* ignore */ }
 });
 </script>
