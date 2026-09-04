@@ -3,8 +3,8 @@
 // This facade wraps src/pipeline.mjs so routes stay thin, caches the last
 // discovery (glb stats / dump / THREE) so validate+generate don't re-parse the
 // 23MB GLB, and keeps the kernel as the system-of-record for work state.
-import { mkdirSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { mkdirSync, copyFileSync } from 'node:fs';
+import { resolve, dirname } from 'node:path';
 import { createHost } from '../src/core/host.mjs';
 import { loadConfig } from '../src/config.mjs';
 import { registerAllPlugins } from '../src/plugins/index.mjs';
@@ -84,15 +84,25 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
     },
 
     // Bounded generate->validate loop (DSH). onRound streams to the caller.
-    async generate({ lang = 'javascript', model = null, rounds = 1, onRound = null } = {}) {
+    // When `out` is given, the accepted controller is also written to that
+    // user-chosen destination (mirrors the CLI's --out) and becomes the active
+    // controller, so the viewer + knobs drive the file the user asked for.
+    async generate({ lang = 'javascript', model = null, rounds = 1, onRound = null, out = null } = {}) {
       if (!current.glb) throw new Error('no project loaded; POST /api/project first');
       const gen = await generateController(host, {
         glbPath: current.glbPath, glb: current.glb, dump: current.dump,
         runDir, lang, model, rounds, THREE, onRound,
       });
-      current.controller = gen.controller;
+      let controller = gen.controller;
+      if (out) {
+        const outAbs = resolve(host.repoRoot, out);
+        mkdirSync(dirname(outAbs), { recursive: true });
+        copyFileSync(gen.controller, outAbs);
+        controller = outAbs;
+      }
+      current.controller = controller;
       current.lastValidation = { pass: gen.failures.length === 0, failures: gen.failures, warnings: gen.warnings, metrics: gen.metrics };
-      return gen;
+      return { ...gen, controller };
     },
 
     // One human-note repair round (interactive gate over WS).

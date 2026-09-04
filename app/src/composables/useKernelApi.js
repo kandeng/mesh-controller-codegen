@@ -13,6 +13,7 @@ export function useKernelApi() {
     loadProject: (glb) => post('/api/project', { glb }),
     validate: (file) => post('/api/validate', { file }),
     generate: (opts) => post('/api/generate', opts || {}),
+    pickFile: (opts) => post('/api/fs/pick', opts || {}),
     slots: (id) => get(`/api/joints/${encodeURIComponent(id)}/slots`),
     renders: () => get('/api/renders'),
     resume: () => get('/api/session/resume'),

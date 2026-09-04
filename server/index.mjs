@@ -15,6 +15,7 @@ import { registerEventsSocket } from './events-socket.mjs';
 import { projectRoutes } from './routes/project.mjs';
 import { jointRoutes } from './routes/joints.mjs';
 import { agentRoutes } from './routes/agent.mjs';
+import { fsRoutes } from './routes/fs.mjs';
 import { createDshAgent } from './dsh-agent.mjs';
 
 export async function startServer({ configPath = null, port = 0, verbose = false } = {}) {
@@ -49,6 +50,7 @@ export async function startServer({ configPath = null, port = 0, verbose = false
   const disposeEvents = registerEventsSocket(app, kernel);
   projectRoutes(app, kernel);
   jointRoutes(app, kernel);
+  fsRoutes(app, kernel);
   await agentRoutes(app, kernel, agent);
 
   // Resumability + health.

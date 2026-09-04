@@ -43,7 +43,7 @@ export function projectRoutes(app, kernel) {
     if (!file) return reply.code(400).send({ error: 'body.file required' });
     try {
       const r = await kernel.validate(file);
-      return { ok: true, pass: r.pass, failures: r.failures, warnings: r.warnings, metrics: r.metrics, controllerUrl: r.controllerUrl, viewer: kernel.viewerUrls() };
+      return { ok: true, pass: r.pass, failures: r.failures, warnings: r.warnings, metrics: r.metrics, controller: r.controller, controllerUrl: r.controllerUrl, viewer: kernel.viewerUrls() };
     } catch (e) {
       return reply.code(400).send({ error: e.message });
     }
@@ -51,18 +51,20 @@ export function projectRoutes(app, kernel) {
 
   // Generate a controller via the DSH bridge. Always a SINGLE emit→validate
   // pass (rounds fixed at 1); round progress is broadcast over the events WS.
+  // `out` (optional) is the user-chosen destination the accepted controller is
+  // copied to; omit it to keep the run-dir default.
   app.post('/api/generate', async (req, reply) => {
-    const { lang = 'javascript', model = null } = req.body || {};
+    const { lang = 'javascript', model = null, out = null } = req.body || {};
     const rounds = 1;
     try {
       const gen = await kernel.generate({
-        lang, model, rounds,
+        lang, model, rounds, out,
         onRound: (r) => app.broadcast({ kind: 'round', ...r }),
       });
       const accepted = gen.failures.length === 0;
       if (accepted) kernel.viewerUrls(); // refresh controller.view.js
       const report = kernel.finalize({ accepted, roundsUsed: gen.roundsUsed, lang, model, failures: gen.failures, warnings: gen.warnings, metrics: gen.metrics });
-      return { ok: true, accepted, roundsUsed: gen.roundsUsed, failures: gen.failures, warnings: gen.warnings, metrics: gen.metrics, viewer: kernel.viewerUrls(), report };
+      return { ok: true, accepted, roundsUsed: gen.roundsUsed, failures: gen.failures, warnings: gen.warnings, metrics: gen.metrics, controller: gen.controller, viewer: kernel.viewerUrls(), report };
     } catch (e) {
       return reply.code(400).send({ error: e.message });
     }

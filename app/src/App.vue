@@ -1,14 +1,12 @@
 <script setup>
-// App shell — a 3-pane layout: MeshViewer | (Toolbar + JointList + KnobPanel) |
-// ChatPanel, separated by two DRAGGABLE dividers. The viewer (left) flexes to
-// fill; the mid and right panes have resizable widths. Dragging a divider left
-// grows the pane to its right; double-click resets it; arrow keys nudge it when
-// focused (a11y). Cross-pane state still flows through the reactive store.
+// App shell — a 3-pane layout: MeshViewer | ControlPanel | ChatPanel,
+// separated by two DRAGGABLE dividers. The viewer (left) flexes to fill; the mid
+// and right panes have resizable widths. Dragging a divider left grows the pane
+// to its right; double-click resets it; arrow keys nudge it when focused (a11y).
+// Cross-pane state still flows through the reactive store.
 import { ref, onMounted, onBeforeUnmount } from 'vue';
 import MeshViewer from './components/MeshViewer.vue';
-import Toolbar from './components/Toolbar.vue';
-import JointList from './components/JointList.vue';
-import KnobPanel from './components/KnobPanel.vue';
+import ControlPanel from './components/ControlPanel.vue';
 import ChatPanel from './components/ChatPanel.vue';
 import { useTheme } from './composables/useTheme.js';
 
@@ -101,11 +99,8 @@ onBeforeUnmount(() => {
       ><span class="grip"></span></div>
 
       <section class="pane side-pane" :style="{ width: midWidth + 'px' }">
-        <div class="side-top"><Toolbar /></div>
         <div class="side-scroll">
-          <JointList />
-          <div class="sep"></div>
-          <KnobPanel />
+          <ControlPanel />
         </div>
       </section>
 
@@ -149,9 +144,7 @@ onBeforeUnmount(() => {
 .side-pane { flex: 0 0 auto; display: flex; flex-direction: column; background: var(--panel); }
 .chat-pane { flex: 0 0 auto; padding: 12px; background: var(--panel); }
 
-.side-top { flex: none; padding: 12px; border-bottom: 1px solid var(--border); }
 .side-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 14px; }
-.sep { height: 1px; background: var(--border); }
 
 /* Draggable vertical divider between panes (6px hit area, accent on hover). */
 .divider {
