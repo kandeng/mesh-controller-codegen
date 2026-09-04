@@ -20,11 +20,19 @@ The tool ships two front-ends over **one shared pipeline**:
   - [How a run flows](#how-a-run-flows)
   - [Plugin set](#plugin-set)
 - [Installation](#installation)
+  - [Build](#build)
+- [Start up and shut down](#start-up-and-shut-down)
+  - [CLI](#cli)
+  - [Web app](#web-app)
 - [Usage](#usage)
-  - [CLI](#1-cli-one-shot-generation)
-  - [Web app](#2-web-app-vue-3--fastify)
-  - [The generated controller contract](#the-generated-controller-contract)
-  - [Run artifacts](#run-artifacts)
+  - [The three-pane shell](#the-three-pane-shell)
+  - [Control knobs](#control-knobs)
+  - [The AI assistant (chatbot)](#the-ai-assistant-chatbot)
+  - [Attaching screenshots](#attaching-screenshots)
+- [CLI reference](#cli-reference)
+- [Web app development](#web-app-development)
+- [The generated controller contract](#the-generated-controller-contract)
+- [Run artifacts](#run-artifacts)
 - [Project layout](#project-layout)
 
 ---
@@ -208,11 +216,69 @@ cp config.example.json config.json
 | `dsh_timeout_ms` | `900000` | Kill timer for a DSH child process. |
 | `paths.*` | see file | `dsh_bin`, `bailian_patch`, `three`, `samples`, `runs`. |
 
+### Build
+
+The backend serves the web app as a **pre-built** bundle, so compile it once
+here — and re-run it after any front-end change:
+
+```bash
+# Build the SPA (outputs to app/dist, served by the backend at '/')
+npm run app:build
+```
+
 ---
+
+## Start up and shut down
+
+Two ways to run the system — the **CLI** (one-shot) and the **web app**
+(persistent server). Each needs one command to start and one to stop.
+
+### CLI
+
+- **Start:** `node src/cli.mjs samples/drone_dji_inspire3.glb --lang javascript`
+- **Shut down:** `Ctrl+C` — or just answer the visual gate (`pass` to accept); the CLI exits on its own.
+
+### Web app
+
+- **Start:** `npm run server` — then open the printed address, e.g. `http://127.0.0.1:8788`.
+- **Shut down:** `Ctrl+C` in the server terminal.
+
+> The web app is served from `app/dist`, so run [`npm run app:build`](#build) once during installation first.
 
 ## Usage
 
-### 1. CLI (one-shot generation)
+How to drive a rigged mesh and debug its controller from the web app. Use the
+toolbar to **Load mesh** (discover joints from a GLB), **Validate** an existing
+controller, or **Generate (DSH)** a new one — then select a joint to drive it
+with the control knobs and the assistant.
+
+### The three-pane shell
+
+The shell has three draggable panes — **3D mesh viewer · control knobs · AI assistant** — with a dark/light theme toggle (persisted in browser `localStorage`). The knob panel is rendered entirely from the **Slot Graph** for the active joint.
+
+### Control knobs
+
+These are the live drivers for the selected joint. Moving a knob updates the 3D
+viewer in real time and exercises the controller's runtime contract:
+
+- **Speed slider** *(rotor)* — target speed in m/s (`0` = props stopped, up to `10`, step `0.1`); rotor RPM eases toward it.
+- **Turn toggle** *(rotor)* — **Turn Left / Turn Right / Go Straight**; yaw spins the diagonal propeller pairs differentially (CW vs CCW).
+- **Pitch & yaw sliders** *(gimbal)* — tilt the camera body; pitch is clamped to `[-90, 30]`, yaw to `[-120, 120]`.
+- **Angle slider / readout** *(hinge, gimbal)* — drive a hinge angle, or show a derived read-only angle.
+
+Knob changes broadcast live (the `ui:knobChanged` event) and the viewer re-renders
+the mesh, so you *see* the rig respond — the human visual gate the automated
+checks can't replace.
+
+### The AI assistant (chatbot)
+
+**The AI assistant is a live DSH debugging agent** (the same loop a human debugger would run): its session cwd is the run dir, pre-populated by [`server/agent-workspace.mjs`](server/agent-workspace.mjs) with an `AGENTS.md` persona and a `kernel-cli.mjs` tool belt (`validate` · `rig <jointId>` · `joints` · `state`) that calls this server's REST API. The web profile is patched to enable its bash tool; the supervisor keeps DSH's atomic `workspace-write` preset (writes sandboxed to the run dir) and auto-allows each approval request over the host's `/api/respond` channel — so the agent runs tools autonomously without ever escaping the workspace. (Overriding the approval policy alone composes a `custom` preset that aborts host boot, which is why auto-allow is done supervisor-side.) The supervisor drives the host over its verified wire contract: unary RPCs via `POST /api/<method>`, and the live event stream via the **downlink-only WebSocket** `ws://…/api/events.mux` (a plain GET returns HTTP 426). Workflow: reproduce via `validate` → inspect the rig report (`GET /api/joints/:id/rig` — node parent chains, rest world positions, rotor disc membership, and the cousin-blade warning that prevents per-node rotation) → patch `controller.js` → re-validate until tier-1 passes.
+
+### Attaching screenshots
+
+**Screenshots are human-initiated**: paste from the clipboard (Ctrl+V) or upload via the 📎 button; thumbnails queue above the composer and ride along with the next message (`POST /api/agent/attach` → inline base64 image parts in `session.prompt`). The default `qwen3.8-max` is **natively multimodal (text + image)** and is declared with `input: [text, image]` in `bailian.patch.yml`, so screenshot turns work out of the box on the same model as text. (DSH under-claims text-only unless a model declares its input modalities, which is why that declaration is required — without it the host refuses the image at prompt time with `MODEL_DOES_NOT_SUPPORT_IMAGES`.) Set `vision_model` in `config.json` only to route image turns to a *different* model, which must likewise be declared with `input: [text, image]`. The chat streams token deltas and ⚙ tool lines live; transcript entries (text, attachment refs, tool summaries) persist in `sessions/latest.json` and are replayed on reload.
+
+## CLI reference
 
 ```bash
 node src/cli.mjs <glb> [options]
@@ -245,28 +311,19 @@ npm run prove
 
 When the interactive gate passes, the CLI prints a **human visual-verification checklist** and serves the live viewer at `http://127.0.0.1:<port>/viewer/viewer.html?glb=…&ctl=…`. Type `pass` to accept, or describe what's wrong to trigger a note-driven repair round.
 
-### 2. Web app (Vue 3 + Fastify)
+## Web app development
+
+For front-end work, run the Vite dev server **alongside** the backend: it serves
+the Vue app from source with hot-module reload and proxies the API + asset
+prefixes to Fastify, so you never rebuild `app/dist` while iterating.
 
 ```bash
-# Build the SPA (outputs to app/dist, served by the backend at '/')
-npm run app:build
-
-# Start the backend (boots ONE long-lived kernel host)
-npm run server                 # or: node server/index.mjs --port 8791
+npm run server        # terminal A — backend + API on :8788
+npm run app:dev       # terminal B — Vite dev server on :5173 (proxies /api, /samples, /runs, /viewer to :8788)
 ```
 
-Open the printed address (e.g. `http://127.0.0.1:8788`). For front-end development with hot reload:
-
-```bash
-npm run server        # terminal A — backend + API
-npm run app:dev       # terminal B — Vite dev server (proxies /api to the backend)
-```
-
-The shell has three draggable panes — **3D mesh viewer · control knobs · AI assistant** — with a dark/light theme toggle (persisted in browser `localStorage`). The knob panel is rendered entirely from the **Slot Graph** for the active joint.
-
-**The AI assistant is a live DSH debugging agent** (the same loop a human debugger would run): its session cwd is the run dir, pre-populated by [`server/agent-workspace.mjs`](server/agent-workspace.mjs) with an `AGENTS.md` persona and a `kernel-cli.mjs` tool belt (`validate` · `rig <jointId>` · `joints` · `state`) that calls this server's REST API. The web profile is patched to enable its bash tool; the supervisor keeps DSH's atomic `workspace-write` preset (writes sandboxed to the run dir) and auto-allows each approval request over the host's `/api/respond` channel — so the agent runs tools autonomously without ever escaping the workspace. (Overriding the approval policy alone composes a `custom` preset that aborts host boot, which is why auto-allow is done supervisor-side.) The supervisor drives the host over its verified wire contract: unary RPCs via `POST /api/<method>`, and the live event stream via the **downlink-only WebSocket** `ws://…/api/events.mux` (a plain GET returns HTTP 426). Workflow: reproduce via `validate` → inspect the rig report (`GET /api/joints/:id/rig` — node parent chains, rest world positions, rotor disc membership, and the cousin-blade warning that prevents per-node rotation) → patch `controller.js` → re-validate until tier-1 passes.
-
-**Screenshots are human-initiated**: paste from the clipboard (Ctrl+V) or upload via the 📎 button; thumbnails queue above the composer and ride along with the next message (`POST /api/agent/attach` → inline base64 image parts in `session.prompt`). The default `qwen3.8-max` is **natively multimodal (text + image)** and is declared with `input: [text, image]` in `bailian.patch.yml`, so screenshot turns work out of the box on the same model as text. (DSH under-claims text-only unless a model declares its input modalities, which is why that declaration is required — without it the host refuses the image at prompt time with `MODEL_DOES_NOT_SUPPORT_IMAGES`.) Set `vision_model` in `config.json` only to route image turns to a *different* model, which must likewise be declared with `input: [text, image]`. The chat streams token deltas and ⚙ tool lines live; transcript entries (text, attachment refs, tool summaries) persist in `sessions/latest.json` and are replayed on reload.
+Open the **Vite** URL (`http://127.0.0.1:5173`) for live reload; `:8788` keeps
+serving the last built bundle. Override with `MCC_APP_PORT` / `MCC_BACKEND`.
 
 **Backend integration test** (health, SPA serving, discovery, slot graphs, validation, resume, WebSocket events):
 
@@ -274,7 +331,7 @@ The shell has three draggable panes — **3D mesh viewer · control knobs · AI 
 npm run prove:shell -- http://127.0.0.1:8788
 ```
 
-#### REST / WS surface
+### REST / WS surface
 
 | Method & path | Purpose |
 |---------------|---------|
@@ -287,7 +344,7 @@ npm run prove:shell -- http://127.0.0.1:8788
 | `GET /api/session/resume` | Persisted session (transcript + project pointer). |
 | `WS /api/events` | Live kernel bus events (hello + stream). |
 
-### The generated controller contract
+## The generated controller contract
 
 Emitted controllers are **ES modules** exporting a single factory. The test harness and viewer import exactly this shape:
 
@@ -305,7 +362,7 @@ ctl.getState();                 // { speed, headingDeg, props:[{name, rpm}], gim
 
 Controllers use **only** the `THREE` namespace passed as the second argument — no imports, DOM, network, timers, or globals — and must guard every node lookup (warn once and skip; never throw).
 
-### Run artifacts
+## Run artifacts
 
 Each run writes to `runs/<timestamp>/`:
 
