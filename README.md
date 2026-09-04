@@ -15,29 +15,184 @@ The tool ships two front-ends over **one shared pipeline**:
 
 ## Table of contents
 
-- [System architecture (the DSH paradigm)](#system-architecture-the-dsh-paradigm)
-  - [The 9 kernel primitives](#the-9-kernel-primitives)
-  - [How a run flows](#how-a-run-flows)
-  - [Plugin set](#plugin-set)
-- [Installation](#installation)
-  - [Build](#build)
-- [Start up and shut down](#start-up-and-shut-down)
-  - [CLI](#cli)
+- [1. Installation](#1-installation)
+- [2. Build](#2-build)
+- [3. Start up and shut down](#3-start-up-and-shut-down)
   - [Web app](#web-app)
-- [Usage](#usage)
+  - [CLI](#cli)
+    - [CLI reference](#cli-reference)
+- [4. Usage](#4-usage)
   - [The three-pane shell](#the-three-pane-shell)
   - [Control knobs](#control-knobs)
   - [The AI assistant (chatbot)](#the-ai-assistant-chatbot)
-  - [Attaching screenshots](#attaching-screenshots)
-- [CLI reference](#cli-reference)
-- [Web app development](#web-app-development)
-- [The generated controller contract](#the-generated-controller-contract)
-- [Run artifacts](#run-artifacts)
-- [Project layout](#project-layout)
+    - [Attaching screenshots](#attaching-screenshots)
+- [5. System architecture (the DSH paradigm)](#5-system-architecture-the-dsh-paradigm)
+  - [The 9 kernel primitives](#the-9-kernel-primitives)
+  - [Plugin set](#plugin-set)
+  - [Project layout](#project-layout)
 
 ---
 
-## System architecture (the DSH paradigm)
+## 1. Installation
+
+### Prerequisites
+
+- **Node.js ≥ 20** (developed on Node 24).
+- A **Bailian (Aliyun compatible-mode) API key** for generation, exposed as `config.json → api_key` or the `BAILIAN_API_KEY` env var.
+
+### Steps
+
+```bash
+# 1. Clone
+git clone https://github.com/kandeng/mesh-controller-codegen.git
+cd mesh-controller-codegen
+
+# 2. Root dependencies (Fastify backend + three.js)
+npm install
+
+# 3. DSH runtime (the agent harness; provides runtime/node_modules/.bin/dsh)
+npm --prefix runtime install
+
+# 4. Web app dependencies (Vue 3 + Vite) — only needed for the web app
+npm --prefix app install
+
+# 5. Configure your API key
+cp config.example.json config.json
+#    then edit config.json and set "api_key"  (or: export BAILIAN_API_KEY=...)
+```
+
+`config.json` is **gitignored** — the real key is never committed. All paths in it are resolved relative to the repo root, so nothing is hardcoded to a parent checkout.
+
+### Configuration ([`config.example.json`](config.example.json))
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `api_key` | `""` | Bailian API key (or use `BAILIAN_API_KEY`). |
+| `model` | `qwen3.8-max` | Default model id (natively multimodal: text + image). |
+| `vision_model` | `""` | Optional: routes screenshot turns to a different model; empty uses `model`. |
+| `bailian_base_url` | token-plan gateway | OpenAI-compatible endpoint. |
+| `viewer.port` | `8788` | Default port for the viewer/backend. |
+| `dsh_timeout_ms` | `900000` | Kill timer for a DSH child process. |
+| `paths.*` | see file | `dsh_bin`, `bailian_patch`, `three`, `samples`, `runs`. |
+
+## 2. Build
+
+The backend serves the web app as a **pre-built** bundle, so compile it once
+here — and re-run it after any front-end change:
+
+```bash
+# Build the SPA (outputs to app/dist, served by the backend at '/')
+npm run app:build
+```
+
+## 3. Start up and shut down
+
+Two ways to run the system — the **web app** (persistent server) and the
+**CLI** (one-shot). Each needs one command to start and one to stop.
+
+### Web app
+
+- **Start:** `npm run server` — then open the printed address, e.g. `http://127.0.0.1:8788`.
+- **Shut down:** `Ctrl+C` in the server terminal.
+
+> The web app is served from `app/dist`, so run [`npm run app:build`](#2-build) once during installation first.
+
+### CLI
+
+- **Start:** `node src/cli.mjs samples/drone_dji_inspire3.glb --lang javascript`
+- **Shut down:** `Ctrl+C` — or just answer the visual gate (`pass` to accept); the CLI exits on its own.
+
+#### CLI reference
+
+```bash
+node src/cli.mjs <glb> [options]
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--controller <file>` | — | Skip generation; validate an existing controller module. |
+| `--out <file>` | — | Copy the accepted controller here. |
+| `--lang <id>` | `javascript` | `javascript` \| `python` \| `csharp` (py/cs are stubs). |
+| `--model <id>` | from config | Bailian model id. |
+| `--rounds <n>` | `1` | Max repair rounds (single pass by default). |
+| `--gate <mode>` | `interactive` | `interactive` (opens the live 3D viewer + prompts) \| `auto`. |
+| `--port <n>` | from config | Viewer HTTP port. |
+| `--config <file>` | `<repo>/config.json` | Config path. |
+| `--verbose` | off | Trace every event to stderr. |
+
+**Generate a controller** (interactive visual gate):
+
+```bash
+node src/cli.mjs samples/drone_dji_inspire3.glb --lang javascript
+```
+
+**Validate-only + auto gate** (the bundled smoke test):
+
+```bash
+npm run prove
+# = node src/cli.mjs samples/drone_dji_inspire3.glb --controller samples/drone-controller.js --gate auto
+```
+
+When the interactive gate passes, the CLI prints a **human visual-verification checklist** and serves the live viewer at `http://127.0.0.1:<port>/viewer/viewer.html?glb=…&ctl=…`. Type `pass` to accept, or describe what's wrong to trigger a note-driven repair round.
+
+## 4. Usage
+
+How to drive a rigged mesh and debug its controller from the web app. Use the
+toolbar to **Load mesh** (discover joints from a GLB), **Validate** an existing
+controller, or **Generate (DSH)** a new one — then select a joint to drive it
+with the control knobs and the assistant.
+
+### The three-pane shell
+
+The shell has three draggable panes — **3D mesh viewer · control knobs · AI assistant** — with a dark/light theme toggle (persisted in browser `localStorage`). The knob panel is rendered entirely from the **Slot Graph** for the active joint.
+
+### Control knobs
+
+These are the live drivers for the selected joint. Moving a knob updates the 3D
+viewer in real time and exercises the controller's runtime contract:
+
+- **Speed slider** *(rotor)* — target speed in m/s (`0` = props stopped, up to `10`, step `0.1`); rotor RPM eases toward it.
+- **Turn toggle** *(rotor)* — **Turn Left / Turn Right / Go Straight**; yaw spins the diagonal propeller pairs differentially (CW vs CCW).
+- **Pitch & yaw sliders** *(gimbal)* — tilt the camera body; pitch is clamped to `[-90, 30]`, yaw to `[-120, 120]`.
+- **Angle slider / readout** *(hinge, gimbal)* — drive a hinge angle, or show a derived read-only angle.
+
+Knob changes broadcast live (the `ui:knobChanged` event) and the viewer re-renders
+the mesh, so you *see* the rig respond — the human visual gate the automated
+checks can't replace.
+
+### The AI assistant (chatbot)
+
+The right-hand pane is a conversational assistant that debugs the loaded mesh
+and its controller together with you. Type a message and press **Send**: the
+assistant sees the current project (mesh, joints, controller, validation
+results), runs its own checks when needed, edits the controller when you ask
+for a fix, and explains what it changed. Replies and tool activity stream into
+the transcript live.
+
+Things you can ask it, for example:
+
+- *"Why does the rear-left rotor spin backwards?"* — it reproduces the problem, patches the controller, and re-checks until validation passes.
+- *"Limit the gimbal pitch to [-60, 10]."* — it edits the controller and confirms the new behavior.
+- *"Which joints did you find, and what can I drive on each?"* — it answers from the live project state.
+
+The conversation is resumable: reload the page or restart the server and the
+transcript — plus the loaded project — comes back where you left off.
+
+#### Attaching screenshots
+
+Show the assistant what you see. Three ways to attach an image:
+
+- **Capture the 3D viewer** — click the screenshot button (left of the upload button); the current viewer frame is grabbed instantly.
+- **Upload a file** — click the folder button and pick an image.
+- **Paste** — press **Ctrl+V** with an image on the clipboard.
+
+Attached thumbnails queue above the input box and are sent together with your
+next message, so you can point at a visual problem — *"this propeller looks
+bent"* — and the assistant sees exactly what you see. Click any thumbnail
+(pending or sent) to open it full-size; press **Esc** or click the backdrop to
+close.
+
+## 5. System architecture (the DSH paradigm)
 
 The internal design follows the DSH paradigm: **"everything is a plugin"** sitting on a **thin, framework-free kernel** of nine primitives. The kernel is assembled by [`createHost()`](src/core/host.mjs); the domain logic (discovery, joint types, emitters, validators, bridges) is registered as plugins. Adding a new joint type, target language, validator, or discovery strategy means **adding a module — never editing the core**.
 
@@ -144,20 +299,6 @@ Two cooperating pieces:
 
 Subscribes to **every** bus event via `onAny()` and writes a slim **`trace.jsonl`** into the run dir, plus per-type counters. Writes use a **synchronous fd** (`openSync`/`writeSync`) because the CLI may `process.exit()` immediately after `close()` — an async stream would lose buffered lines. Each traced event is slimmed: long strings are truncated to 200 chars, arrays collapse to `[array:n]`, other objects to `[type]`. `diagnostics.note(msg, data)` emits a `diag` event; `count(type)` returns event counters (folded into `report.json`). This addresses the *opaque-agent-loop* pain by making every step observable.
 
-### How a run flows
-
-[`src/pipeline.mjs`](src/pipeline.mjs) is the shared orchestration used by **both** the CLI and the Fastify backend (same code path, no duplication):
-
-```
-discoverJoints      register mesh asset → geometry discovery → motion-spec IR → context.set
-validateController  run validator plugins in tier order, short-circuit on first failure
-generateController  bounded emit → validate repair loop (onRound streams each round)
-repairWithNotes     one human-note-driven repair round (interactive gate)
-finalizeRun         persist context + write report.json
-```
-
-Validation is tiered: **Tier-0** (static/structural) then **Tier-1** (behavioral — load the controller in headless `three.js`, tick scenarios, assert the contract). Generation is a single emit→validate pass (rounds fixed at 1).
-
 ### Plugin set
 
 Registered by [`registerAllPlugins(host)`](src/plugins/index.mjs):
@@ -172,212 +313,7 @@ Registered by [`registerAllPlugins(host)`](src/plugins/index.mjs):
 
 Each joint type declares its `contributes.slots` and single-joint `assertions` (e.g. rotor: `stopAtZero`, `bladesSpinWithHub`, `rpmGrowsWithSpeed`, `diagonalDifferential`).
 
----
-
-## Installation
-
-### Prerequisites
-
-- **Node.js ≥ 20** (developed on Node 24).
-- A **Bailian (Aliyun compatible-mode) API key** for generation, exposed as `config.json → api_key` or the `BAILIAN_API_KEY` env var.
-
-### Steps
-
-```bash
-# 1. Clone
-git clone https://github.com/kandeng/mesh-controller-codegen.git
-cd mesh-controller-codegen
-
-# 2. Root dependencies (Fastify backend + three.js)
-npm install
-
-# 3. DSH runtime (the agent harness; provides runtime/node_modules/.bin/dsh)
-npm --prefix runtime install
-
-# 4. Web app dependencies (Vue 3 + Vite) — only needed for the web app
-npm --prefix app install
-
-# 5. Configure your API key
-cp config.example.json config.json
-#    then edit config.json and set "api_key"  (or: export BAILIAN_API_KEY=...)
-```
-
-`config.json` is **gitignored** — the real key is never committed. All paths in it are resolved relative to the repo root, so nothing is hardcoded to a parent checkout.
-
-### Configuration ([`config.example.json`](config.example.json))
-
-| Key | Default | Meaning |
-|-----|---------|---------|
-| `api_key` | `""` | Bailian API key (or use `BAILIAN_API_KEY`). |
-| `model` | `qwen3.8-max` | Default model id (natively multimodal: text + image). |
-| `vision_model` | `""` | Optional: routes screenshot turns to a different model; empty uses `model`. |
-| `bailian_base_url` | token-plan gateway | OpenAI-compatible endpoint. |
-| `viewer.port` | `8788` | Default port for the viewer/backend. |
-| `dsh_timeout_ms` | `900000` | Kill timer for a DSH child process. |
-| `paths.*` | see file | `dsh_bin`, `bailian_patch`, `three`, `samples`, `runs`. |
-
-### Build
-
-The backend serves the web app as a **pre-built** bundle, so compile it once
-here — and re-run it after any front-end change:
-
-```bash
-# Build the SPA (outputs to app/dist, served by the backend at '/')
-npm run app:build
-```
-
----
-
-## Start up and shut down
-
-Two ways to run the system — the **CLI** (one-shot) and the **web app**
-(persistent server). Each needs one command to start and one to stop.
-
-### CLI
-
-- **Start:** `node src/cli.mjs samples/drone_dji_inspire3.glb --lang javascript`
-- **Shut down:** `Ctrl+C` — or just answer the visual gate (`pass` to accept); the CLI exits on its own.
-
-### Web app
-
-- **Start:** `npm run server` — then open the printed address, e.g. `http://127.0.0.1:8788`.
-- **Shut down:** `Ctrl+C` in the server terminal.
-
-> The web app is served from `app/dist`, so run [`npm run app:build`](#build) once during installation first.
-
-## Usage
-
-How to drive a rigged mesh and debug its controller from the web app. Use the
-toolbar to **Load mesh** (discover joints from a GLB), **Validate** an existing
-controller, or **Generate (DSH)** a new one — then select a joint to drive it
-with the control knobs and the assistant.
-
-### The three-pane shell
-
-The shell has three draggable panes — **3D mesh viewer · control knobs · AI assistant** — with a dark/light theme toggle (persisted in browser `localStorage`). The knob panel is rendered entirely from the **Slot Graph** for the active joint.
-
-### Control knobs
-
-These are the live drivers for the selected joint. Moving a knob updates the 3D
-viewer in real time and exercises the controller's runtime contract:
-
-- **Speed slider** *(rotor)* — target speed in m/s (`0` = props stopped, up to `10`, step `0.1`); rotor RPM eases toward it.
-- **Turn toggle** *(rotor)* — **Turn Left / Turn Right / Go Straight**; yaw spins the diagonal propeller pairs differentially (CW vs CCW).
-- **Pitch & yaw sliders** *(gimbal)* — tilt the camera body; pitch is clamped to `[-90, 30]`, yaw to `[-120, 120]`.
-- **Angle slider / readout** *(hinge, gimbal)* — drive a hinge angle, or show a derived read-only angle.
-
-Knob changes broadcast live (the `ui:knobChanged` event) and the viewer re-renders
-the mesh, so you *see* the rig respond — the human visual gate the automated
-checks can't replace.
-
-### The AI assistant (chatbot)
-
-**The AI assistant is a live DSH debugging agent** (the same loop a human debugger would run): its session cwd is the run dir, pre-populated by [`server/agent-workspace.mjs`](server/agent-workspace.mjs) with an `AGENTS.md` persona and a `kernel-cli.mjs` tool belt (`validate` · `rig <jointId>` · `joints` · `state`) that calls this server's REST API. The web profile is patched to enable its bash tool; the supervisor keeps DSH's atomic `workspace-write` preset (writes sandboxed to the run dir) and auto-allows each approval request over the host's `/api/respond` channel — so the agent runs tools autonomously without ever escaping the workspace. (Overriding the approval policy alone composes a `custom` preset that aborts host boot, which is why auto-allow is done supervisor-side.) The supervisor drives the host over its verified wire contract: unary RPCs via `POST /api/<method>`, and the live event stream via the **downlink-only WebSocket** `ws://…/api/events.mux` (a plain GET returns HTTP 426). Workflow: reproduce via `validate` → inspect the rig report (`GET /api/joints/:id/rig` — node parent chains, rest world positions, rotor disc membership, and the cousin-blade warning that prevents per-node rotation) → patch `controller.js` → re-validate until tier-1 passes.
-
-### Attaching screenshots
-
-**Screenshots are human-initiated**: paste from the clipboard (Ctrl+V) or upload via the 📎 button; thumbnails queue above the composer and ride along with the next message (`POST /api/agent/attach` → inline base64 image parts in `session.prompt`). The default `qwen3.8-max` is **natively multimodal (text + image)** and is declared with `input: [text, image]` in `bailian.patch.yml`, so screenshot turns work out of the box on the same model as text. (DSH under-claims text-only unless a model declares its input modalities, which is why that declaration is required — without it the host refuses the image at prompt time with `MODEL_DOES_NOT_SUPPORT_IMAGES`.) Set `vision_model` in `config.json` only to route image turns to a *different* model, which must likewise be declared with `input: [text, image]`. The chat streams token deltas and ⚙ tool lines live; transcript entries (text, attachment refs, tool summaries) persist in `sessions/latest.json` and are replayed on reload.
-
-## CLI reference
-
-```bash
-node src/cli.mjs <glb> [options]
-```
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--controller <file>` | — | Skip generation; validate an existing controller module. |
-| `--out <file>` | — | Copy the accepted controller here. |
-| `--lang <id>` | `javascript` | `javascript` \| `python` \| `csharp` (py/cs are stubs). |
-| `--model <id>` | from config | Bailian model id. |
-| `--rounds <n>` | `1` | Max repair rounds (single pass by default). |
-| `--gate <mode>` | `interactive` | `interactive` (opens the live 3D viewer + prompts) \| `auto`. |
-| `--port <n>` | from config | Viewer HTTP port. |
-| `--config <file>` | `<repo>/config.json` | Config path. |
-| `--verbose` | off | Trace every event to stderr. |
-
-**Generate a controller** (interactive visual gate):
-
-```bash
-node src/cli.mjs samples/drone_dji_inspire3.glb --lang javascript
-```
-
-**Validate-only + auto gate** (the bundled smoke test):
-
-```bash
-npm run prove
-# = node src/cli.mjs samples/drone_dji_inspire3.glb --controller samples/drone-controller.js --gate auto
-```
-
-When the interactive gate passes, the CLI prints a **human visual-verification checklist** and serves the live viewer at `http://127.0.0.1:<port>/viewer/viewer.html?glb=…&ctl=…`. Type `pass` to accept, or describe what's wrong to trigger a note-driven repair round.
-
-## Web app development
-
-For front-end work, run the Vite dev server **alongside** the backend: it serves
-the Vue app from source with hot-module reload and proxies the API + asset
-prefixes to Fastify, so you never rebuild `app/dist` while iterating.
-
-```bash
-npm run server        # terminal A — backend + API on :8788
-npm run app:dev       # terminal B — Vite dev server on :5173 (proxies /api, /samples, /runs, /viewer to :8788)
-```
-
-Open the **Vite** URL (`http://127.0.0.1:5173`) for live reload; `:8788` keeps
-serving the last built bundle. Override with `MCC_APP_PORT` / `MCC_BACKEND`.
-
-**Backend integration test** (health, SPA serving, discovery, slot graphs, validation, resume, WebSocket events):
-
-```bash
-npm run prove:shell -- http://127.0.0.1:8788
-```
-
-### REST / WS surface
-
-| Method & path | Purpose |
-|---------------|---------|
-| `GET /api/health` | Plugins, run dir, agent status. |
-| `GET /api/state` | Current server-side project state (for load/resume). |
-| `POST /api/project` `{ glb }` | Register asset + discover joints. |
-| `POST /api/validate` `{ file }` | Validate a controller against the loaded mesh. |
-| `POST /api/generate` `{ lang, model }` | Single emit→validate generate pass (rounds fixed at 1). |
-| `GET /api/joints/:id/slots` | Slot Routing Graph for a joint. |
-| `GET /api/session/resume` | Persisted session (transcript + project pointer). |
-| `WS /api/events` | Live kernel bus events (hello + stream). |
-
-## The generated controller contract
-
-Emitted controllers are **ES modules** exporting a single factory. The test harness and viewer import exactly this shape:
-
-```js
-import { createDroneController } from './samples/drone-controller.js';
-
-const ctl = createDroneController(gltfSceneRoot, THREE);
-
-ctl.update(dtSeconds);          // call once per animation frame
-ctl.setSpeed(metersPerSecond);  // 0 = hover; speed eases toward target
-ctl.turnLeft(); ctl.turnRight(); ctl.goStraight();
-ctl.setGimbal(pitchDeg, yawDeg);// pitch clamped to [-90, 30], yaw to [-120, 120]
-ctl.getState();                 // { speed, headingDeg, props:[{name, rpm}], gimbal:{pitch, yaw} }
-```
-
-Controllers use **only** the `THREE` namespace passed as the second argument — no imports, DOM, network, timers, or globals — and must guard every node lookup (warn once and skip; never throw).
-
-## Run artifacts
-
-Each run writes to `runs/<timestamp>/`:
-
-| File | Contents |
-|------|----------|
-| `context.json` | Shared Context Store snapshot (work state). |
-| `trace.jsonl` | Dev Diagnostics event trace (one slim JSON object per event). |
-| `report.json` | Final result: accepted, rounds, failures, warnings, metrics, joints, diagnostic counts. |
-| `dsh.log` | The DSH child process output. |
-| `controller.mjs` / `controller.view.js` | Generated controller (and the copy the viewer imports). |
-| `task.md` | The generation task handed to DSH. |
-
----
-
-## Project layout
+### Project layout
 
 ```
 src/
