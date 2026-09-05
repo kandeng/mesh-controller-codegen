@@ -1,14 +1,46 @@
 // glTF/GLB JSON-chunk parser for the controller-generation tool.
 // Everything tier-0/tier-1 need (names, hierarchy, translations, local mesh
 // bbox extents) lives in the JSON chunk — no BIN decode required.
+//
+// Extraction is LIBRARY-FIRST: @gltf-transform/core validates the container
+// (magic, version, chunk bounds) and returns the embedded glTF JSON. If the
+// library ever rejects a file, the hand-rolled 5-line GLB chunk reader is the
+// safety net — a fallback parse is tagged parser:'builtin-fallback' so the
+// non-compliant container shows up in diagnostics. Text .gltf JSON is accepted
+// too (the analysis below only needs the JSON document).
 import { readFileSync } from 'node:fs';
+import { NodeIO } from '@gltf-transform/core';
 
-export function parseGlb(path) {
+const io = new NodeIO();
+
+// Async because the library's binaryToJSON is Promise-based (v4.5.0).
+export async function extractGltfJson(raw) {
+  if (raw.length < 20 || raw.readUInt32LE(0) !== 0x46546c67) {
+    // Not a GLB container — accept a plain .gltf JSON document.
+    if (raw.toString('utf8', 0, Math.min(raw.length, 64)).trimStart().startsWith('{')) {
+      return { g: JSON.parse(raw.toString('utf8')), parser: 'gltf-text' };
+    }
+    throw new Error('not a GLB (bad magic) and not a .gltf JSON document');
+  }
+  try {
+    const doc = await io.binaryToJSON(new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength));
+    return { g: doc.json, parser: 'gltf-transform' };
+  } catch (libErr) {
+    // Safety net: hand-rolled container read (spec-frozen since glTF 2.0).
+    try {
+      const clen = raw.readUInt32LE(12);
+      if (raw.readUInt32LE(16) !== 0x4e4f534a) throw new Error('first chunk is not JSON');
+      const g = JSON.parse(raw.subarray(20, 20 + clen).toString('utf8'));
+      return { g, parser: 'builtin-fallback' };
+    } catch (ownErr) {
+      throw new Error(`glTF extraction failed — library: ${libErr.message}; fallback: ${ownErr.message}`);
+    }
+  }
+}
+
+export async function parseGlb(path) {
   const raw = readFileSync(path);
-  if (raw.readUInt32LE(0) !== 0x46546c67) throw new Error('not a GLB (bad magic)');
-  const clen = raw.readUInt32LE(12);
-  if (raw.readUInt32LE(16) !== 0x4e4f534a) throw new Error('first chunk is not JSON');
-  const g = JSON.parse(raw.subarray(20, 20 + clen).toString('utf8'));
+  const { g, parser } = await extractGltfJson(raw);
   const nodes = g.nodes || [];
   const parent = new Array(nodes.length).fill(-1);
   nodes.forEach((n, i) => (n.children || []).forEach((c) => { parent[c] = i; }));
@@ -128,6 +160,7 @@ export function parseGlb(path) {
     center: [cx, cy],
     count: nodes.length,
     animations: (g.animations || []).length,
+    parser,
   };
 }
 

@@ -117,8 +117,15 @@ tool to close a capability gap, keep the wrapper script in this directory and
 append one line: capability — wrapper — package@version (or "hand-rolled") —
 exact invocation — the smoke-test assertion that passed.
 
+Pre-installed at the repo root (pinned in package.json — never hand-roll or
+download for these jobs): \`@gltf-transform/core\` 4.5.0 — the reference library
+for glTF/GLB work: container validation, embedded-JSON extraction, node/skin/
+accessor queries. Use \`import { NodeIO } from '@gltf-transform/core'\` in your
+wrapper scripts; the project's own parser (src/lib/gltf.mjs) is library-first
+with a hand-rolled fallback.
+
 <!-- example line:
-- glTF json extraction — extract-gltf-json.mjs — hand-rolled — \`node extract-gltf-json.mjs <file.glb>\` — asserted parsed json has nodes[] and skins[].joints[]
+- glTF json extraction — extract-gltf-json.mjs — @gltf-transform/core@4.5.0 (pre-installed) — \`node extract-gltf-json.mjs <file.glb>\` — asserted parsed json has nodes[] and skins[].joints[]
 -->
 `;
 

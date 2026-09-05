@@ -10,9 +10,9 @@ import { parseGlb } from '../../src/lib/gltf.mjs';
 // Memoized per GLB path: the rig report re-reads the full node table, and the
 // 23MB sample should not be re-parsed on every assistant call.
 let glbCache = { path: null, g: null };
-function parsed(glbPath) {
+async function parsed(glbPath) {
   if (!glbPath) return null;
-  if (glbCache.path !== glbPath) glbCache = { path: glbPath, g: parseGlb(glbPath) };
+  if (glbCache.path !== glbPath) glbCache = { path: glbPath, g: await parseGlb(glbPath) };
   return glbCache.g;
 }
 
@@ -69,7 +69,7 @@ export function jointRoutes(app, kernel) {
   app.get('/api/joints/:id/rig', async (req, reply) => {
     const joint = (kernel.current.joints || []).find((j) => j.id === req.params.id);
     if (!joint) return reply.code(404).send({ ok: false, error: `joint not found: ${req.params.id}` });
-    const g = parsed(kernel.current.glbPath);
+    const g = await parsed(kernel.current.glbPath);
     if (!g) return reply.code(400).send({ ok: false, error: 'no project loaded; POST /api/project first' });
 
     const byName = new Map(g.nodes.map((n) => [n.name, n]));

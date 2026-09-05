@@ -31,7 +31,7 @@ export async function discoverJoints(host, glbPath) {
   const discovery = host.registry.get(CATEGORY.DISCOVERY, 'geometry');
   if (!discovery) throw new Error('discovery plugin "geometry" not registered');
 
-  const { stats, dump, joints } = discovery.api.discover(GLB, host);
+  const { stats, dump, joints } = await discovery.api.discover(GLB, host);
 
   const spec = createMotionSpec({ assetId: asset.id, path: GLB });
   for (const j of joints) addJoint(spec, j);

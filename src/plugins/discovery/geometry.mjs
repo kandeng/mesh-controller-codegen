@@ -47,8 +47,8 @@ export const geometryDiscovery = definePlugin({
   version: '1.0.0',
   contributes: { description: 'Geometry-heuristic joint discovery for static GLBs (no embedded animations).' },
   api: {
-    discover(glbPath, host) {
-      const g = parseGlb(glbPath);
+    async discover(glbPath, host) {
+      const g = await parseGlb(glbPath);
       const joints = [];
 
       for (const [i, c] of rotorClusters(g).entries()) {
