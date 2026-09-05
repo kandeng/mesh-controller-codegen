@@ -2,6 +2,7 @@
 // (the run dir), written at session create:
 //   - AGENTS.md        the persona + debug workflow the agent follows
 //   - kernel-cli.mjs   the agent's window into the kernel (validate / rig / state)
+//   - TOOLS.md         lab notebook: tools acquired to close capability gaps
 //   - web.patch.yml    profile overlay: enable bash, never block on approvals
 //   - model.patch.yml  model override (only when not the profile default)
 // The DSH web profile ships no MCP client and patches cannot add plugins, so the
@@ -82,11 +83,49 @@ floating away from a hub = wrong rotation origin; a static blade at max speed =
 node not in the spin set or wrong axis; mirrored/identical diagonal rpm =
 differential bug. Translate what you see into a validate-able hypothesis, then
 follow the workflow above.
+
+## Capability gaps (standing orders)
+When a task needs a capability you do not hold, never give up and never guess —
+run this loop:
+1. Check TOOLS.md first: an earlier turn may already have installed and
+   verified a tool for exactly this capability. Reuse it; skip to step 6.
+2. Compose before downloading. Your universal tools (bash, node, python, curl,
+   fs + str-replace-editor) cover more than you expect. Example: a .glb file is
+   a container — 12-byte header, then chunks of (uint32 length, uint32 type);
+   the chunk typed 0x4E4F534A ('JSON') IS the embedded glTF json (nodes,
+   skins[].joints, accessors). A ~15-line node script extracts it; no package.
+3. Only if composition fails its smoke test, discover a package: query public
+   registries with curl — \`curl -s 'https://registry.npmjs.org/-/v1/search?text=<q>'\`
+   or \`curl -s https://pypi.org/pypi/<pkg>/json\` — and pick by fit and downloads.
+4. Install into THIS directory only (your sandbox), pinned to the version you
+   will verify: \`npm install --no-save --prefix . <pkg>@<ver>\` or
+   \`pip install --target=./libs <pkg>==<ver>\`. Never install globally.
+5. Smoke-test before trusting: minimal invocation on a known sample, asserting
+   the output SHAPE (fields present, types right). On failure: next candidate,
+   or fall back to your composed script from step 2.
+6. Use the verified tool for the real task.
+7. Crystallize: keep the wrapper script you wrote (e.g. extract-gltf-json.mjs)
+   and append one line to TOOLS.md — capability, wrapper, package@version,
+   exact invocation, the assertion that passed. Future turns skip rediscovery.
+`;
+
+const TOOLS_MD = `# TOOLS.md — lab notebook of tools acquired in this workspace
+
+Convention (see AGENTS.md "Capability gaps"): before acquiring anything, check
+the ledger below and reuse what already passed. When you install or compose a
+tool to close a capability gap, keep the wrapper script in this directory and
+append one line: capability — wrapper — package@version (or "hand-rolled") —
+exact invocation — the smoke-test assertion that passed.
+
+<!-- example line:
+- glTF json extraction — extract-gltf-json.mjs — hand-rolled — \`node extract-gltf-json.mjs <file.glb>\` — asserted parsed json has nodes[] and skins[].joints[]
+-->
 `;
 
 export function writeAgentWorkspace({ runDir, port, model, defaultModel = 'qwen3.8-max' }) {
   writeFileSync(resolve(runDir, 'AGENTS.md'), AGENTS_MD + slashSection());
   writeFileSync(resolve(runDir, 'kernel-cli.mjs'), KERNEL_CLI(port));
+  writeFileSync(resolve(runDir, 'TOOLS.md'), TOOLS_MD);
 
   // Profile overlay: the web profile ships the bash tool disabled. Enable it so
   // the assistant can run kernel-cli.mjs. We deliberately DO NOT touch the
