@@ -63,6 +63,65 @@ cp config.example.json config.json
 
 `config.json` is **gitignored** — the real key is never committed. All paths in it are resolved relative to the repo root, so nothing is hardcoded to a parent checkout.
 
+### The DSH runtime (install, version, upgrade)
+
+DSH (DeepSeek Harness) is the agent harness underneath both front-ends. It is
+installed as an ordinary npm package, **isolated in [`runtime/`](runtime)** —
+its own `package.json` + `package-lock.json` (both committed) pin the version;
+its `node_modules` is gitignored. The binary lands at
+`runtime/node_modules/.bin/dsh`, exactly where `config.json → paths.dsh_bin`
+points. Nothing else on your system is touched, and DSH is spawned lazily:
+once per CLI run, or once per web session (on the first chat message) — never
+at boot.
+
+**Which version am I on?**
+
+```bash
+runtime/node_modules/.bin/dsh --version     # what the binary reports
+npm --prefix runtime ls @deepseek-ai/dsh    # what the lockfile installed
+```
+
+**Which versions exist?**
+
+```bash
+npm view @deepseek-ai/dsh versions
+```
+
+Releases ride prerelease tags (`0.1.1-rc.2`, `0.1.2-rc.1`, …). npm's `latest`
+dist-tag skips prereleases, so always name the exact version you want.
+
+**Upgrade (or downgrade) to a specific version:**
+
+```bash
+npm --prefix runtime install @deepseek-ai/dsh@0.1.2-rc.1   # any exact version
+```
+
+This rewrites `runtime/package.json` + `runtime/package-lock.json` to that
+version. Restart the server (or start a new CLI run) — the supervisor spawns
+DSH per session, so the new binary is picked up on the next spawn; no web-app
+rebuild is needed.
+
+**Verify after switching:**
+
+```bash
+runtime/node_modules/.bin/dsh --version
+npm run server                                  # then, in a second terminal:
+npm run prove:shell -- http://127.0.0.1:8788    # backend integration checks
+```
+
+Then exercise one live chat turn (plus one screenshot turn if you attach
+images): rc-line releases have historically shifted RPC/patch behaviour, and
+those two turns cover every surface we depend on (session RPC, SSE event mux,
+approval auto-allow, image content parts).
+
+**Roll back:** reinstall the previous exact version the same way, or restore
+the committed pin and reinstall from the lockfile:
+
+```bash
+git checkout -- runtime/package.json runtime/package-lock.json
+npm --prefix runtime ci
+```
+
 ### Configuration ([`config.example.json`](config.example.json))
 
 | Key | Default | Meaning |
