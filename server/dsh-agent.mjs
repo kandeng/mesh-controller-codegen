@@ -119,7 +119,15 @@ export function createDshAgent(kernel) {
     } else if (kind === 'turn/end') {
       if (pendingTurn) {
         const p = pendingTurn; pendingTurn = null; clearTimeout(p.timer);
-        if (ev.data?.reason?.kind === 'error') p.reject(new Error('agent turn failed'));
+        if (ev.data?.reason?.kind === 'error') {
+          // Surface the host's reason detail — 'agent turn failed' alone is
+          // undiagnosable (provider errors, image rejections, etc.).
+          const r = ev.data.reason;
+          const detail = r.message || r.error?.message
+            || (typeof r.error === 'string' ? r.error : '')
+            || JSON.stringify(r).slice(0, 300);
+          p.reject(new Error(`agent turn failed: ${detail}`.slice(0, 400)));
+        }
         else p.resolve();
       }
     } else if (kind === 'error') {
@@ -227,25 +235,33 @@ export function createDshAgent(kernel) {
       const spawned = await spawnWebHost(runDir, patches);
       child = spawned.child; base = spawned.base;
 
-      // Resume with the persisted sessionId when we have one (session.create is
-      // idempotent for same id+cwd); otherwise mint and persist a fresh id.
-      const persisted = kernel.sessionStore?.get?.().sessionId;
-      const wanted = typeof persisted === 'string' && persisted && persisted !== 'stub-session'
-        ? persisted : `mcc-${randomUUID()}`;
-      let created;
       try {
-        created = await rpc('session.create', { cwd: runDir, sessionId: wanted });
+        // Resume with the persisted sessionId when we have one (session.create is
+        // idempotent for same id+cwd); otherwise mint and persist a fresh id.
+        const persisted = kernel.sessionStore?.get?.().sessionId;
+        const wanted = typeof persisted === 'string' && persisted && persisted !== 'stub-session'
+          ? persisted : `mcc-${randomUUID()}`;
+        let created;
+        try {
+          created = await rpc('session.create', { cwd: runDir, sessionId: wanted });
+        } catch (e) {
+          // A stale id can conflict after host restarts — mint a fresh session.
+          if (!/conflict/i.test(e.message)) throw e;
+          created = await rpc('session.create', { cwd: runDir, sessionId: `mcc-${randomUUID()}` });
+        }
+        sessionId = created?.sessionId || wanted;
+        kernel.sessionStore?.setSession({ sessionId });
+        mode = 'live';
+        lastModel = null;
+        connectMux();
+        log(`live: ${base} session=${sessionId}`);
       } catch (e) {
-        // A stale id can conflict after host restarts — mint a fresh session.
-        if (!/conflict/i.test(e.message)) throw e;
-        created = await rpc('session.create', { cwd: runDir, sessionId: `mcc-${randomUUID()}` });
+        // Handshake failed (e.g. an incompatible DSH runtime wire API): tear the
+        // spawned host down before degrading to stub — never leak the child.
+        try { child?.kill('SIGTERM'); } catch { /* already gone */ }
+        child = null; base = null;
+        throw e;
       }
-      sessionId = created?.sessionId || wanted;
-      kernel.sessionStore?.setSession({ sessionId });
-      mode = 'live';
-      lastModel = null;
-      connectMux();
-      log(`live: ${base} session=${sessionId}`);
     })();
     try { await startPromise; } finally { startPromise = null; }
   }
