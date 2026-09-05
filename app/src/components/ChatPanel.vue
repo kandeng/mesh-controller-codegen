@@ -21,6 +21,8 @@ const fileInput = ref(null);
 const pending = ref([]);   // [{ id, url, name, mediaType }] uploaded, not yet sent
 const uploading = ref(0);
 const lightbox = ref(null);   // { url, name } of the image shown full-size
+const taRef = ref(null);      // composer textarea
+const userH = ref(null);      // manual composer height in px; null = auto-grow
 
 const readAsBase64 = (file) => new Promise((res, rej) => {
   const fr = new FileReader();
@@ -84,7 +86,49 @@ async function submit() {
   draft.value = '';
   pending.value = [];
   send(t, atts);
+  nextTick(autoGrow);
 }
+
+// Composer height: the textarea auto-grows with its content (wrapped or pasted
+// lines) up to a cap, then scrolls inside. Dragging the grip above the box
+// switches to a manual height; double-clicking the grip returns to auto-grow.
+const MIN_H = 34;
+const autoMax = () => Math.max(140, Math.round(innerHeight * 0.35));
+const manMax = () => Math.round(innerHeight * 0.7);
+function autoGrow() {
+  const el = taRef.value;
+  if (!el || userH.value) return;
+  const border = el.offsetHeight - el.clientHeight;
+  el.style.height = 'auto';
+  el.style.height = Math.min(Math.max(el.scrollHeight + border, MIN_H), autoMax()) + 'px';
+}
+watch(draft, () => nextTick(autoGrow));
+
+// Enter sends, Shift+Enter inserts a newline (textarea default).
+function onEnterKey(e) {
+  if (e.isComposing) return;
+  if (!e.shiftKey) { e.preventDefault(); submit(); }
+}
+
+function startResize(e) {
+  e.preventDefault();
+  const el = taRef.value;
+  if (!el) return;
+  const y0 = e.clientY;
+  const h0 = el.offsetHeight;
+  const move = (ev) => {
+    const h = Math.min(Math.max(h0 + (y0 - ev.clientY), MIN_H), manMax());
+    userH.value = h;
+    el.style.height = h + 'px';
+  };
+  const up = () => {
+    removeEventListener('pointermove', move);
+    removeEventListener('pointerup', up);
+  };
+  addEventListener('pointermove', move);
+  addEventListener('pointerup', up);
+}
+function resetHeight() { userH.value = null; nextTick(autoGrow); }
 
 async function scrollDown() {
   await nextTick();
@@ -93,7 +137,7 @@ async function scrollDown() {
 watch(() => state.transcript.length, scrollDown);
 watch(() => state.transcript[state.transcript.length - 1]?.text, scrollDown); // streaming deltas
 
-onMounted(async () => { connect(); await resume(); scrollDown(); addEventListener('keydown', onKeydown); });
+onMounted(async () => { connect(); await resume(); scrollDown(); nextTick(autoGrow); addEventListener('keydown', onKeydown); });
 onBeforeUnmount(() => { removeEventListener('keydown', onKeydown); });
 </script>
 
@@ -135,7 +179,10 @@ onBeforeUnmount(() => { removeEventListener('keydown', onKeydown); });
       <input ref="fileInput" type="file" accept="image/*" multiple hidden @change="attachFiles([...fileInput.files]); fileInput.value = ''" />
       <button type="button" class="attach" title="Capture the 3D viewer as a screenshot" :disabled="state.busy || !state.viewer.glb" @click="captureViewer"><span class="ic ic-shot" aria-hidden="true"></span></button>
       <button type="button" class="attach" title="Upload an image (or paste with Ctrl+V)" :disabled="state.busy" @click="fileInput.click()"><span class="ic ic-folder" aria-hidden="true"></span></button>
-      <input v-model="draft" type="text" placeholder="Message the assistant… (paste screenshots with Ctrl+V)" :disabled="state.busy" @paste="onPaste" />
+      <div class="ta-wrap">
+        <div class="grip" title="Drag to resize · double-click for auto height" @pointerdown="startResize" @dblclick="resetHeight"><span /></div>
+        <textarea ref="taRef" v-model="draft" rows="1" placeholder="Message the assistant… Enter sends · Shift+Enter new line · Ctrl+V pastes screenshots" :disabled="state.busy" @paste="onPaste" @keydown.enter="onEnterKey"></textarea>
+      </div>
       <button type="submit" :disabled="state.busy || uploading > 0 || (!draft.trim() && !pending.length)">Send</button>
     </form>
 
@@ -174,10 +221,15 @@ onBeforeUnmount(() => { removeEventListener('keydown', onKeydown); });
 .thumb img { width: 52px; height: 52px; object-fit: cover; border-radius: 6px; border: 1px solid var(--border-2); display: block; }
 .thumb .x { position: absolute; top: -6px; right: -6px; width: 18px; height: 18px; line-height: 14px; padding: 0; border-radius: 50%; background: var(--panel-2); color: var(--text); border: 1px solid var(--border-2); cursor: pointer; font-size: 12px; }
 .uploading { color: var(--muted); font-size: 11px; font-style: italic; }
-.composer { display: flex; gap: 6px; padding-top: 8px; border-top: 1px solid var(--border); margin-top: 8px; }
-.composer input[type="text"] { flex: 1; background: var(--input-bg); border: 1px solid var(--border-2); border-radius: 7px; color: var(--text); padding: 8px 10px; font-size: 13px; }
-.composer input:focus { outline: none; border-color: var(--border-accent); }
-.composer button { background: var(--accent); border: 1px solid var(--accent-2); color: #fff; border-radius: 7px; padding: 0 14px; cursor: pointer; font-size: 13px; }
+.composer { display: flex; gap: 6px; padding-top: 8px; border-top: 1px solid var(--border); margin-top: 8px; align-items: flex-end; }
+.ta-wrap { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+/* Height grip: drag vertically to set a manual composer height, dblclick = auto. */
+.grip { height: 9px; display: flex; align-items: center; justify-content: center; cursor: ns-resize; touch-action: none; }
+.grip span { width: 34px; height: 3px; border-radius: 2px; background: var(--border-2); }
+.grip:hover span { background: var(--border-accent); }
+.composer textarea { resize: none; overflow-y: auto; width: 100%; min-height: 34px; background: var(--input-bg); border: 1px solid var(--border-2); border-radius: 7px; color: var(--text); padding: 8px 10px; font-size: 13px; line-height: 1.45; font-family: inherit; display: block; }
+.composer textarea:focus { outline: none; border-color: var(--border-accent); }
+.composer button { background: var(--accent); border: 1px solid var(--accent-2); color: #fff; border-radius: 7px; padding: 0 14px; height: 35px; cursor: pointer; font-size: 13px; }
 .composer button.attach { background: var(--panel-2); border-color: var(--border-2); color: var(--text); padding: 0 10px; display: inline-flex; align-items: center; justify-content: center; }
 /* Icon glyphs: the SVG artwork is applied as a CSS mask so the tint follows the
    button's currentColor (theme-aware) instead of the file's baked-in gray. */
