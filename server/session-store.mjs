@@ -6,6 +6,9 @@
 // Split of responsibility (from the captured design):
 //   - WORK state (joints, controllers, validation) = kernel context (system-of-record)
 //   - CONVERSATION state (transcript, DSH sessionId) = this store
+// Every transcript entry carries a monotonic `seq` (independent of clears) so all
+// connected tabs of this single-install session can apply entries idempotently
+// and converge resume payloads with live broadcast frames.
 // In M2 the persisted sessionId is handed to session.create to resume the live
 // agent; until then the transcript alone restores the visible conversation.
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
@@ -16,7 +19,7 @@ export function createSessionStore({ repoRoot, dir = 'sessions' }) {
   const file = resolve(base, 'latest.json');
   mkdirSync(base, { recursive: true });
 
-  const blank = () => ({ sessionId: null, glb: null, runDir: null, updatedAt: Date.now(), transcript: [], work: {} });
+  const blank = () => ({ sessionId: null, glb: null, runDir: null, updatedAt: Date.now(), seq: 0, transcript: [], work: {} });
   let state = blank();
   if (existsSync(file)) {
     try { state = { ...blank(), ...JSON.parse(readFileSync(file, 'utf8')) }; } catch { /* corrupt -> start fresh */ }
@@ -27,7 +30,7 @@ export function createSessionStore({ repoRoot, dir = 'sessions' }) {
   return {
     file,
     get: () => state,
-    append(msg) { state.transcript.push(msg); persist(); return state.transcript.length; },
+    append(msg) { const entry = { ...msg, seq: ++state.seq }; state.transcript.push(entry); persist(); return entry; },
     setSession(patch) { Object.assign(state, patch); persist(); return state; },
     setWork(patch) { state.work = { ...state.work, ...patch }; persist(); return state.work; },
     clearTranscript() { state.transcript = []; persist(); },

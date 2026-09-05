@@ -110,7 +110,7 @@ onBeforeUnmount(() => { removeEventListener('keydown', onKeydown); });
       </div>
       <template v-for="(m, i) in state.transcript" :key="i">
         <div v-if="m.role === 'tool'" class="tool-line" :title="m.text">⚙ {{ m.text }}</div>
-        <div v-else class="msg" :class="[m.role, { streaming: m.streaming }]">
+        <div v-else class="msg" :class="[m.role, { streaming: m.streaming, cmd: m.command }]">
           <div class="bubble">
             <div v-if="m.attachments?.length" class="shots">
               <img v-for="a in m.attachments" :key="a.id || a.url" class="zoomable" :src="a.url" :alt="a.name || 'screenshot'" loading="lazy" @click="openLightbox(a.url, a.name)" />
@@ -160,6 +160,8 @@ onBeforeUnmount(() => { removeEventListener('keydown', onKeydown); });
 .bubble { max-width: 86%; padding: 7px 10px; border-radius: 10px; font-size: 13px; line-height: 1.45; white-space: pre-wrap; }
 .msg.user .bubble { background: var(--accent); color: #fff; border-bottom-right-radius: 3px; }
 .msg.assistant .bubble { background: var(--panel-2); color: var(--text); border: 1px solid var(--border-2); border-bottom-left-radius: 3px; }
+/* Deterministic slash-command replies (e.g. /help) read as output, not prose. */
+.msg.assistant.cmd .bubble { font-family: ui-monospace, monospace; font-size: 12px; }
 .msg.system .bubble { background: transparent; color: var(--warn); font-size: 12px; font-family: ui-monospace, monospace; }
 .msg.streaming .bubble { opacity: .85; }
 .typing { color: var(--muted); font-style: italic; }

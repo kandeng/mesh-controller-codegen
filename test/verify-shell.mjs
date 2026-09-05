@@ -90,6 +90,10 @@ ok('  attach rejects non-images', badAtt.ok === false);
 const agStat = await jget('/api/agent/status');
 ok('GET /api/agent/status', agStat.ok === true && ['stub', 'live'].includes(agStat.mode) && Array.isArray(agStat.methods), `mode=${agStat.mode} session=${agStat.sessionId ?? 'none'}`);
 
+// 7e) Slash-command registry is exposed for the UI (help + clean ship by default).
+const cmds = await jget('/api/agent/commands');
+ok('GET /api/agent/commands', cmds.ok === true && Array.isArray(cmds.commands) && ['help', 'clean'].every((n) => cmds.commands.some((c) => c.name === n && c.usage && c.desc && c.example)), `n=${cmds.commands?.length}`);
+
 // 8) Live events WebSocket streams a hello + kernel events.
 const wsProof = await new Promise((resolve) => {
   const url = BASE.replace(/^http/, 'ws') + '/api/events';

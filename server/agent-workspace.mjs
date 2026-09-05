@@ -8,6 +8,7 @@
 // kernel tools ride as a workspace CLI the agent runs through its bash tool.
 import { writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { slashSection } from './slash-commands.mjs';
 
 const KERNEL_CLI = (port) => `#!/usr/bin/env node
 // Workspace CLI: the assistant's window into the mesh-controller kernel.
@@ -84,7 +85,7 @@ follow the workflow above.
 `;
 
 export function writeAgentWorkspace({ runDir, port, model, defaultModel = 'qwen3.8-max' }) {
-  writeFileSync(resolve(runDir, 'AGENTS.md'), AGENTS_MD);
+  writeFileSync(resolve(runDir, 'AGENTS.md'), AGENTS_MD + slashSection());
   writeFileSync(resolve(runDir, 'kernel-cli.mjs'), KERNEL_CLI(port));
 
   // Profile overlay: the web profile ships the bash tool disabled. Enable it so
