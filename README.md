@@ -47,7 +47,7 @@ The tool ships two front-ends over **one shared pipeline**:
 git clone https://github.com/kandeng/mesh-controller-codegen.git
 cd mesh-controller-codegen
 
-# 2. Root dependencies (Fastify backend + three.js)
+# 2. Root dependencies (Fastify backend + three.js + @gltf-transform/core)
 npm install
 
 # 3. DSH runtime (the agent harness; provides runtime/node_modules/.bin/dsh)
@@ -87,13 +87,23 @@ npm --prefix runtime ls @deepseek-ai/dsh    # what the lockfile installed
 npm view @deepseek-ai/dsh versions
 ```
 
-Releases ride prerelease tags (`0.1.1-rc.2`, `0.1.2-rc.1`, …). npm's `latest`
-dist-tag skips prereleases, so always name the exact version you want.
+Releases ride prerelease tags (`0.1.1-rc.2`, `0.1.2-rc.1`, …), and even the
+`latest` dist-tag may point at a prerelease for this package — so always name
+the exact version you want.
+
+**Compatibility warning.** This repo's supervisor targets the DSH **0.1.1-rc.2**
+web-host wire API (`POST /api/<method>` RPC + the downlink-only `events.mux`
+WebSocket). The newer `0.1.2-*` runtimes replace that surface with a
+token→cookie auth fence, a single `/api` gateway endpoint, a multiplexed
+`remote.mux` WebSocket, and per-session agent presets — the supervisor cannot
+handshake against them, and the app silently degrades to stub replies. Treat an
+upgrade to `0.1.2-*` as a migration of [`server/dsh-agent.mjs`](server/dsh-agent.mjs),
+not a version bump. Until then, stay on `0.1.1-rc.2`.
 
 **Upgrade (or downgrade) to a specific version:**
 
 ```bash
-npm --prefix runtime install @deepseek-ai/dsh@0.1.2-rc.1   # any exact version
+npm --prefix runtime install @deepseek-ai/dsh@<version>   # any exact version
 ```
 
 This rewrites `runtime/package.json` + `runtime/package-lock.json` to that
