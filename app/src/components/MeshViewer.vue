@@ -142,15 +142,17 @@ function jointNodeObjects(j) {
 // rotor radius R, and within the disc plane band) joins the spin. Nodes whose
 // subtree reaches OUTSIDE the disc (e.g. the corner node carrying the landing
 // leg) are skipped so legs/arms never rotate.
+// NOTE the data is Z-UP (XY horizontal, Z vertical — parseGlb world space;
+// GLTFLoader applies the same node transforms, so the viewer scene is Z-up too).
 function rotorAssemblyNodes(j, base) {
   const a = { x: j.anchor.x - center.x, y: j.anchor.y - center.y, z: j.anchor.z - center.z };
   let R = 0.5;
   for (const o of base) {
     const p = restWorld.get(o.name);
-    if (p) R = Math.max(R, Math.hypot(p.x - a.x, p.z - a.z));
+    if (p) R = Math.max(R, Math.hypot(p.x - a.x, p.y - a.y));
   }
-  const dyTol = R * 1.5;
-  const inDisc = (p) => Math.hypot(p.x - a.x, p.z - a.z) <= R && Math.abs(p.y - a.y) <= dyTol;
+  const dzTol = R * 1.5;
+  const inDisc = (p) => Math.hypot(p.x - a.x, p.y - a.y) <= R && Math.abs(p.z - a.z) <= dzTol;
   const inBase = new Set(base.map((o) => o.name));
   const extras = [];
   for (const [name, o] of nodeByName) {
@@ -162,6 +164,25 @@ function rotorAssemblyNodes(j, base) {
     if (whole) extras.push(o);
   }
   return base.concat(extras);
+}
+
+// The set the preview actually drives. Rotors get geometric disc completion
+// (the disc is the physical truth; attachment-sanity floaters there are real
+// blades the warn over-flags, and the completion re-adds them anyway —
+// skipping them would LEAVE A BLADE BEHIND). Gimbal/hinge have no completion,
+// so the battery's floater verdict is applied as the guard: a floating member
+// is discovery over-collection — e.g. the gimbal regex also matched the
+// belly-plate subtree 13.7 units from the anchor, and attach()ing it swung
+// 51 nodes about the gimbal pivot (the torn sheet in the viewer).
+function driveSet(j) {
+  const base = jointNodeObjects(j);
+  if (j?.type === 'rotor') return rotorAssemblyNodes(j, base);
+  const skip = new Set(
+    (j?.tests || [])
+      .filter((t) => t.name === 'attachment-sanity' && t.pass === false)
+      .flatMap((t) => t.floaters || []),
+  );
+  return base.filter((o) => !skip.has(o.name));
 }
 
 function teardownPivot() {
@@ -179,8 +200,7 @@ function teardownPivot() {
 function ensurePivot(j) {
   if (pivot && pivotJointId === j.id) return;
   teardownPivot();
-  const base = jointNodeObjects(j);
-  const nodes = j.type === 'rotor' ? rotorAssemblyNodes(j, base) : base;
+  const nodes = driveSet(j);
   if (!nodes.length || !j.anchor) return;
   pivot = new THREE.Object3D();
   pivot.position.set(j.anchor.x - center.x, j.anchor.y - center.y, j.anchor.z - center.z);
@@ -210,17 +230,19 @@ function applyPreview(dt) {
     const speed = Number(kv.speed || 0);
     const dir = Number(kv.turn || 1) < 0 ? -1 : 1;   // -1 = CCW, +1 = CW
     // Slow-motion visual rate so the spin DIRECTION stays readable by eye.
+    // Scene is Z-up: the rotor spin axis is world Z — NEVER rotation.y (that
+    // is a horizontal axis here and flips the propeller out of plane).
     previewAngle = (previewAngle + speed * 36 * dir * dt) % 360;
-    pivot.rotation.y = previewAngle * DEG2RAD;
+    pivot.rotation.z = previewAngle * DEG2RAD;
     publishGimbal(0, 0, now);
   } else if (j.type === 'gimbal') {
     const p = Number(kv.pitch || 0);
     const y = Number(kv.yaw || 0);
-    pivot.rotation.x = p * DEG2RAD;
-    pivot.rotation.y = y * DEG2RAD;
+    pivot.rotation.x = p * DEG2RAD;   // pitch about a horizontal axis
+    pivot.rotation.z = y * DEG2RAD;   // yaw about the vertical (Z) axis
     publishGimbal(p, y, now);
   } else {
-    pivot.rotation.y = Number(kv.angle || 0) * DEG2RAD;
+    pivot.rotation.z = Number(kv.angle || 0) * DEG2RAD;
     publishGimbal(0, 0, now);
   }
 }
