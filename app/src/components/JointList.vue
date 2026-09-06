@@ -1,18 +1,60 @@
 <script setup>
 // JointList — the discovered maximal-scope joint units. Selecting one sets it
 // active and pulls its slot graph (which knobs/overlays to render).
+import { computed, ref } from 'vue';
 import { useProjectStore } from '../composables/useProjectStore.js';
 import { useSlotRouting } from '../composables/useSlotRouting.js';
+import { useKernelApi } from '../composables/useKernelApi.js';
 
 const { state } = useProjectStore();
 const { selectJoint } = useSlotRouting();
+const api = useKernelApi();
 
 const TYPE_ICON = { rotor: '✈', gimbal: '🎥', hinge: '🔩' };
+
+// Phase-1 hypothesis verdict chip: green ✓ when the deterministic battery
+// auto-accepted the joint, amber ! when a human verdict is needed.
+const chipTip = (j) => {
+  const ev = (j.evidence || []).join(', ') || 'no evidence';
+  const ts = (j.tests || []).map((t) => `${t.pass ? '✓' : '✗'} ${t.name}${t.detail ? ` — ${t.detail}` : ''}`).join('\n');
+  return `evidence: ${ev}\nconfidence: ${j.confidence ?? '—'}${ts ? `\n${ts}` : ''}`;
+};
+
+// Phase-2: ask the AI for one batch of proposals over the needs-verdict
+// frontier. The deterministic battery re-tests every proposal; verdicts stay
+// human (phase 3). Without a live agent the backend refuses gracefully.
+const refining = ref(false);
+const refineMsg = ref('');
+const needsVerdict = computed(() => state.joints.some((j) => j.status === 'needs-verdict'));
+async function refine() {
+  if (refining.value) return;
+  refining.value = true;
+  refineMsg.value = '';
+  try {
+    const r = await api.refine();
+    if (!r.ok) { refineMsg.value = r.error || 'refine failed'; return; }
+    if (r.added) {
+      const j = await api.joints();
+      if (j.ok) state.joints = j.joints;
+    }
+    refineMsg.value = r.added ? `+${r.added} proposal(s)` : (r.reason || 'no new proposals');
+  } catch (e) {
+    refineMsg.value = e.message;
+  } finally {
+    refining.value = false;
+  }
+}
 </script>
 
 <template>
   <div class="joints">
-    <div class="title">Joints <span class="count">{{ state.joints.length }}</span></div>
+    <div class="title">
+      Joints <span class="count">{{ state.joints.length }}</span>
+      <button v-if="needsVerdict" class="refine" :disabled="refining" title="Ask the AI for one batch of joint proposals over the uncertain units" @click="refine">
+        {{ refining ? '…' : '✦ AI refine' }}
+      </button>
+      <span v-if="refineMsg" class="refinemsg">{{ refineMsg }}</span>
+    </div>
     <ul>
       <li
         v-for="j in state.joints"
@@ -23,6 +65,8 @@ const TYPE_ICON = { rotor: '✈', gimbal: '🎥', hinge: '🔩' };
         <span class="icon">{{ TYPE_ICON[j.type] || '•' }}</span>
         <span class="label">{{ j.label }}</span>
         <span class="meta">{{ j.type }} · {{ j.nodeCount }}</span>
+        <span v-if="j.status === 'auto-accepted'" class="chip ok" :title="chipTip(j)">✓</span>
+        <span v-else-if="j.status === 'needs-verdict'" class="chip warn" :title="chipTip(j)">!</span>
       </li>
     </ul>
     <div v-if="!state.joints.length" class="empty">No joints discovered yet.</div>
@@ -43,5 +87,15 @@ li.active { border-color: var(--accent-2); background: var(--item-active); }
 .icon { width: 16px; text-align: center; }
 .label { flex: 1; }
 .meta { font-family: ui-monospace, monospace; font-size: 11px; color: var(--muted); }
+.chip { font-size: 10px; font-weight: 700; border-radius: 8px; padding: 0 5px; line-height: 15px; border: 1px solid; }
+.chip.ok { color: var(--good); border-color: var(--good); }
+.chip.warn { color: #b58900; border-color: #b58900; }
+.refine {
+  margin-left: 8px; font-size: 10px; font-family: inherit; cursor: pointer;
+  color: var(--accent-2, #6aa); background: none; border: 1px solid var(--border-accent, #456);
+  border-radius: 8px; padding: 1px 7px;
+}
+.refine:disabled { opacity: 0.5; cursor: default; }
+.refinemsg { margin-left: 6px; font-size: 10px; color: var(--faint); }
 .empty { color: var(--faint); font-style: italic; padding: 6px 2px; }
 </style>

@@ -15,6 +15,8 @@ export function useKernelApi() {
     generate: (opts) => post('/api/generate', opts || {}),
     pickFile: (opts) => post('/api/fs/pick', opts || {}),
     slots: (id) => get(`/api/joints/${encodeURIComponent(id)}/slots`),
+    joints: () => get('/api/joints'),
+    refine: () => post('/api/manifest/refine'),
     renders: () => get('/api/renders'),
     resume: () => get('/api/session/resume'),
     agentStatus: () => get('/api/agent/status'),
