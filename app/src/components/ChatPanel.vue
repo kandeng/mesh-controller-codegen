@@ -11,7 +11,7 @@ import { useKernelApi } from '../composables/useKernelApi.js';
 import { useViewerCapture } from '../composables/useViewerCapture.js';
 
 const { state } = useProjectStore();
-const { connect, send, resume } = useAgentSocket();
+const { connect, send, resume, stop } = useAgentSocket();
 const api = useKernelApi();
 const { capture: captureViewerFrame } = useViewerCapture();
 
@@ -175,15 +175,17 @@ onBeforeUnmount(() => { removeEventListener('keydown', onKeydown); });
       </div>
       <span v-if="uploading" class="uploading">uploading…</span>
     </div>
+    <div v-if="state.notice" class="queue-notice">{{ state.notice }}</div>
     <form class="composer" @submit.prevent="submit">
       <input ref="fileInput" type="file" accept="image/*" multiple hidden @change="attachFiles([...fileInput.files]); fileInput.value = ''" />
-      <button type="button" class="attach" title="Capture the 3D viewer as a screenshot" :disabled="state.busy || !state.viewer.glb" @click="captureViewer"><span class="ic ic-shot" aria-hidden="true"></span></button>
-      <button type="button" class="attach" title="Upload an image (or paste with Ctrl+V)" :disabled="state.busy" @click="fileInput.click()"><span class="ic ic-folder" aria-hidden="true"></span></button>
+      <button type="button" class="attach" title="Capture the 3D viewer as a screenshot" :disabled="!state.viewer.glb" @click="captureViewer"><span class="ic ic-shot" aria-hidden="true"></span></button>
+      <button type="button" class="attach" title="Upload an image (or paste with Ctrl+V)" @click="fileInput.click()"><span class="ic ic-folder" aria-hidden="true"></span></button>
       <div class="ta-wrap">
         <div class="grip" title="Drag to resize · double-click for auto height" @pointerdown="startResize" @dblclick="resetHeight"><span /></div>
-        <textarea ref="taRef" v-model="draft" rows="1" placeholder="Message the assistant… Enter sends · Shift+Enter new line · Ctrl+V pastes screenshots" :disabled="state.busy" @paste="onPaste" @keydown.enter="onEnterKey"></textarea>
+        <textarea ref="taRef" v-model="draft" rows="1" placeholder="Message the assistant… Enter sends · Shift+Enter new line · Ctrl+V pastes screenshots · while busy, sends queue up" @paste="onPaste" @keydown.enter="onEnterKey"></textarea>
       </div>
-      <button type="submit" :disabled="state.busy || uploading > 0 || (!draft.trim() && !pending.length)">Send</button>
+      <button type="submit" class="sendbtn" title="Send (Enter sends · while busy, sends queue up)" :disabled="uploading > 0 || (!draft.trim() && !pending.length)"><span class="ic ic-send" aria-hidden="true"></span></button>
+      <button type="button" class="stopbtn" title="Stop the current task (queued messages still run)" :disabled="!state.busy" @click="stop"><span class="ic ic-stop" aria-hidden="true"></span></button>
     </form>
 
     <!-- Click-to-zoom lightbox (teleported to <body> so it escapes the pane). -->
@@ -239,6 +241,14 @@ onBeforeUnmount(() => { removeEventListener('keydown', onKeydown); });
    a touch larger than the square icons; it then fills the button and centers. */
 .ic-folder { width: 18px; height: 16px; mask-image: url('../assets/file_folder.svg'); -webkit-mask-image: url('../assets/file_folder.svg'); }
 .composer button:disabled { opacity: .45; cursor: default; }
+/* Send/Stop are icon buttons right of the textarea: same mask technique as the
+   attach buttons so the glyph tint follows currentColor (white on their fills).
+   Stop sits right of Send and is only live while a turn is in flight. */
+.composer button.sendbtn, .composer button.stopbtn { padding: 0 10px; display: inline-flex; align-items: center; justify-content: center; }
+.composer button.stopbtn { background: #b3261e; border-color: #8c1d18; margin-left: 6px; }
+.ic-send { mask-image: url('../assets/send.svg'); -webkit-mask-image: url('../assets/send.svg'); }
+.ic-stop { mask-image: url('../assets/stop.svg'); -webkit-mask-image: url('../assets/stop.svg'); }
+.queue-notice { font-size: 11px; color: var(--text-dim, #8a6d1b); padding: 2px 10px 0; }
 
 /* click-to-zoom lightbox */
 .zoomable { cursor: zoom-in; }

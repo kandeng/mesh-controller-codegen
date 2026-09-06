@@ -3,7 +3,10 @@
 // fallback). Every tab binds to the SINGLE install session: the server broadcasts
 // live frames (delta | tool) and authoritative persisted entries (transcript) to
 // all connected tabs, so every tab converges on the same conversation. Frames:
-// ready | turn-start | delta | tool | transcript | turn-end | clear | error. On init the
+// ready | turn-start | delta | tool | transcript | turn-end | notice | clear | error.
+// turn-end/error carry `queued` (pending sends behind the finished turn) so the
+// composer stays live while the queue drains; `notice` shows transient queue
+// hints. On init the
 // prior transcript (with attachment images + tool lines) is restored from the
 // stable session store; monotonic `seq` numbers dedupe resume vs live frames.
 import { useProjectStore } from './useProjectStore.js';
@@ -36,6 +39,9 @@ export function useAgentSocket() {
         state.busy = true;
       } else if (msg.type === 'delta') {
         // Live tokens: build a provisional bubble; the transcript entry replaces it.
+        // Deltas arriving after the final turn-end (a cancelled turn's tail) are
+        // dropped: they would resurrect a streaming bubble nobody finalizes.
+        if (!state.busy) return;
         const cur = state.transcript.find((x) => x.streaming);
         if (cur) cur.text += msg.text;
         else { streaming = true; state.transcript.push({ role: 'assistant', text: msg.text, ts: Date.now(), streaming: true }); }
@@ -50,20 +56,25 @@ export function useAgentSocket() {
         if (m.seq) lastSeq = m.seq;
         if (m.role === 'assistant') finalizeStream();
         state.transcript.push({ ...m });
+      } else if (msg.type === 'notice') {
+        // Transient queue hint ("queued as #2 — runs after…"); not persisted.
+        state.notice = msg.text;
       } else if (msg.type === 'turn-end') {
         finalizeStream();
         if (msg.mode) state.agent = { mode: msg.mode };
-        state.busy = false;
+        state.busy = (msg.queued || 0) > 0; // queue keeps the composer live
+        if (!state.busy) state.notice = '';
       } else if (msg.type === 'clear') {
         // /clean: the supervisor wiped the persisted transcript; empty every tab.
         // lastSeq stays: the server's seq counter is monotonic across clears.
         finalizeStream();
         state.transcript = [];
         state.busy = false;
+        state.notice = '';
       } else if (msg.type === 'error') {
         finalizeStream();
         state.transcript.push({ role: 'system', text: `error: ${msg.error}`, ts: Date.now() });
-        state.busy = false;
+        state.busy = (msg.queued || 0) > 0;
       }
     };
     ws.onclose = () => { ws = null; finalizeStream(); setTimeout(connect, 2000); };
@@ -85,6 +96,12 @@ export function useAgentSocket() {
     }
   }
 
+  // Stop the running turn: the supervisor cancels it on the DSH host; queued
+  // sends (if any) still run afterwards.
+  function stop() {
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'stop' }));
+  }
+
   // Restore the persisted transcript (resumability across localhost restarts).
   async function resume() {
     try {
@@ -98,5 +115,5 @@ export function useAgentSocket() {
     } catch { /* ignore */ }
   }
 
-  return { connect, send, resume };
+  return { connect, send, resume, stop };
 }
