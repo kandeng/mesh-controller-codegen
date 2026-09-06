@@ -18,6 +18,7 @@ import { resolve, basename } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import fastifyStatic from '@fastify/static';
 import { COMMANDS, parseSlash, findCommand } from '../slash-commands.mjs';
+import { STOP_MSG } from '../dsh-agent.mjs';
 
 const IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
 const EXT = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif' };
@@ -84,6 +85,17 @@ export async function agentRoutes(app, kernel, agent) {
       let msg;
       try { msg = JSON.parse(raw.toString()); } catch { return send({ type: 'error', error: 'invalid json' }); }
       if (msg.type === 'status') return send({ type: 'status', ...agent.status() });
+      if (msg.type === 'stop') {
+        // Stop button / programmatic stop: cancel the in-flight turn on the
+        // host; the unwinding send broadcasts the queue-aware turn-end.
+        const stopped = await agent.stop();
+        const note = stopped ? 'task stopped by user' : 'no task is running — nothing to stop';
+        const sysEntry = kernel.sessionStore?.append({ role: 'system', text: note, ts: Date.now() })
+          || { role: 'system', text: note, ts: Date.now() };
+        broadcast({ type: 'transcript', msg: sysEntry });
+        if (!stopped) broadcast({ type: 'turn-end', mode: agent.mode, queued: agent.queueDepth() });
+        return;
+      }
       if (msg.type === 'send') {
         const text = String(msg.text || '').trim();
         const ids = Array.isArray(msg.attachments) ? msg.attachments : [];
@@ -96,7 +108,10 @@ export async function agentRoutes(app, kernel, agent) {
         const slash = ids.length ? null : parseSlash(text);
         const found = slash ? findCommand(slash.name) : null;
         const cmd = found && (found.takesArgs || !slash.args) ? found : null;
-        broadcast({ type: 'turn-start' });
+        // Quiet commands (/stop) emit NO turn frames: they must not disturb
+        // the busy state of a live turn they are cancelling.
+        const isQuiet = !!(cmd && cmd.quiet);
+        if (!isQuiet) broadcast({ type: 'turn-start' });
         // Persist the user turn (with attachment refs) before answering, then
         // broadcast the authoritative entry so every tab appends it exactly once.
         const userEntry = kernel.sessionStore?.append({
@@ -113,7 +128,7 @@ export async function agentRoutes(app, kernel, agent) {
           const sysEntry = kernel.sessionStore?.append({ role: 'system', text: note, ts: Date.now() })
             || { role: 'system', text: note, ts: Date.now() };
           broadcast({ type: 'transcript', msg: sysEntry });
-          broadcast({ type: 'turn-end', mode: agent.mode });
+          broadcast({ type: 'turn-end', mode: agent.mode, queued: agent.queueDepth() });
           return;
         }
         if (cmd) {
@@ -127,20 +142,29 @@ export async function agentRoutes(app, kernel, agent) {
                 || { role: 'assistant', text: cmdText, ts: Date.now(), command: cmd.name };
               broadcast({ type: 'transcript', msg: cmdEntry });
             }
-            broadcast({ type: 'turn-end', mode: agent.mode });
+            if (!isQuiet) broadcast({ type: 'turn-end', mode: agent.mode, queued: agent.queueDepth() });
           } catch (e) {
-            broadcast({ type: 'error', error: e.message });
+            broadcast({ type: 'error', error: e.message, queued: agent.queueDepth() });
           }
           return;
+        }
+        if (agent.isBusy()) {
+          broadcast({ type: 'notice', text: `queued as #${agent.queueDepth() + 1} — runs after the current turn finishes` });
         }
         try {
           const r = await agent.send(text, images);
           const asstEntry = kernel.sessionStore?.append({ role: 'assistant', text: r.reply, ts: Date.now(), tools: r.tools || undefined })
             || { role: 'assistant', text: r.reply, ts: Date.now(), tools: r.tools || undefined };
           broadcast({ type: 'transcript', msg: asstEntry });
-          broadcast({ type: 'turn-end', mode: r.mode });
+          broadcast({ type: 'turn-end', mode: r.mode, queued: agent.queueDepth() });
         } catch (e) {
-          broadcast({ type: 'error', error: e.message });
+          if (e.message === STOP_MSG) {
+            // Stopped turn: the system note already explains it; just release
+            // the tabs' busy state (queued sends, if any, keep it true).
+            broadcast({ type: 'turn-end', mode: agent.mode, queued: agent.queueDepth() });
+            return;
+          }
+          broadcast({ type: 'error', error: e.message, queued: agent.queueDepth() });
         }
       }
     });

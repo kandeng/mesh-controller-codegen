@@ -29,6 +29,7 @@ import { resolve } from 'node:path';
 import { defineAgentContract } from './agent-contract.mjs';
 import { writeAgentWorkspace } from './agent-workspace.mjs';
 
+export const STOP_MSG = 'agent turn stopped by user';
 const STUB_NOTE =
   'The live DSH assistant is unavailable (web host did not start), so this is a stub reply. ' +
   'The app shell remains fully functional: load a mesh, pick a joint, drive its knobs, and validate/generate from the toolbar.';
@@ -51,6 +52,8 @@ export function createDshAgent(kernel) {
   // One in-flight turn at a time; later sends chain behind it (mode:'queue'
   // semantics on our side so WS replies stay ordered).
   let chain = Promise.resolve();
+  let running = false; // a turn body is executing right now
+  let waiting = 0;     // sends chained behind the running turn
 
   const log = (...a) => kernel.diagnostics?.note?.('dsh-agent', { msg: a.join(' ') });
 
@@ -85,6 +88,19 @@ export function createDshAgent(kernel) {
   // assistant text deltas + tool lines to onEvent, auto-allow any approval
   // request, and resolve the pending turn on turn/end.
   let pendingTurn = null; // { resolve, reject, timer }
+  // A turn/end event closes exactly one turn. When we settle pendingTurn
+  // WITHOUT an event (user stop, timeout), that turn's late turn/end would
+  // otherwise be misattributed to the NEXT prompt's pendingTurn and kill it.
+  // The gate holds the next session.prompt back until the outstanding
+  // turn/end has been consumed (or a force timeout opens it anyway).
+  let turnGate = openGate();
+  function openGate() { return { p: Promise.resolve(), open: () => {} }; }
+  function closedGate() { let o; const p = new Promise((r) => { o = r; }); return { p, open: () => o() }; }
+  function closeGate(forceMs = 5000) {
+    const g = closedGate();
+    turnGate = g;
+    setTimeout(() => g.open(), forceMs); // never wedge the queue on a silent host
+  }
   let responding = new Set();
   let turnTools = [];     // per-turn tool activity lines (persisted with the reply)
   const emit = (frame) => { try { agent.onEvent?.(frame); } catch { /* listener went away */ } };
@@ -117,7 +133,10 @@ export function createDshAgent(kernel) {
       const isError = !!msg?.content?.[0]?.isError;
       emit({ type: 'tool', kind, name: '', callId, isError, view: isError ? 'tool error' : 'tool result' });
     } else if (kind === 'turn/end') {
-      if (pendingTurn) {
+      // Only a PROMPTED turn may be settled by an event: a late turn/end from
+      // a cancelled/timed-out predecessor must not kill the next turn that is
+      // still waiting at the gate (it only opens the gate).
+      if (pendingTurn?.prompted) {
         const p = pendingTurn; pendingTurn = null; clearTimeout(p.timer);
         if (ev.data?.reason?.kind === 'error') {
           // Surface the host's reason detail — 'agent turn failed' alone is
@@ -130,8 +149,10 @@ export function createDshAgent(kernel) {
         }
         else p.resolve();
       }
+      turnGate.open(); // the cancelled/timed-out turn's late end lands here too
     } else if (kind === 'error') {
-      if (pendingTurn) { const p = pendingTurn; pendingTurn = null; clearTimeout(p.timer); p.reject(new Error(ev.data?.message || 'agent turn failed')); }
+      if (pendingTurn?.prompted) { const p = pendingTurn; pendingTurn = null; clearTimeout(p.timer); p.reject(new Error(ev.data?.message || 'agent turn failed')); }
+      turnGate.open();
     }
   }
 
@@ -281,11 +302,13 @@ export function createDshAgent(kernel) {
     const turnDone = new Promise((res, rej) => {
       const timer = setTimeout(() => {
         pendingTurn = null;
+        closeGate(); // this turn's late turn/end must not hit the next prompt
         rpc('session.cancel', { sessionId }).catch(() => {});
         rej(new Error('agent turn timed out'));
       }, Math.max(cfg.dshTimeoutMs || 900_000, 300_000));
-      pendingTurn = { resolve: res, reject: rej, timer };
+      pendingTurn = { resolve: res, reject: rej, timer, prompted: false };
     });
+    await turnGate.p; // previous turn's end event consumed (or forced) — safe to prompt
     try {
       await rpc('session.prompt', { sessionId, mode: 'queue', content });
     } catch (e) {
@@ -300,6 +323,7 @@ export function createDshAgent(kernel) {
       }
       throw e;
     }
+    if (pendingTurn) pendingTurn.prompted = true; // events may now settle this turn
     await turnDone;
 
     // The authoritative reply is the final assistant/message text captured during
@@ -348,7 +372,12 @@ export function createDshAgent(kernel) {
 
     // images: [{ mediaType, dataBase64, name? }]
     send(text, images = []) {
+      const behind = running;
+      if (behind) waiting += 1;
       const run = chain.then(async () => {
+        if (behind) waiting -= 1;
+        running = true;
+        try {
         if (disposed) throw new Error('agent disposed');
         const wasLive = mode === 'live';
         if (wasLive || existsSync(cfg.paths.dshBin)) {
@@ -356,17 +385,46 @@ export function createDshAgent(kernel) {
             const r = await sendLive(text, images);
             return { role: 'assistant', text, reply: r.reply, tools: r.tools, mode: 'live' };
           } catch (e) {
+            if (e.message === STOP_MSG) throw e; // user stop: never stub-mask it
             if (wasLive) throw e; // host was live but the turn failed — surface it
+            if (/^agent turn failed/.test(e.message)) {
+              // The host DID boot; the turn itself failed at the model provider
+              // (e.g. 429 quota exhausted). Surface the real cause — the
+              // boot-failure stub note would be a lie here.
+              log('turn failed on fresh host:', e.message);
+              const detail = e.message.replace(/^agent turn failed:\s*/, '').slice(0, 400);
+              const reply = `The live DSH assistant started, but this turn failed at the model provider:\n${detail}\n\nThe app shell remains fully functional: load a mesh, pick a joint, drive its knobs, and validate/generate from the toolbar.\n\nYou said: "${text}"`;
+              return { role: 'assistant', text, reply, mode: 'stub' };
+            }
             log('start failed, stub fallback:', e.message);
           }
         }
         sessionId = sessionId || 'stub-session';
         const reply = `${STUB_NOTE}\n\nYou said: "${text}"`;
         return { role: 'assistant', text, reply, mode: 'stub' };
+        } finally { running = false; }
       });
       chain = run.catch(() => {}); // keep the queue alive after failures
       return run;
     },
+
+    // User-initiated stop: gracefully cancel the in-flight turn on the host
+    // (same RPC the timeout path uses) and reject the pending turn so this
+    // send unwinds; chained (queued) sends still run afterwards. The cancel
+    // is AWAITED before rejecting: otherwise the host can apply it to the
+    // next queued prompt and kill that turn too.
+    async stop() {
+      if (!pendingTurn) return false;
+      clearTimeout(pendingTurn.timer);
+      const p = pendingTurn;
+      pendingTurn = null;
+      try { await rpc('session.cancel', { sessionId }, 5_000); } catch (e) { log('session.cancel failed:', e.message); }
+      closeGate(); // this turn's late turn/end must not hit the next prompt
+      p.reject(new Error(STOP_MSG));
+      return true;
+    },
+    isBusy() { return running || waiting > 0; },
+    queueDepth() { return waiting; },
 
     async dispose() {
       disposed = true;

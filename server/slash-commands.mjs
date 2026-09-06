@@ -33,6 +33,19 @@ export const COMMANDS = [
       return { clear: true };
     },
   },
+  {
+    name: 'stop',
+    usage: '/stop',
+    desc: 'Stop the currently running assistant turn; queued messages still run afterwards.',
+    example: '/stop',
+    takesArgs: false,
+    // No turn-start/turn-end frames: /stop fires WHILE a turn is live and
+    // must not flip the tabs' busy state out from under it.
+    quiet: true,
+    run: async ({ agent }) => ((await agent.stop())
+      ? 'Stop requested — the running turn is being cancelled. Queued messages (if any) still run.'
+      : 'No task is running — nothing to stop.'),
+  },
 ];
 
 // "/name [args...]" -> { name, args } | null (null = not a slash command).
