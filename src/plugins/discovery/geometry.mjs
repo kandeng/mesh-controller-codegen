@@ -41,6 +41,26 @@ function gimbalNodes(g) {
   return g.nodes.filter((n) => !isDup(n) && GIMBAL_RE.test(n.name) && n.r < 0.6 * g.radius);
 }
 
+// Name-regex over-collection guard: the gimbal device is a COMPACT cluster,
+// but the regex also matches static parts elsewhere on the craft (e.g. the
+// Inspire's belly plate "gimbal_319" — a 51-node subtree 8x farther from the
+// device than every lens node; swinging it about the anchor was the preview
+// tear-off bug). Elbow cut on centroid distance: sort by distance, cut at the
+// first >=3x gap, keep the compact core; trimmed names land in meta.trimmed.
+function trimToCluster(gn, radius) {
+  if (gn.length < 3) return { kept: gn, trimmed: [] };
+  const c = gn.reduce((a, n) => [a[0] + n.wp[0], a[1] + n.wp[1], a[2] + n.wp[2]], [0, 0, 0]).map((v) => v / gn.length);
+  const eps = 0.05 * radius;
+  const byDist = gn
+    .map((n) => ({ n, d: Math.hypot(n.wp[0] - c[0], n.wp[1] - c[1], n.wp[2] - c[2]) }))
+    .sort((a, b) => a.d - b.d);
+  let cut = byDist.length;
+  for (let i = 0; i + 1 < byDist.length; i++) {
+    if (byDist[i + 1].d > 3 * Math.max(byDist[i].d, eps)) { cut = i + 1; break; }
+  }
+  return { kept: byDist.slice(0, cut).map((x) => x.n), trimmed: byDist.slice(cut).map((x) => x.n.name) };
+}
+
 export const geometryDiscovery = definePlugin({
   category: CATEGORY.DISCOVERY,
   name: 'geometry',
@@ -60,16 +80,23 @@ export const geometryDiscovery = definePlugin({
           type: JOINT_TYPE.ROTOR,
           nodes,
           anchor: { x: c.wp[0], y: c.wp[1], z: c.wp[2] },
-          axis: { x: 0, y: 1, z: 0 }, // controller spins about local Y (rotation.y)
-          over: { meta: { blades: c.blades, mates: c.mates } },
+          axis: { x: 0, y: 0, z: 1 }, // model is Z-up: rotors spin about the vertical Z axis
+          // Hypothesis re-typing (phase 1): producers only attach evidence +
+          // confidence; the loop owns `status` transitions.
+          over: {
+            meta: { blades: c.blades, mates: c.mates },
+            evidence: ['blade-shape', 'disc-cluster', 'co-location'],
+            confidence: 0.9,
+          },
         });
         j.params.direction = (label === 'FL' || label === 'BR') ? 1 : -1; // diagonal pairs counter-rotate
         joints.push(j);
         host?.bus.emit(EVT.JOINT_DISCOVERED, { id: j.id, jointType: j.type, nodes: nodes.length });
       }
 
-      const gn = gimbalNodes(g);
-      if (gn.length) {
+      const gn0 = gimbalNodes(g);
+      if (gn0.length) {
+        const { kept: gn, trimmed } = trimToCluster(gn0, g.radius);
         const c = gn.reduce((a, n) => [a[0] + n.wp[0], a[1] + n.wp[1], a[2] + n.wp[2]], [0, 0, 0]).map((v) => v / gn.length);
         const j = createJoint({
           id: 'gimbal_main',
@@ -78,7 +105,13 @@ export const geometryDiscovery = definePlugin({
           nodes: gn.map((n) => n.name),
           anchor: { x: c[0], y: c[1], z: c[2] },
           axis: { x: 1, y: 0, z: 0 },
-          over: { meta: { cameraHardLinked: true } },
+          // Name-regex is the weakest signal → lowest confidence; the gimbal is
+          // the joint most likely to need a human verdict.
+          over: {
+            meta: { cameraHardLinked: true, ...(trimmed.length ? { trimmed } : {}) },
+            evidence: trimmed.length ? ['name-regex', 'cluster-trim'] : ['name-regex'],
+            confidence: 0.6,
+          },
         });
         joints.push(j);
         host?.bus.emit(EVT.JOINT_DISCOVERED, { id: j.id, jointType: j.type, nodes: gn.length });

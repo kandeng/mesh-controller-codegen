@@ -54,6 +54,18 @@ function rotorDisc(g, joint, baseNodes) {
 }
 
 export function jointRoutes(app, kernel) {
+  // Hypothesis manifest from the phase-1 discovery loop (statuses + tests).
+  app.get('/api/manifest', async () => ({ ok: true, manifest: kernel.current.manifest || [] }));
+
+  // Phase 2: trigger one L2 AI-proposal round over the current manifest
+  // (refines the needs-verdict frontier; reopen state survives). 503 when the
+  // agent supervisor is in stub mode — proposals need a live model.
+  app.post('/api/manifest/refine', async (req, reply) => {
+    const r = await kernel.refineManifest();
+    if (!r.ok) return reply.code(503).send(r);
+    return r;
+  });
+
   app.get('/api/joints', async () => ({
     ok: true,
     joints: (kernel.current.joints || []).map(jointSummary),
@@ -106,7 +118,7 @@ export function jointRoutes(app, kernel) {
       warnings.push(
         'Rotate the whole rotor assembly about the joint ANCHOR via a pivot Object3D ' +
         '(re-parent the spin-set nodes with attach() so world transforms are preserved), ' +
-        'then set pivot.rotation.y. NEVER set rotation on each node individually: per-node ' +
+        'then set pivot.rotation.z (model space is Z-up). NEVER set rotation on each node individually: per-node ' +
         'rotation spins every part about its OWN origin and tears blades/locks off the hub.',
       );
       if (cousins.length) {
@@ -134,7 +146,7 @@ export function jointRoutes(app, kernel) {
     return {
       ok: true,
       joint: { id: joint.id, label: joint.label, type: joint.type, anchor: joint.anchor, axis: joint.axis, direction: joint.params?.direction ?? null },
-      model: { up: 'Z (XY horizontal in model space; the viewer maps it to Y-up)', radius: +g.radius.toFixed(3), center: g.center.map((v) => +v.toFixed(3)), nodeCount: g.count },
+      model: { up: 'Z (XY horizontal in model space; the viewer scene is Z-up too — spin is rotation.z)', radius: +g.radius.toFixed(3), center: g.center.map((v) => +v.toFixed(3)), nodeCount: g.count },
       nodes,
       disc,
       cousins,

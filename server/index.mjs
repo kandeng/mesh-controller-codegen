@@ -47,6 +47,7 @@ export async function startServer({ configPath = null, port = 0, verbose = false
   }
 
   const agent = createDshAgent(kernel);
+  kernel.attachAgent(agent); // kernel drives L2 proposal rounds through the same supervisor
   const disposeEvents = registerEventsSocket(app, kernel);
   projectRoutes(app, kernel);
   jointRoutes(app, kernel);

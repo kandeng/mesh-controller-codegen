@@ -52,6 +52,8 @@ export function createDroneController(gltfSceneRoot, THREE) {
   // Find a suitable drone root to yaw.
   // Walk up from the first prop node to the common ancestor that sits just
   // below the scene root.  Rotating this node turns the whole drone.
+  // MUST run before the pivot re-parenting below, or the walk would stop at
+  // the new pivot and yaw only one rotor.
   var droneRoot = null;
   if (groups.length > 0) {
     var nd = groups[0].nodes[0];
@@ -59,6 +61,47 @@ export function createDroneController(gltfSceneRoot, THREE) {
       nd = nd.parent;
     }
     droneRoot = nd;
+  }
+
+  // ---- anchor pivots (the rigidity rule) -------------------------------------
+  // NEVER rotate member nodes about their own origins — per-node rotation tears
+  // blades/locks off the hub (the historical tear-off bug, now caught by the
+  // relative-pose-invariance gate). Instead each assembly is re-parented under a
+  // pivot Object3D placed at the assembly anchor via attach() (world transforms
+  // are preserved), and only the PIVOT rotates. The pivot's orientation is
+  // neutralized against any root rotation, so pivot.rotation.z is always the
+  // world-vertical spin axis (the model is Z-up).
+  function neutralPivot(at) {
+    var p = new THREE.Object3D();
+    p.position.copy(at);
+    gltfSceneRoot.add(p);
+    gltfSceneRoot.updateMatrixWorld(true);
+    var rq = gltfSceneRoot.getWorldQuaternion(new THREE.Quaternion());
+    p.quaternion.copy(rq.invert());
+    return p;
+  }
+  for (var pi = 0; pi < groups.length; pi++) {
+    (function (grp) {
+      var c = new THREE.Vector3();
+      for (var ni = 0; ni < grp.nodes.length; ni++) c.add(grp.nodes[ni].getWorldPosition(new THREE.Vector3()));
+      c.multiplyScalar(1 / grp.nodes.length);
+      grp.pivot = neutralPivot(c);
+      grp.pivot.name = '__pivot_' + grp.key;
+      for (var mi = 0; mi < grp.nodes.length; mi++) grp.pivot.attach(grp.nodes[mi]);
+    })(groups[pi]);
+  }
+  // Gimbal: yaw pivot (world vertical) with a nested pitch pivot (horizontal
+  // after yaw) — textbook two-axis gimbal, rigid at both stages.
+  var gimbalYawPivot = null;
+  var gimbalPitchPivot = null;
+  if (gimbalNodes.length) {
+    var ga = gimbalNodes[0].getWorldPosition(new THREE.Vector3());
+    gimbalYawPivot = neutralPivot(ga);
+    gimbalYawPivot.name = '__pivot_gimbal_yaw';
+    gimbalPitchPivot = new THREE.Object3D();
+    gimbalPitchPivot.name = '__pivot_gimbal_pitch';
+    gimbalYawPivot.add(gimbalPitchPivot);
+    for (var mi2 = 0; mi2 < gimbalNodes.length; mi2++) gimbalPitchPivot.attach(gimbalNodes[mi2]);
   }
 
   // ---- state ----------------------------------------------------------------
@@ -119,19 +162,16 @@ export function createDroneController(gltfSceneRoot, THREE) {
       var degPerSec = rpm * 6;  // 360 / 60
       g.angle = (g.angle + degPerSec * dt) % 360;
 
-      var rotRad = g.angle * g.spin * DEG2RAD;
-
-      for (var j = 0; j < g.nodes.length; j++) {
-        g.nodes[j].rotation.y = rotRad;
-      }
+      // Members are never touched — only the pivot rotates (rigidity rule).
+      if (g.pivot) g.pivot.rotation.z = g.angle * g.spin * DEG2RAD;
     }
 
     gimbalPitch = easeToward(gimbalPitch, targetPitch, GIMBAL_EASE, dt);
     gimbalYaw   = easeToward(gimbalYaw,   targetYaw,   GIMBAL_EASE, dt);
 
-    for (var k = 0; k < gimbalNodes.length; k++) {
-      gimbalNodes[k].rotation.x = gimbalPitch * DEG2RAD;
-      gimbalNodes[k].rotation.y = gimbalYaw   * DEG2RAD;
+    if (gimbalYawPivot) {
+      gimbalYawPivot.rotation.z = gimbalYaw * DEG2RAD;
+      gimbalPitchPivot.rotation.x = gimbalPitch * DEG2RAD;
     }
   }
 

@@ -90,7 +90,9 @@ export async function parseGlb(path) {
       parent: parent[i],
       children: (n.children || []).length,
       t,
+      q: n.rotation || null, // local rotation (quaternion) — rigidity tests need it
       s,
+      lm: Array.isArray(n.matrix) && n.matrix.length === 16 ? n.matrix : null, // matrix-form local transform
       mesh: n.mesh != null,
       ext: xyExtent(i),
     };
@@ -138,6 +140,7 @@ export async function parseGlb(path) {
   info.forEach((_, i) => worldMat(i));
   info.forEach((n, i) => {
     const m = wm[i];
+    n.wm = m; // full world matrix — the rigidity battery's rest pose (read-only)
     n.wp = [m[12], m[13], m[14]];
     n.ws = [Math.hypot(m[0], m[1], m[2]), Math.hypot(m[4], m[5], m[6]), Math.hypot(m[8], m[9], m[10])];
     n.wext = n.ext ? { ex: n.ext.ex * n.ws[0], ey: n.ext.ey * n.ws[1], ez: n.ext.ez * n.ws[2] } : null;

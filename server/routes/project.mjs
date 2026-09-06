@@ -9,6 +9,9 @@ function jointSummary(j) {
     label: j.label,
     type: j.type,
     status: j.status || 'candidate',
+    evidence: j.evidence || [],
+    confidence: j.confidence ?? null,
+    tests: (j.tests || []).map((t) => ({ name: t.name, pass: !!t.pass, level: t.level || 'fail', detail: t.detail || '', ...(t.floaters?.length ? { floaters: t.floaters } : {}) })),
     nodeCount: (j.nodes || []).length,
     nodes: j.nodes || [],   // node names: the viewer preview rotates exactly these
     anchor: j.anchor,
@@ -43,7 +46,7 @@ export function projectRoutes(app, kernel) {
     if (!file) return reply.code(400).send({ error: 'body.file required' });
     try {
       const r = await kernel.validate(file);
-      return { ok: true, pass: r.pass, failures: r.failures, warnings: r.warnings, metrics: r.metrics, controller: r.controller, controllerUrl: r.controllerUrl, viewer: kernel.viewerUrls() };
+      return { ok: true, pass: r.pass, failures: r.failures, warnings: r.warnings, metrics: r.metrics, rigidity: r.rigidity || null, reopened: r.reopened || [], controller: r.controller, controllerUrl: r.controllerUrl, viewer: kernel.viewerUrls() };
     } catch (e) {
       return reply.code(400).send({ error: e.message });
     }

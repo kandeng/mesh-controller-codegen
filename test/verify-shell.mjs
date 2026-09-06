@@ -37,6 +37,17 @@ const rotor = proj.joints?.find((j) => j.type === 'rotor');
 const gimbal = proj.joints?.find((j) => j.type === 'gimbal');
 ok('  viewer glb url present', typeof proj.viewer?.glb === 'string' && proj.viewer.glb.length > 0);
 
+// 3b) Phase-1 hypothesis loop: manifest with evidence-derived statuses.
+const man = await jget('/api/manifest');
+ok('GET /api/manifest', man.ok === true && man.manifest?.length === 5, (man.manifest || []).map((r) => `${r.id}:${r.status}`).join(', '));
+ok('  rotors auto-accepted, gimbal needs-verdict',
+  (man.manifest || []).filter((r) => r.type === 'rotor').every((r) => r.status === 'auto-accepted')
+    && man.manifest?.find((r) => r.type === 'gimbal')?.status === 'needs-verdict');
+
+// 3c) Phase-2 refine endpoint: stub-mode agent must refuse gracefully (503 body).
+const ref = await jpost('/api/manifest/refine', {});
+ok('POST /api/manifest/refine graceful without live agent', ref.ok === false && /agent unavailable/.test(ref.error || ''), JSON.stringify(ref));
+
 // 4) Slot Routing Graphs (data-driven knob/overlay routing).
 if (rotor) {
   const g = (await jget(`/api/joints/${encodeURIComponent(rotor.id)}/slots`)).graph;
@@ -55,6 +66,8 @@ if (gimbal) {
 // 5) Validate the reference controller -> must PASS with rpmIdle==0.
 const val = await jpost('/api/validate', { file: CTL });
 ok('POST /api/validate PASS', val.ok === true && val.pass === true, `rpmIdle=${val.metrics?.rpmIdle} failures=${JSON.stringify(val.failures)}`);
+ok('  rigidity gate (tear-off detection)', val.rigidity?.pass === true, (val.rigidity?.results || []).map((r) => `${r.set}:${r.pass ? 'ok' : 'CRACK'}`).join(' '));
+ok('  validate carries reopened[] (reopen edge)', Array.isArray(val.reopened) && val.reopened.length === 0, JSON.stringify(val.reopened));
 ok('  validate returns controller viewer url', typeof val.viewer?.ctl === 'string' && val.viewer.ctl.length > 0);
 
 // 6) Resumable server state.
