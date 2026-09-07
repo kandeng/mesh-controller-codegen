@@ -12,13 +12,14 @@ import {
   discoverJoints, validateController, generateController, repairWithNotes,
   loadThree, toViewerUrl, refreshView, finalizeRun,
 } from '../src/pipeline.mjs';
-import { reopenFromRigidity, runDiscoveryLoop, runL2Round, runVisionRound } from '../src/plugins/discovery/loop.mjs';
-import { saveManifest } from '../src/plugins/discovery/manifest.mjs';
+import { reopenFromRigidity, runDiscoveryLoop, runL2Round, runVisionCampaign, runMotionRound, applyJointVerdict, amortizeVerdict, MAX_EXTRA_VIEWS, MAX_VISION_ROUNDS, MOTION_ANGLES } from '../src/plugins/discovery/loop.mjs';
+import { saveManifest, saveRevision, listRevisions, loadRevision, latestRevision, diffManifests } from '../src/plugins/discovery/manifest.mjs';
 import { rigidityGate } from '../src/plugins/discovery/tests.mjs';
-import { focusFromManifest, planViews, VIEWPORT } from '../src/plugins/discovery/views.mjs';
+import { focusFromManifest, modelRadius, modelTarget, planViews, VIEWPORT } from '../src/plugins/discovery/views.mjs';
+import { AMORTIZABLE, peersOf, symmetryGroups } from '../src/plugins/discovery/symmetry.mjs';
 import {
-  MAX_FRAMES_PER_ROUND, framePath, listRounds, loadColorMap,
-  savePlan, saveProposals, saveReply,
+  MAX_FRAMES_PER_ROUND, framePath, listRounds, loadColorMap, loadRound,
+  saveMotion, savePlan, saveProposals, saveReply,
 } from '../src/plugins/discovery/observations.mjs';
 import { createVisionProvider } from '../src/plugins/discovery/vision-provider.mjs';
 import { createSessionStore } from './session-store.mjs';
@@ -72,6 +73,18 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
   // kernel uses it for L2 proposal rounds; routes use it for the chat WS.
   let agent = null;
 
+  // Phase 3 task 19: freeze the manifest as a numbered revision on the TIME axis.
+  // Called after EVERY write that changes what we believe — a loop round, a
+  // verdict, an amortization, a rigidity reopen — so the graph's history is
+  // replayable and diffable with no VCS. `parent` defaults to the trunk (the
+  // latest revision); a caller re-running from an earlier state names a parent
+  // and gets a branch. A refusal path never reaches here, so a failed write
+  // leaves no phantom revision behind.
+  const commitRevision = (note, opts = {}) => {
+    if (!runDir || !current.manifest) return null;
+    return saveRevision(runDir, current.manifest, { note, ...opts });
+  };
+
   // The browser render farm, attached the same way and for the same reason: the
   // server has no WebGL context by design, so a vision round borrows a tab's.
   let farm = null;
@@ -107,6 +120,7 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
       // discovery output is served as before (strangler-fig fallback).
       try {
         current.manifest = runDiscoveryLoop(current.glb, current.joints, { runDir }).manifest;
+        commitRevision('discovery loop (project load)');
       } catch (e) {
         host.diagnostics.note('discovery loop failed — serving raw joints', { error: e.message });
         current.manifest = null;
@@ -127,6 +141,7 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
       const l2 = async (prompt) => (await agent.send(prompt)).reply;
       const res = await runL2Round(current.glb, current.joints, current.manifest, l2);
       saveManifest(runDir, current.manifest);
+      commitRevision('L2 AI-proposal round');
       if (res.added) {
         sessionStore.setWork({ joints: current.joints.map((j) => ({ id: j.id, label: j.label, type: j.type, nodeCount: (j.nodes || []).length })) });
       }
@@ -199,6 +214,12 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
       }
 
       const round = whole(opts.round, 0, 999) ?? nextObservationRound(runDir);
+      // Phase 3 task 16: the round is now a CAMPAIGN. `round` is the directory the
+      // first round writes to, and each further round takes the next one — so a
+      // two-round press leaves r0 (the survey) and r1 (the close-ups) side by side
+      // and a human can see exactly what the second look was bought for.
+      const rounds = whole(opts.rounds, 1, MAX_VISION_ROUNDS) ?? MAX_VISION_ROUNDS;
+      const extraViews = whole(opts.extraViews, 0, MAX_EXTRA_VIEWS) ?? MAX_EXTRA_VIEWS;
       const mode = opts.mode === 'all' || opts.mode === 'none' ? opts.mode : 'frontier';
       const viewport = opts.viewport?.w ? opts.viewport : VIEWPORT;
       // An explicit focus list wins (the UI can aim a round at one joint the user
@@ -221,14 +242,19 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
 
       // Which frames actually reached the model, collected as they are captured,
       // so the response can point the UI at the exact pixels behind each claim.
+      // `round` is carried per frame because a campaign spans several directories
+      // and the observation browser groups by them.
       const drawn = [];
 
-      const res = await runVisionRound(current.glb, current.joints, current.manifest, {
+      const res = await runVisionCampaign(current.glb, current.joints, current.manifest, {
         plan: () => planViews(current.glb, planSpec),
 
-        capture: async (view, shotMode, focusNodes) => {
+        // The campaign passes its own round index as the fourth argument; that is
+        // what routes this round's frames to their own directory.
+        capture: async (view, shotMode, focusNodes, campaignRound = 0) => {
+          const rnd = round + campaignRound;
           const r = await farm.capture({
-            round, view, mode: shotMode, focusNodes, viewport, rendererId, timeoutMs,
+            round: rnd, view, mode: shotMode, focusNodes, viewport, rendererId, timeoutMs,
           });
           const entry = r?.frame || null;
           if (!entry) return null;
@@ -238,13 +264,16 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
           // the frame the model saw and the frame a human opens later are
           // provably the same file, and a 12-frame round does not hold 24MB of
           // base64 in the kernel for the length of the turn.
-          const file = framePath(runDir, round, entry.id);
+          const file = framePath(runDir, rnd, entry.id);
           if (!file) return null;
-          drawn.push({ id: entry.id, mode: entry.mode, viewId: entry.viewId ?? view.id, url: toViewerUrl(host, runDir, file) });
+          drawn.push({
+            id: entry.id, mode: entry.mode, round: rnd, viewId: entry.viewId ?? view.id,
+            url: toViewerUrl(host, runDir, file),
+          });
           return {
             ...entry,
             dataBase64: readFileSync(file).toString('base64'),
-            colorMap: entry.colorMap ? loadColorMap(runDir, round, entry.id) : null,
+            colorMap: entry.colorMap ? loadColorMap(runDir, rnd, entry.id) : null,
           };
         },
 
@@ -255,41 +284,77 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
         maskPairs: whole(opts.maskPairs, 0, 12),
         ghostFrames: whole(opts.ghostFrames, 0, 12),
         orientation: whole(opts.orientation, 0, 12),
+        rounds,
+        extraViews,
+        maxRegions: whole(opts.maxRegions, 1, 8),
+        perRegion: whole(opts.perRegion, 1, 4),
 
-        persist: {
-          // The plan is the round's own evidence: which poses were asked for,
-          // what each was expected to buy, and who drew them.
-          plan: (p) => savePlan(runDir, round, {
-            ...p, mode, focus: focusNames ? [...focusNames] : null, rendererId,
-          }),
-          // Deliberately a no-op. POST /api/observe/frame writes the bytes BEFORE
-          // it resolves the waiting capture, so by the time the loop sees a frame
-          // it is already on disk and indexed; re-saving would rewrite the same
-          // file and the same entry for nothing.
-          frame: () => {},
-          reply: (r) => saveReply(runDir, round, r),
-          proposals: (p) => saveProposals(runDir, round, p),
+        // Which round DIRECTORY each campaign round wrote into, so the records it
+        // adds can say where their evidence lives. Without this the observation
+        // browser has to scan every campaign for a frame id and cannot always
+        // tell two identically-numbered frames apart.
+        evidenceRound: (campaignRound = 0) => round + campaignRound,
+
+        // A FACTORY, not an object: round 2 must not write into round 1's
+        // directory, or the frames behind the first claim would be overwritten by
+        // the ones behind the second and the evidence trail would be a lie.
+        persist: (campaignRound = 0) => {
+          const rnd = round + campaignRound;
+          return {
+            // The plan is the round's own evidence: which poses were asked for,
+            // what each was expected to buy, and who drew them. A round-2 plan
+            // additionally carries the regions it was aimed at and why.
+            plan: (p) => savePlan(runDir, rnd, {
+              ...p, mode: campaignRound === 0 ? mode : 'close-up',
+              // Round 2's focus is its `regions` — recording round 1's focusNames
+              // against it would say the close-ups covered the whole frontier.
+              focus: campaignRound === 0 && focusNames ? [...focusNames] : null,
+              rendererId, baseRound: round,
+            }),
+            // Deliberately a no-op. POST /api/observe/frame writes the bytes BEFORE
+            // it resolves the waiting capture, so by the time the loop sees a frame
+            // it is already on disk and indexed; re-saving would rewrite the same
+            // file and the same entry for nothing.
+            frame: () => {},
+            reply: (r) => saveReply(runDir, rnd, r),
+            proposals: (p) => saveProposals(runDir, rnd, p),
+          };
         },
       });
 
-      // Only a round that actually merged something may write the manifest: a
+      // Only a campaign that actually merged something may write the manifest: a
       // refused round must leave the on-disk record byte-identical, so a human
       // can trust that a failed button press changed nothing.
-      if (res.ok && res.manifestUntouched === false) saveManifest(runDir, current.manifest);
+      if (res.ok && res.manifestUntouched === false) {
+        saveManifest(runDir, current.manifest);
+        commitRevision(`vision campaign (${res.roundCount ?? 1} round(s), +${res.added ?? 0} record(s))`);
+      }
       if (res.added) {
         sessionStore.setWork({ joints: current.joints.map((j) => ({ id: j.id, label: j.label, type: j.type, nodeCount: (j.nodes || []).length })) });
       }
-      host.diagnostics.note('vision refine round', {
-        round, ok: res.ok, code: res.code || null, added: res.added,
+      host.diagnostics.note('vision refine campaign', {
+        round, rounds: res.roundCount, ok: res.ok, code: res.code || null, added: res.added,
+        extraViews: res.extraViews, stop: res.stop || null,
         frames: res.frames ?? 0, views: res.views ?? 0, warnings: res.warnings?.length || 0,
       });
 
       const frameUrls = drawn;
+      // Per-round detail is trimmed to what a response body should carry; the full
+      // grounded/admitted/rejected trail for each round is on disk under r<N>/.
+      const roundSummary = (res.rounds || []).map((x) => ({
+        round: round + x.round, index: x.round, ok: x.ok, added: x.added, confirms: x.confirms,
+        views: x.views, shots: x.shots, frames: x.frames, regions: x.regions,
+        code: x.code || null, reason: x.reason || null, model: x.model, ms: x.ms,
+      }));
       if (!res.ok) {
-        return { ...res, error: res.reason || res.error || 'the vision round failed', round, rendererId, provider: provider.kind, frameUrls, farm: farm.status() };
+        return {
+          ...res, rounds: roundSummary, error: res.reason || res.error || 'the vision round failed',
+          round, rendererId, provider: provider.kind, frameUrls, farm: farm.status(),
+        };
       }
       return {
         ...res,
+        rounds: roundSummary,
         round,
         rendererId,
         provider: provider.kind,
@@ -297,6 +362,352 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
         frameUrls,
         farm: farm.status(),
       };
+    },
+
+    // Phase 3 task 17: the symmetry peers of one joint, i.e. the joints a verdict
+    // on it may be OFFERED to. Read-only, so the panel can render the checkboxes
+    // before the human has decided anything.
+    //
+    // `canAmortize` is answered here rather than left for the caller to work out,
+    // because the rule is not obvious: an `edit` verdict cannot travel, since it is
+    // written in this joint's own node names and a mirror's nodes are different
+    // nodes. Letting the panel guess that would mean it offering a button that the
+    // write path then refuses.
+    jointPeers(id) {
+      if (!current.glb || !current.manifest) {
+        return { ok: false, code: 'NO_PROJECT', error: 'no project loaded; POST /api/project first' };
+      }
+      const rec = (current.manifest || []).find((r) => r.id === id);
+      if (!rec) return { ok: false, code: 'NO_RECORD', error: `no manifest record with id "${id}"` };
+      const geom = { center: modelTarget(current.glb), radius: modelRadius(current.glb) };
+      return {
+        ok: true,
+        id,
+        status: rec.status,
+        verdict: rec.verdict || null,
+        canAmortize: AMORTIZABLE.has(rec.verdict?.decision),
+        peers: peersOf(current.manifest, id, geom),
+        // The whole symmetric family this joint belongs to, so the panel can say
+        // "4 rotors, 1 mirror, 2 same-family" without doing graph work itself.
+        group: symmetryGroups(current.manifest, geom).find((grp) => grp.includes(id)) || [id],
+      };
+    },
+
+    // Phase 3 task 17: the frames behind ONE claim — what a human looks at before
+    // pressing accept or reject.
+    //
+    // A record carries `frame:v3.photo` and, when the loop stamped it, the round
+    // directory that frame lives in. The stamp is what makes this exact: a frame
+    // id is unique WITHIN a round but not across campaigns, and every campaign
+    // starts its own r0. For an unstamped record (a run persisted before task 17,
+    // or a phase-1 geometry joint that never had a frame at all) the rounds are
+    // scanned NEWEST FIRST and EVERY match is returned with an `ambiguous` flag,
+    // because a confident thumbnail of the wrong campaign's frame is the one
+    // failure this panel must not have — it is the thing a human judges by.
+    //
+    // Two match tiers, reported per frame because they are not the same claim:
+    //   'frameId' the record names this exact frame — the model was looking at it
+    //   'focus'   this frame was drawn with the record's own nodes in focus, i.e.
+    //             the mask behind the claim. Only consulted when the record names
+    //             no frame at all, so the weaker tier can never displace the
+    //             stronger one.
+    jointEvidence(id) {
+      if (!current.glb || !current.manifest) {
+        return { ok: false, code: 'NO_PROJECT', error: 'no project loaded; POST /api/project first' };
+      }
+      const rec = (current.manifest || []).find((r) => r.id === id);
+      if (!rec) return { ok: false, code: 'NO_RECORD', error: `no manifest record with id "${id}"` };
+
+      const wanted = new Set();
+      for (const tag of rec.evidence || []) {
+        const m = /^frame:(.+)$/.exec(String(tag));
+        if (m) wanted.add(m[1]);
+      }
+      if (rec.frameId) wanted.add(String(rec.frameId));
+      if (rec.grounding?.frameId) wanted.add(String(rec.grounding.frameId));
+      const names = new Set(rec.nodes || []);
+      const stamped = Number.isFinite(rec.frameRound) ? rec.frameRound : null;
+
+      const all = listRounds(runDir);
+      const order = [...all].reverse().filter((r) => stamped == null || r.round === stamped);
+      const frames = [];
+      for (const meta of order) {
+        const data = loadRound(runDir, meta.round);
+        if (!data) continue;
+        for (const f of data.frames) {
+          const byId = wanted.has(f.id);
+          const byFocus = !byId && wanted.size === 0 && names.size > 0
+            && Array.isArray(f.focus) && f.focus.some((n) => names.has(n));
+          if (!byId && !byFocus) continue;
+          const file = framePath(runDir, meta.round, f.id);
+          const grounded = (data.proposals?.grounded || []).find((x) => x.frameId === f.id) || null;
+          frames.push({
+            round: meta.round,
+            id: f.id,
+            mode: f.mode,
+            matchedBy: byId ? 'frameId' : 'focus',
+            url: file ? toViewerUrl(host, runDir, file) : null,
+            bytes: f.bytes ?? null,
+            width: f.width ?? null,
+            height: f.height ?? null,
+            spec: f.spec ?? null,
+            pose: f.pose ?? null,
+            focus: f.focus ?? null,
+            // The colour map is ground truth and can be thousands of entries, so
+            // it is flagged rather than inlined — the panel fetches it on demand
+            // from /api/observations/:round/colors/:id.
+            hasColors: !!f.colorMap,
+            model: data.reply?.model ?? null,
+            // What THIS round concluded about this frame: which names the box
+            // resolved to and how the two grounding channels agreed. Shown beside
+            // the pixels because a thumbnail alone cannot say why it is evidence.
+            grounded: grounded ? {
+              names: grounded.names || [],
+              source: grounded.grounding?.source ?? null,
+              agreement: grounded.grounding?.agreement ?? null,
+              score: grounded.grounding?.score ?? null,
+              uncertainties: grounded.uncertainties || [],
+            } : null,
+          });
+        }
+      }
+
+      const perId = new Map();
+      for (const f of frames) perId.set(f.id, (perId.get(f.id) || 0) + 1);
+      return {
+        ok: true,
+        joint: {
+          id, label: rec.label, type: rec.type, status: rec.status,
+          confidence: rec.confidence ?? null, origin: rec.origin ?? null,
+          nodes: rec.nodes || [],
+          // Carried because an `edit` verdict may change them: a panel that cannot
+          // show the current anchor cannot offer a corrected one, and asking the
+          // human to read it off the rig report instead would be a second place
+          // for the two to disagree.
+          anchor: rec.anchor ?? null,
+          axis: rec.axis ?? null,
+          reasoning: rec.reasoning ?? null,
+          uncertainties: rec.uncertainties || [],
+          suggestView: rec.suggestView ?? null,
+          grounding: rec.grounding ?? null,
+          verdict: rec.verdict || null,
+          tests: rec.tests || [],
+          history: rec.history || [],
+        },
+        frames,
+        // True only for an UNSTAMPED record whose frame id exists in more than one
+        // campaign. A stamped one cannot be ambiguous — it names its directory.
+        ambiguous: stamped == null && [...perId.values()].some((n) => n > 1),
+        frameRound: stamped,
+        // The whole observation history, so the panel can offer "browse every
+        // round" without a second request. `dir` is server-internal and dropped.
+        rounds: all.map(({ dir, ...r }) => ({ ...r, url: toViewerUrl(host, runDir, dir) })),
+        peers: this.jointPeers(id),
+      };
+    },
+
+    // Phase 3 task 17: the human verdict edge — the only route to `confirmed` or
+    // `rejected`, and the counterpart to reopenFromRigidity (reality contradicting
+    // a record) rather than a variant of it.
+    //
+    // opts: { id, decision:'accept'|'reject'|'edit', edits, note, actor,
+    //         amortizeTo:[ids] }
+    //
+    // The verdict and its amortization are two separate writes with two separate
+    // outcomes, and the response keeps them separate: a human who accepted a joint
+    // and asked to pass it to three mirrors has SUCCEEDED even if one mirror
+    // already carried a direct verdict. Collapsing that into one `ok:false` would
+    // tell them their accept did not happen, and they would press it again.
+    setVerdict({ id, decision, edits = null, note = null, actor = 'human', amortizeTo = null } = {}) {
+      if (!current.glb || !current.manifest) {
+        return { ok: false, code: 'NO_PROJECT', error: 'no project loaded; POST /api/project first', manifestUntouched: true };
+      }
+      const r = applyJointVerdict(current.glb, current.joints, current.manifest, {
+        id, decision, edits, note, actor,
+      });
+      // A refusal means applyVerdict validated and declined BEFORE writing, so the
+      // on-disk manifest is still byte-identical and nothing is saved. Saying so
+      // explicitly is what makes the button safe to press twice.
+      if (!r.ok) return { ...r, manifestUntouched: true };
+
+      let amortized = null;
+      if (Array.isArray(amortizeTo) && amortizeTo.length) {
+        amortized = amortizeVerdict(current.glb, current.joints, current.manifest, {
+          fromId: id, toIds: amortizeTo, note, actor,
+        });
+      }
+      // One decision, one snapshot: the verdict and any amortization it triggered
+      // are a single point on the time axis, so they persist and revise together
+      // rather than as two revisions a reader would have to diff to see one act.
+      saveManifest(runDir, current.manifest);
+      commitRevision(`verdict ${decision} on ${id}${amortized?.applied?.length ? ` (+${amortized.applied.length} amortized)` : ''}`);
+
+      // The joint list the UI reads is mutated in place by applyManifest, so the
+      // resumable work state has to be refreshed too — otherwise a restart would
+      // hand back the pre-verdict joints.
+      sessionStore.setWork({ joints: current.joints.map((j) => ({ id: j.id, label: j.label, type: j.type, nodeCount: (j.nodes || []).length })) });
+      host.diagnostics.note('joint verdict', {
+        id, decision, status: r.status, edited: r.applied.length,
+        amortizedTo: amortized?.applied?.length ?? 0,
+        amortizeRefused: (amortized ? [...amortized.refused, ...amortized.skipped].length : 0),
+      });
+      return { ok: true, ...r, amortized, peers: this.jointPeers(id) };
+    },
+
+    // Phase 3 task 18: drive ONE joint through a fan of poses and ask a model what
+    // the moving thing is and whether its motion is sensible. The semantic half of
+    // "go and look": the geometry half (which nodes move, by how much) was already
+    // measured exactly, so this round annotates the record rather than mutating it.
+    //
+    // Same precondition discipline as visionRefine, for the same reasons: EVERY
+    // unmet guard is collected so one headless probe proves the whole wiring, the
+    // round is pinned to one renderer so the fan cannot be drawn by two tabs, and
+    // each pose's bytes are read back OFF DISK rather than held in memory.
+    //
+    // opts: { jointId, angles:[deg], mode:'photo'|'solo', round, viewport,
+    //         rendererId, timeoutMs }
+    async motionRefine(opts = {}) {
+      const refuse = (code, error, extra = {}) => ({
+        ok: false, code, error, manifestUntouched: true, ...extra,
+      });
+
+      const unmet = [];
+      if (!current.glb || !current.manifest) {
+        unmet.push({ code: 'NO_PROJECT', error: 'no project loaded; POST /api/project first' });
+      }
+      const provider = createVisionProvider(host.config, agent);
+      if (!provider.available()) {
+        unmet.push({
+          code: 'NO_VISION_AGENT',
+          error: provider.reason() || 'no live multimodal model is available',
+          provider: provider.kind, model: provider.model(),
+        });
+      }
+      const farmStatus = farm ? farm.status() : null;
+      if (!farm) {
+        unmet.push({ code: 'NO_RENDERER', error: 'the render farm is not available on this server' });
+      } else if (!farmStatus.ready) {
+        unmet.push({
+          code: 'NO_RENDERER',
+          error: `no browser renderer with a loaded model is connected (${farmStatus.renderers} attached, ${farmStatus.ready} ready) — open the viewer tab and load the mesh`,
+          hint: 'a motion fan needs a live browser to drive the preview pivot',
+        });
+      }
+      const jointId = opts.jointId != null ? String(opts.jointId) : null;
+      if (!jointId) {
+        unmet.push({ code: 'NO_RECORD', error: 'no jointId was given; a motion round drives exactly one joint' });
+      } else if (current.manifest && !current.manifest.some((r) => r.id === jointId)) {
+        unmet.push({ code: 'NO_RECORD', error: `no manifest record with id "${jointId}"` });
+      }
+      if (unmet.length) {
+        const [first] = unmet;
+        return refuse(first.code, first.error, { unmet, farm: farmStatus });
+      }
+
+      const rendererId = opts.rendererId ? String(opts.rendererId) : (farm.pick()?.id ?? null);
+      if (!rendererId) {
+        return refuse('NO_RENDERER', 'every renderer with a loaded model is busy with another capture', { farm: farmStatus });
+      }
+
+      const round = whole(opts.round, 0, 999) ?? nextObservationRound(runDir);
+      const viewport = opts.viewport?.w ? opts.viewport : VIEWPORT;
+      const mode = ['photo', 'solo'].includes(opts.mode) ? opts.mode : 'photo';
+      const angles = Array.isArray(opts.angles) && opts.angles.length
+        ? opts.angles.map(Number).filter(Number.isFinite)
+        : MOTION_ANGLES;
+      const timeoutMs = Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : null;
+      const drawn = [];
+
+      const res = await runMotionRound(current.glb, current.joints, current.manifest, {
+        jointId, mode, angles, viewport, evidenceRound: round,
+
+        // The fan is ONE logical capture that resolves once, but it lands as N+1
+        // stored frames. Read each pose's bytes back off disk (exactly as the
+        // vision capture does) so the prompt is built from the persisted artefact
+        // and the kernel never holds a whole fan of base64 for the length of a turn.
+        capture: async (rec, view, fanAngles, fanMode, focusNodes) => {
+          const r = await farm.captureMotion({
+            round, joint: rec, view, angles: fanAngles, mode: fanMode, focusNodes, viewport, rendererId, timeoutMs,
+          });
+          const raw = r?.frames || [];
+          if (raw.length < 2) return null;
+          const withBytes = [];
+          for (const f of raw) {
+            const file = framePath(runDir, round, f.id);
+            if (!file) continue;
+            drawn.push({ id: f.id, mode: fanMode, round, index: f.index, angle: f.angle, url: toViewerUrl(host, runDir, file) });
+            withBytes.push({ index: f.index, angle: f.angle, tag: f.tag, id: f.id, mediaType: 'image/png', dataBase64: readFileSync(file).toString('base64') });
+          }
+          let composite = null;
+          if (r.composite?.id) {
+            const file = framePath(runDir, round, r.composite.id);
+            if (file) {
+              drawn.push({ id: r.composite.id, mode: fanMode, round, kind: 'sweep', url: toViewerUrl(host, runDir, file) });
+              composite = { id: r.composite.id, kind: r.composite.kind || 'sweep', mediaType: 'image/png', dataBase64: readFileSync(file).toString('base64') };
+            }
+          }
+          // Two poses is the floor for an arc; a fan that lost frames on the way
+          // back is refused rather than assessed as if it were complete.
+          if (withBytes.length < 2) return null;
+          return { frames: withBytes, composite, angles: r.angles || withBytes.map((f) => f.angle) };
+        },
+
+        propose: (text, images) => provider.send(text, images),
+
+        persist: { motion: (m) => saveMotion(runDir, round, m) },
+      });
+
+      // Only a round that annotated the record may write the manifest; a refused
+      // round leaves the on-disk record byte-identical, so a failed press is safe.
+      if (res.ok && res.manifestUntouched === false) {
+        saveManifest(runDir, current.manifest);
+        commitRevision(`motion round on ${jointId}`);
+      }
+      host.diagnostics.note('motion refine', {
+        jointId, round, ok: res.ok, code: res.code || null,
+        sensible: res.motionSensible ?? null, observedType: res.observedType ?? null,
+        agrees: res.agreesWithType ?? null, frames: res.frames ?? 0, warnings: res.warnings?.length || 0,
+      });
+
+      const frameUrls = drawn;
+      if (!res.ok) {
+        return {
+          ...res, error: res.reason || res.error || 'the motion round failed',
+          round, rendererId, provider: provider.kind, frameUrls, farm: farm.status(),
+        };
+      }
+      return {
+        ...res, round, rendererId, provider: provider.kind,
+        model: res.model || provider.model(), frameUrls, farm: farm.status(),
+      };
+    },
+
+    // Phase 3 task 19: the TIME axis, read back. Every belief-changing write froze
+    // a revision; these expose the chain and the structural diff between two of
+    // them. Read-only — nothing here mutates the manifest, so the observation
+    // browser can poll them freely.
+    revisions() {
+      return { ok: true, revisions: listRevisions(runDir), latest: latestRevision(runDir) };
+    },
+
+    revision(n = null) {
+      const rev = loadRevision(runDir, n);
+      if (!rev) return { ok: false, code: 'NO_REVISION', error: `no revision ${n ?? '(latest)'}` };
+      return { ok: true, ...rev };
+    },
+
+    // Default compare is against the snapshot's OWN parent — "what did THIS
+    // revision change" — which is the question the time axis exists to answer.
+    // `against` names a different base to diff across a branch or a gap; a base
+    // with no snapshot (or a root revision) diffs against the empty graph, so
+    // every record reads as added rather than the call failing.
+    revisionDiff(n = null, against = null) {
+      const after = loadRevision(runDir, n);
+      if (!after) return { ok: false, code: 'NO_REVISION', error: `no revision ${n ?? '(latest)'}` };
+      const baseId = Number.isFinite(against) ? against : after.parent;
+      const before = baseId == null ? [] : (loadRevision(runDir, baseId)?.joints || []);
+      const diff = diffManifests(before, after.joints || []);
+      return { ok: true, revision: after.revision, against: baseId ?? null, ...diff };
     },
 
     // Validate a controller file against the cached mesh.
@@ -321,6 +732,7 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
         if (rr.skipped.length) host.diagnostics.note('rigidity reopen skipped', { skipped: rr.skipped });
         if (reopened.length) {
           saveManifest(runDir, current.manifest);
+          commitRevision(`rigidity reopen: ${reopened.join(', ')}`);
           host.diagnostics.note('manifest reopened by rigidity gate', { reopened });
         }
       }

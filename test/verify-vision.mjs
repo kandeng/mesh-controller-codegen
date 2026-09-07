@@ -28,7 +28,7 @@ import { makeCamera, namedIndex, nodeBox, planViews, rectOf, renderTargets } fro
 import {
   cloudAnchor, cloudAxis, visionPropose, L2_VISION_BASE_CONFIDENCE,
 } from '../src/plugins/discovery/vision-propose.mjs';
-import { runVisionRound, selectShots } from '../src/plugins/discovery/loop.mjs';
+import { MAX_EXTRA_VIEWS, MAX_VISION_ROUNDS, runVisionCampaign, runVisionRound, selectShots } from '../src/plugins/discovery/loop.mjs';
 import { frameKey } from '../src/plugins/discovery/observations.mjs';
 // The serializer that stands between a merged record and the browser. Importing
 // it from the server is safe headlessly: routes/project.mjs pulls in only
@@ -833,6 +833,225 @@ function makeFakes(replyOf) {
   ok('I: a non-vision joint still carries its phase-1 verdict fields',
     plain.status === 'candidate' && plain.confidence === 0.8 && Array.isArray(plain.evidence),
     `${plain.status} conf=${plain.confidence}`);
+}
+
+// ---- J) the bounded ACTIVE loop: round 2 goes and looks ----------------------
+// Round 1 declares where it was unsure; round 2 turns that sentence back into a
+// camera pose and looks. Everything here is faked — no browser, no model — which
+// is the only way to prove the BOUNDS: that the ceiling is hard, that the extra
+// frames really are close-ups of the disputed part, and that a campaign stops
+// when another look would repeat a question.
+function makeCampaignFakes(replyOf) {
+  const state = { plan: 0, capture: 0, propose: 0, prompts: [], asked: [], saved: {} };
+  return {
+    state,
+    plan: () => { state.plan += 1; return bigPlan; },
+    capture: async (view, mode, focusNodes) => {
+      state.capture += 1;
+      // `propose` runs once per round AFTER every capture, so its count is the
+      // round index while frames are being drawn.
+      state.asked.push({
+        round: state.propose, viewId: view.id, kind: view.spec?.kind ?? null,
+        mode, focus: focusNodes?.length ?? 0, sees: view.sees || [],
+      });
+      const colorMap = {};
+      if (mode === 'colorId') (focusNodes || []).forEach((nm, i) => { colorMap[hexOf(i)] = nm; });
+      return {
+        id: frameKey(view.id, mode), viewId: view.id, mode, pose: view.pose, spec: view.spec,
+        covers: view.covers, sees: view.sees, focus: focusNodes, mediaType: 'image/png',
+        dataBase64: PNG, colorMap: mode === 'colorId' ? colorMap : null,
+      };
+    },
+    propose: async (text, images) => {
+      const round = state.propose;
+      state.propose += 1;
+      state.prompts.push(text);
+      const m = text.match(/LEGEND for "([^"]+)":\s*(#[0-9a-f]{6})=(\S+)/);
+      return {
+        reply: replyOf(m ? { frameId: m[1], color: m[2], name: m[3] } : null, images, round),
+        model: 'fake-vlm', ms: 5, mode: 'live',
+      };
+    },
+    // A FACTORY, because a campaign persists per round: an object-shaped persist
+    // belongs to round 1 only, and reusing it would write round 2's evidence over
+    // the frames a human may already be looking at.
+    persist: (r) => {
+      if (!state.saved[r]) state.saved[r] = { plan: 0, frame: 0, reply: null, proposals: null };
+      const b = state.saved[r];
+      return {
+        plan: () => { b.plan += 1; },
+        frame: () => { b.frame += 1; },
+        reply: (x) => { b.reply = x; },
+        proposals: (x) => { b.proposals = x; },
+      };
+    },
+  };
+}
+
+// A reply that grounds by exact colour AND names a real part it wants seen again.
+const askAgain = (loc, images, round) => J([{
+  op: 'new', type: 'rotor', frameId: loc.frameId, regionColors: [loc.color], axis: [0, 0, 1],
+  reasoning: 'a central hub with radial blades',
+  uncertainties: ['blade count unclear'],
+  suggestView: { target: subject, reason: 'the hub is hidden by the arm' },
+}]);
+// A reply that is sure of itself: exact colour, no doubt, no request.
+const askNothing = (loc) => J([{
+  op: 'new', type: 'rotor', frameId: loc.frameId, regionColors: [loc.color], axis: [0, 0, 1],
+  reasoning: 'a central hub with four radial blades',
+}]);
+const wire = (f) => ({ plan: f.plan, capture: f.capture, propose: f.propose, persist: f.persist });
+
+{
+  const f = makeCampaignFakes(askAgain);
+  const joints = []; const man = [];
+  const res = await runVisionCampaign(g, joints, man, wire(f));
+  const r2 = f.state.asked.filter((a) => a.round === 1);
+  const r1 = f.state.asked.filter((a) => a.round === 0);
+
+  ok('J: the campaign runs BOTH rounds and asks the model twice',
+    res.ok === true && res.roundCount === 2 && f.state.propose === 2 && res.rounds.length === 2,
+    `${res.roundCount} rounds, ${f.state.propose} turns, added=${res.added}`);
+  ok('J: round 2 aimed at the region round 1 ASKED for, and says how it resolved',
+    res.rounds[1].regions?.length >= 1 && res.rounds[1].regions[0].how === 'name'
+      && res.rounds[1].regions[0].names >= 1,
+    J(res.rounds[1].regions?.map((x) => `${x.id}:${x.how}:${x.names}`)));
+  ok('J: round 2 shoots CLOSE-UPS, never another whole-model survey',
+    r2.length > 0 && r2.every((a) => a.kind === 'close-up'),
+    J([...new Set(r2.map((a) => a.kind))]));
+  ok('J: round 1 shot the survey and round 2 did not repeat it',
+    r1.length > 0 && r1.some((a) => a.kind !== 'close-up'),
+    `${r1.length} survey frames, ${r2.length} close-up frames`);
+  // The whole justification for round 2: the part the model could not make out is
+  // actually IN one of the new frames. A close-up that misses it is a wasted turn.
+  ok('J: the disputed part is actually FRAMED by round 2',
+    r2.some((a) => a.sees.includes(subject)), `${subject} in ${r2.filter((a) => a.sees.includes(subject)).length}/${r2.length} frames`);
+  ok('J: round 2 masks stay focused, so their legend stays readable',
+    r2.filter((a) => a.mode === 'colorId').every((a) => a.focus > 0),
+    J(r2.filter((a) => a.mode === 'colorId').map((a) => `${a.viewId}:${a.focus}`)));
+  ok('J: round 2 sends a DIFFERENT turn, not the same images again',
+    f.state.prompts.length === 2 && f.state.prompts[1] !== f.state.prompts[0]
+      && f.state.prompts[1].includes('close-up'),
+    `${f.state.prompts[0].length} vs ${f.state.prompts[1].length} chars`);
+  ok('J: BOTH rounds persisted their own plan, reply and proposals',
+    [0, 1].every((r) => f.state.saved[r]?.plan === 1 && f.state.saved[r]?.reply && f.state.saved[r]?.proposals),
+    J(Object.fromEntries(Object.entries(f.state.saved).map(([k, v]) => [k, { plan: v.plan, reply: !!v.reply, proposals: !!v.proposals }]))));
+  ok('J: the round ceiling and the extra-view ceiling are reported',
+    res.maxRounds === MAX_VISION_ROUNDS && res.extraBudget === MAX_EXTRA_VIEWS
+      && res.extraViews <= MAX_EXTRA_VIEWS && res.rounds[1].frames <= MAX_EXTRA_VIEWS,
+    `extraViews spent ${res.extraViews} of ${res.extraBudget}`);
+  ok('J: the campaign aggregates what its rounds found',
+    res.added >= 1 && man.length >= 1 && res.frames === r1.length + r2.length
+      && res.grounded.every((x) => Number.isFinite(x.round)),
+    `added=${res.added} frames=${res.frames} grounded tagged ${[...new Set(res.grounded.map((x) => x.round))].join(',')}`);
+  ok('J: a campaign that merged something reports the manifest as touched',
+    res.manifestUntouched === false);
+}
+
+// The bounds are HARD: they may be lowered by a caller, never raised. A knob that
+// could raise them would undo the bounded-auto decision the whole design rests on.
+{
+  const f = makeCampaignFakes(askAgain);
+  const res = await runVisionCampaign(g, [], [], { ...wire(f), rounds: 9, extraViews: 99 });
+  ok('J: asking for 9 rounds buys MAX_VISION_ROUNDS, and says so',
+    res.maxRounds === MAX_VISION_ROUNDS && res.roundCount <= MAX_VISION_ROUNDS
+      && res.warnings.some((w) => /rounds=9 was capped/.test(w)),
+    `${res.roundCount} rounds; ${res.warnings.find((w) => /capped/.test(w)) || 'no warning'}`);
+  ok('J: asking for 99 extra views buys MAX_EXTRA_VIEWS, and says so',
+    res.extraBudget === MAX_EXTRA_VIEWS && res.extraViews <= MAX_EXTRA_VIEWS
+      && res.warnings.some((w) => /extraViews=99 was capped/.test(w)),
+    `${res.extraViews} of ${res.extraBudget}`);
+  const one = makeCampaignFakes(askAgain);
+  const r1 = await runVisionCampaign(g, [], [], { ...wire(one), rounds: 1 });
+  ok('J: rounds:1 is honoured — a caller may narrow the loop',
+    r1.maxRounds === 1 && r1.roundCount === 1 && one.state.propose === 1
+      && r1.suggestViews.length > 0, `${r1.roundCount} round, ${r1.suggestViews.length} suggestions left unspent`);
+  const zero = makeCampaignFakes(askAgain);
+  const r0 = await runVisionCampaign(g, [], [], { ...wire(zero), extraViews: 0 });
+  ok('J: with no extra-view budget there is no round 2',
+    r0.roundCount === 1 && r0.extraBudget === 0 && /budget/.test(r0.stop || ''), r0.stop);
+}
+
+// Early termination. A second look is only worth six frames if it could answer
+// something the first one could not.
+{
+  const sure = makeCampaignFakes(askNothing);
+  const res = await runVisionCampaign(g, [], [], wire(sure));
+  ok('J: a round that asks for nothing earns no second look',
+    res.roundCount === 1 && sure.state.propose === 1 && /asked for nothing/.test(res.stop || ''),
+    res.stop);
+
+  // Seed the doubts round 1 is about to declare, then require that they earn
+  // nothing. This is the reachable form of "no new uncertainties": the seed
+  // normally comes from the manifest, not from a caller.
+  const probe = makeCampaignFakes(askAgain);
+  const p = await runVisionCampaign(g, [], [], { ...wire(probe), rounds: 1 });
+  const known = [
+    ...(p.rounds[0].grounded || []).flatMap((e) => (e.uncertainties || []).map((u) => `u:${u}`)),
+    ...(p.rounds[0].suggestViews || []).map((s) => `s:${s.target ?? ''}|${s.reason ?? ''}`),
+  ];
+  const seeded = makeCampaignFakes(askAgain);
+  const res2 = await runVisionCampaign(g, [], [], { ...wire(seeded), knownDoubts: known });
+  ok('J: a round that only repeats a doubt already on the books earns no second look',
+    known.length > 0 && res2.roundCount === 1 && /no NEW uncertainty/.test(res2.stop || ''),
+    `${known.length} known doubts; ${res2.stop}`);
+
+  // The REAL form of the same rule: records carry the doubts that produced them,
+  // so pressing the button twice does not photograph the same hidden hub twice.
+  const a = makeCampaignFakes(askAgain);
+  const joints = []; const man = [];
+  const first = await runVisionCampaign(g, joints, man, wire(a));
+  ok('J: round 1 records carry the doubt they declared, onto the manifest',
+    man.some((r) => Array.isArray(r.uncertainties) && r.uncertainties.length)
+      && man.some((r) => r.suggestView?.target === subject),
+    J(man.map((r) => ({ u: (r.uncertainties || []).length, sv: r.suggestView?.target ?? null }))));
+  const b = makeCampaignFakes(askAgain);
+  const second = await runVisionCampaign(g, joints, man, wire(b));
+  ok('J: a SECOND campaign over the same manifest does not re-chase the same doubt',
+    first.roundCount === 2 && second.roundCount === 1 && /no NEW uncertainty/.test(second.stop || ''),
+    `${first.roundCount} rounds then ${second.roundCount}; ${second.stop}`);
+}
+
+// Replay: a preset frame list must drive round 1 with NO renderer attached, and
+// must NOT be handed to round 2 — feeding round 1's pixels to round 2's prompt
+// would look like a working active loop and answer nothing.
+{
+  const pv = bigPlan.views.find((v) => Array.isArray(v.sees) && v.sees.length);
+  const focus = pv.sees.slice(0, 5);
+  const colorMap = {};
+  focus.forEach((nm, i) => { colorMap[hexOf(i)] = nm; });
+  const preset = [{
+    id: frameKey(pv.id, 'colorId'), viewId: pv.id, mode: 'colorId',
+    pose: pv.pose, spec: pv.spec, covers: pv.covers, sees: pv.sees, focus,
+    mediaType: 'image/png', dataBase64: PNG, colorMap,
+  }];
+  const f = makeCampaignFakes(askAgain);
+  const res = await runVisionCampaign(g, [], [], { ...wire(f), frames: preset });
+  const perRound = (r) => f.state.asked.filter((a) => a.round === r).length;
+  ok('J: a preset frame list replays round 1 without touching the renderer',
+    res.rounds[0].frames === 1 && perRound(0) === 0,
+    `${perRound(0)} captures in round 1`);
+  ok('J: the preset is NOT reused for round 2, which captures for real',
+    res.roundCount === 2 && perRound(1) > 0 && res.rounds[1].frames === perRound(1),
+    `${perRound(1)} captures in round 2`);
+  ok('J: round 2 still resolves its regions from the REPLAYED frames',
+    res.rounds[1].regions?.length >= 1,
+    J(res.rounds[1].regions?.map((x) => `${x.how}:${x.names}`)));
+
+  // The full replay claim: a per-round factory is asked once per round, and with
+  // frames supplied for BOTH the entire active loop runs with no renderer and no
+  // model attached — which is what makes a persisted run resumable.
+  const askedRounds = [];
+  const g2 = makeCampaignFakes(askAgain);
+  const res2 = await runVisionCampaign(g, [], [], {
+    ...wire(g2),
+    frames: (r) => { askedRounds.push(r); return preset; },
+  });
+  const replayed = (r) => g2.state.asked.filter((a) => a.round === r).length;
+  ok('J: a per-round preset factory can replay the WHOLE campaign with no renderer',
+    askedRounds.join() === '0,1' && replayed(0) === 0 && replayed(1) === 0
+      && res2.roundCount === 2 && res2.frames === 2,
+    `preset asked for rounds ${askedRounds.join(',')}; ${replayed(0) + replayed(1)} captures`);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

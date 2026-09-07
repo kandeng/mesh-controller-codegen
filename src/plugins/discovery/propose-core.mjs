@@ -151,6 +151,22 @@ export function createProposalGate({
       splitFrom: p.op === 'split' ? p.targetId : undefined,
       tests: [],
       status: 'candidate',
+      // Phase 3, task 17: the verdict fields are protected for the same reason
+      // `confidence` and `status` are. `verdict` is what deriveStatus reads to
+      // return `confirmed`, so a producer able to set it through `extra` would be
+      // able to self-confirm its own hallucination and skip the human gate
+      // entirely — the one gate the whole verdict feature exists to be.
+      verdict: null,
+      // Where the frame behind this claim lives. Protected for a subtler reason
+      // than `verdict`: a frame id is unique WITHIN a round directory but not
+      // ACROSS campaigns — every campaign starts its own r0 — so the id alone
+      // cannot say which pixels the observation browser should show. The loop
+      // stamps this after the merge, because only the caller that owns the round
+      // directories knows which one it wrote into. A producer guessing it would
+      // point a human at a different campaign's frame that happens to share an
+      // id, and the thumbnail would look exactly as trustworthy as the real one.
+      frameRound: null,
+      retestNeeded: false,
       history: [],
     });
     return 'record';

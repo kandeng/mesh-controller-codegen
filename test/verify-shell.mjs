@@ -319,5 +319,260 @@ ok('  a refused round leaves the manifest byte-identical, and asks for a rendere
   && (farmNow.available === false || !unmetCodes.includes('NO_RENDERER')),
   `${manAfter.manifest?.length} records unchanged; farm ready=${farmNow.available} renderers=${farmNow.farm?.renderers}`);
 
+// 12b) Phase-3 task 18: the motion route over HTTP.
+//
+// Same contract as leg 12, for the same reason: a motion fan needs a live
+// multimodal model AND a browser tab to drive the preview pivot, neither of which
+// the shell guarantees. So what is under test is the REFUSAL — graceful, every
+// unmet precondition named, the manifest left byte-identical, and the renderer
+// half asserted as a biconditional against the farm's own report so the check
+// proves the wiring headless AND on a dev machine with a tab attached.
+//
+// A motion round ANNOTATES (rec.motion) rather than mutating status/confidence,
+// so even a SUCCESS would leave leg 3b's statuses intact — but a refusal must
+// leave the record byte-identical, which is the stronger claim asserted here.
+const mid = (manAfter.manifest || []).find((r) => r.type === 'rotor')?.id;
+if (!mid) {
+  ok('the sample mesh yields a rotor to drive', false, 'no rotor record in the manifest');
+} else {
+  const mr = await raw('POST', `/api/joints/${mid}/motion`, {});
+  const mUnmet = (mr.body?.unmet || []).map((u) => u.code);
+  const farmM = await jget('/api/observe/farm');
+  if (agentMode !== 'live') {
+    ok('POST /api/joints/:id/motion refuses gracefully and names EVERY unmet precondition',
+      mr.body?.ok === false && [400, 404, 409, 500, 502, 503].includes(mr.status)
+        && typeof mr.body?.error === 'string' && mr.body.error.length > 0
+        && mr.body?.manifestUntouched === true
+        && Array.isArray(mr.body?.unmet) && mr.body.unmet.length > 0
+        && mr.body.unmet.every((u) => typeof u.code === 'string' && typeof u.error === 'string' && u.error.length > 0),
+      `${mr.status} code=${mr.body?.code} unmet=[${mUnmet.join(', ')}]`);
+    ok('  a stub vision model is named as the missing agent',
+      mUnmet.includes('NO_VISION_AGENT'), `unmet=[${mUnmet.join(', ')}]`);
+  } else {
+    ok('POST /api/joints/:id/motion answers on a live agent without a server fault',
+      mr.status < 500 && mr.body && typeof mr.body.ok === 'boolean',
+      `${mr.status} ok=${mr.body?.ok}`);
+  }
+  ok('  a refused motion round leaves the manifest byte-identical, and asks for a renderer exactly when none is ready',
+    JSON.stringify((await jget('/api/manifest')).manifest) === JSON.stringify(manAfter.manifest)
+      && (farmM.available === true || mUnmet.includes('NO_RENDERER'))
+      && (farmM.available === false || !mUnmet.includes('NO_RENDERER')),
+    `farm ready=${farmM.available} renderers=${farmM.farm?.renderers}`);
+
+  // The route is per-joint, so an unknown id must trip the NO_RECORD guard. Which
+  // code is TOP-LEVEL depends on the environment (a stub agent outranks it), so
+  // the robust claim is that NO_RECORD is among the unmet preconditions.
+  const mUnknown = await raw('POST', '/api/joints/no_such_joint/motion', {});
+  ok('  an unknown joint trips the NO_RECORD guard among the unmet preconditions',
+    mUnknown.body?.ok === false && (mUnknown.body?.unmet || []).some((u) => u.code === 'NO_RECORD'),
+    `${mUnknown.status} unmet=[${(mUnknown.body?.unmet || []).map((u) => u.code).join(', ')}]`);
+}
+
+// 13) Phase-3 task 17: the human verdict gate over HTTP.
+//
+// verify-verdict.mjs proves the DECISION RULES in-process; this leg proves the
+// TRANSPORT, which is where a verdict feature actually fails. The status code has
+// to say which kind of refusal happened, because the panel's recovery action
+// differs per cause: 400 means "your request was malformed", 404 means "no such
+// joint", 409 means "look at the panel again — the state moved under you".
+// Collapsing those into one number is what makes a UI able to say only "failed"
+// about a verdict that actually applied.
+//
+// It runs LAST because it is the only leg that deliberately mutates the manifest,
+// and leg 12's byte-identical assertion depends on nobody having done that.
+const rotors = (manAfter.manifest || []).filter((r) => r.type === 'rotor');
+const vid = rotors[0]?.id;
+if (!vid) {
+  ok('the sample mesh yields a rotor to judge', false, 'no rotor record in the manifest');
+} else {
+  const ev = await jget(`/api/joints/${vid}/evidence`);
+  ok('GET /api/joints/:id/evidence answers in ONE call',
+    ev.ok === true && ev.joint?.id === vid && Array.isArray(ev.frames) && Array.isArray(ev.rounds) && !!ev.peers,
+    `${ev.frames?.length} frame(s), ${ev.rounds?.length} round(s), ${ev.peers?.peers?.length} peer(s)`);
+  ok('  the evidence carries what a human judges BY, not just a confidence number',
+    'reasoning' in ev.joint && 'uncertainties' in ev.joint && Array.isArray(ev.joint.tests)
+    && Array.isArray(ev.joint.history) && 'anchor' in ev.joint && 'axis' in ev.joint,
+    `reasoning=${ev.joint.reasoning ? 'yes' : 'none'} unsure=${ev.joint.uncertainties?.length ?? 0} tests=${ev.joint.tests?.length}`);
+  ok('  every frame carries a servable url and never inlines bytes',
+    ev.frames.every((f) => typeof f.url === 'string' && f.dataBase64 === undefined));
+  ok('  the observation history leg of leg 9 is visible from here',
+    ev.rounds.some((r) => r.round === 0), `rounds=[${ev.rounds.map((r) => r.round).join(',')}]`);
+  ok('  frame BYTES are flagged, not inlined, so a colour map costs nothing until asked for',
+    ev.frames.every((f) => typeof f.hasColors === 'boolean'));
+
+  const ev404 = await raw('GET', '/api/joints/no_such_joint/evidence');
+  ok('GET /api/joints/:id/evidence 404s an unknown joint', ev404.status === 404 && ev404.body?.code === 'NO_RECORD', `${ev404.status}`);
+
+  const pr = await jget(`/api/joints/${vid}/peers`);
+  ok('GET /api/joints/:id/peers is read-only and answers the amortizability question itself',
+    pr.ok === true && Array.isArray(pr.peers) && typeof pr.canAmortize === 'boolean' && Array.isArray(pr.group),
+    `${pr.peers?.length} peer(s), group=${pr.group?.length}, canAmortize=${pr.canAmortize}`);
+  ok('  an undecided joint reports canAmortize=false rather than leaving the panel to guess',
+    pr.canAmortize === false, 'there is no verdict to pass on yet');
+  ok('  each peer says WHY it qualifies, in words',
+    (pr.peers || []).every((p) => ['mirror', 'family'].includes(p.basis) && typeof p.gloss === 'string' && p.gloss.length > 0),
+    (pr.peers || []).map((p) => `${p.id}:${p.basis}`).join(' '));
+
+  // Refusals, each with its own cause-specific code.
+  const manPre = await jget('/api/manifest');
+  const bad = await raw('POST', `/api/joints/${vid}/verdict`, { decision: 'perhaps' });
+  ok('POST verdict 400s an unknown decision', bad.status === 400 && bad.body?.code === 'BAD_VERDICT', `${bad.status} ${bad.body?.code}`);
+  const noJoint = await raw('POST', '/api/joints/no_such_joint/verdict', { decision: 'accept' });
+  ok('POST verdict 404s an unknown joint', noJoint.status === 404 && noJoint.body?.code === 'NO_RECORD', `${noJoint.status}`);
+  const noEdits = await raw('POST', `/api/joints/${vid}/verdict`, { decision: 'edit', edits: { status: 'confirmed' } });
+  ok('POST verdict 400s an edit that could change nothing',
+    noEdits.status === 400 && noEdits.body?.code === 'NO_EDITS', `${noEdits.status} ${noEdits.body?.error}`);
+  ok('  a refused edit says which field it turned down and why',
+    (noEdits.body?.refused || []).some((r) => r.field === 'status' && r.why.length > 0), JSON.stringify(noEdits.body?.refused));
+  const manPost = await jget('/api/manifest');
+  ok('  every refusal left the manifest byte-identical, so the button is safe to press twice',
+    JSON.stringify(manPost.manifest) === JSON.stringify(manPre.manifest)
+    && [bad, noJoint, noEdits].every((r) => r.body?.manifestUntouched === true),
+    `${manPost.manifest?.length} records unchanged`);
+
+  // The accept, and the lateral edge in the SAME submission.
+  const peerIds = (pr.peers || []).map((p) => p.id);
+  const acc = await raw('POST', `/api/joints/${vid}/verdict`, {
+    decision: 'accept', note: 'shell probe', actor: 'probe', amortizeTo: [...peerIds, 'not_a_peer'],
+  });
+  ok('POST verdict accepts and confirms', acc.status === 200 && acc.body?.ok === true && acc.body?.status === 'confirmed',
+    `${acc.status} → ${acc.body?.status}`);
+  ok('  the verdict and its amortization are reported SEPARATELY',
+    acc.body?.decision === 'accept' && acc.body?.amortized && Array.isArray(acc.body?.amortized?.applied),
+    `applied=${acc.body?.amortized?.applied?.length ?? 0} skipped=${acc.body?.amortized?.skipped?.length ?? 0} refused=${acc.body?.amortized?.refused?.length ?? 0}`);
+  ok('  one verdict travelled to every symmetry peer the probe selected',
+    (acc.body?.amortized?.applied || []).length === peerIds.length && peerIds.length > 0,
+    `${acc.body?.amortized?.applied?.length}/${peerIds.length}`);
+  ok('  a non-peer is REFUSED while the verdict itself still succeeds',
+    acc.body?.ok === true && (acc.body?.amortized?.refused || []).some((r) => r.id === 'not_a_peer'),
+    'a partial amortization is a success with a footnote, not a failure');
+  ok('  each amortized peer records where its verdict came from',
+    (acc.body?.amortized?.applied || []).every((a) => a.status === 'confirmed'));
+
+  const pr2 = await jget(`/api/joints/${vid}/peers`);
+  ok('  canAmortize flips once there is a verdict to pass on', pr2.canAmortize === true);
+  const ev2 = await jget(`/api/joints/${vid}/evidence`);
+  ok('  the evidence now carries the verdict, the actor and the note',
+    ev2.joint.verdict?.decision === 'accept' && ev2.joint.verdict?.actor === 'probe'
+    && ev2.joint.verdict?.note === 'shell probe' && ev2.joint.verdict?.amortizedFrom === null,
+    JSON.stringify(ev2.joint.verdict));
+  ok('  the audit trail grew by exactly one entry per write',
+    ev2.joint.history.filter((h) => h.event === 'verdict').length === 1);
+  ok('  an inherited peer says so on its own evidence page',
+    ev2.peers.peers.some((p) => p.verdict?.amortizedFrom === vid),
+    'a green chip must be able to say it came from a mirror');
+
+  const served = await jget('/api/joints');
+  ok('GET /api/joints shows the confirmed status to the step-3 chips',
+    served.joints?.find((j) => j.id === vid)?.status === 'confirmed'
+    && peerIds.every((id) => served.joints?.find((j) => j.id === id)?.status === 'confirmed'),
+    `${served.joints?.filter((j) => j.status === 'confirmed').length} confirmed`);
+
+  // An edit verdict, then the refusal to amortize it.
+  const ed = await raw('POST', `/api/joints/${vid}/verdict`, { decision: 'edit', edits: { label: 'probe-corrected' } });
+  ok('POST verdict applies an edit and re-runs the battery',
+    ed.status === 200 && ed.body?.ok === true && (ed.body?.applied || []).includes('label'),
+    `${ed.status} → ${ed.body?.status} applied=${ed.body?.applied}`);
+  const edAmortize = await raw('POST', `/api/joints/${vid}/verdict`, { decision: 'accept', amortizeTo: peerIds });
+  ok('  a later accept may still be amortized', edAmortize.status === 200 && edAmortize.body?.ok === true,
+    `${edAmortize.status} → ${edAmortize.body?.status}`);
+
+  // A peer with a DIRECT verdict of its own, then an attempt to amortize over it.
+  // A direct human verdict outranks an inference drawn from a mirror, so nothing
+  // can take it. The HTTP answer is still 200: the amortization outcome is nested
+  // under `amortized` because the verdict ITSELF applied, and promoting a skipped
+  // mirror to an error status would tell the human their accept did not happen.
+  const ownId = peerIds[0];
+  const own = await raw('POST', `/api/joints/${ownId}/verdict`, { decision: 'reject', actor: 'probe-direct' });
+  ok('POST verdict on a peer directly gives it a verdict of its own',
+    own.status === 200 && own.body?.status === 'rejected' && own.body?.verdict?.amortizedFrom === null,
+    `${own.status} → ${own.body?.status}`);
+  const clash = await raw('POST', `/api/joints/${vid}/verdict`, { decision: 'accept', amortizeTo: [ownId] });
+  ok('  amortizing over a DIRECT verdict is refused in the body, not by an error status',
+    clash.status === 200 && clash.body?.ok === true && clash.body?.amortized?.ok === false
+    && clash.body?.amortized?.code === 'NOTHING_APPLIED',
+    `${clash.status} amortized.code=${clash.body?.amortized?.code}`);
+  ok('  ...and the source verdict itself still APPLIED, with the reason reported',
+    clash.body?.decision === 'accept' && clash.body?.status === 'confirmed'
+    && clash.body?.amortized?.skipped?.some((s) => s.id === ownId && s.why.includes('direct human verdict')),
+    `skipped=[${(clash.body?.amortized?.skipped || []).map((s) => `${s.id}: ${s.why}`).join('; ')}]`);
+  const ownAfter = await jget(`/api/joints/${ownId}/evidence`);
+  ok('  the peer kept its own verdict instead of inheriting the source\'s',
+    ownAfter.joint.verdict?.decision === 'reject' && ownAfter.joint.verdict?.actor === 'probe-direct',
+    'the machine must never outvote the person who looked at THIS joint');
+
+  // A reversal on the source, with no amortization requested at all.
+  const rev = await raw('POST', `/api/joints/${vid}/verdict`, { decision: 'reject' });
+  ok('POST verdict records a reversal over an earlier decision',
+    rev.status === 200 && rev.body?.status === 'rejected', `${rev.status} → ${rev.body?.status}`);
+  const revEv = await jget(`/api/joints/${vid}/evidence`);
+  ok('  both decisions are on the trail, so a reversal is visible rather than a rewrite',
+    revEv.joint.history.filter((h) => h.event === 'verdict').length >= 2
+    && revEv.joint.verdict.decision === 'reject',
+    `${revEv.joint.history.filter((h) => h.event === 'verdict').length} verdict entries`);
+
+  const manFinal = await jget('/api/manifest');
+  const rejected = (manFinal.manifest || []).filter((r) => r.status === 'rejected');
+  ok('  a rejection reaches the manifest as a status nothing else can produce',
+    rejected.length > 0 && rejected.every((r) => !!r.verdict && r.verdict.decision === 'reject'),
+    `${rejected.length} rejected record(s)`);
+}
+
+// 14) Phase-3 task 19: revision snapshots — the TIME axis over HTTP.
+//
+// verify-revisions.mjs proves the snapshot/diff RULES in-process; this leg proves
+// the TRANSPORT and, more importantly, that the verdict writes in leg 13 actually
+// froze revisions. A feature that snapshots nothing is indistinguishable from one
+// that snapshots everything until you COUNT the files, so this leg counts them.
+// It runs after leg 13 on purpose: the verdict chain is exactly the history a
+// revision list should now be able to replay.
+const revs = await jget('/api/revisions');
+ok('GET /api/revisions lists the snapshot chain',
+  revs.ok === true && Array.isArray(revs.revisions) && revs.revisions.length >= 2,
+  `${revs.revisions?.length} revision(s), latest=${revs.latest}`);
+ok('  revisions are contiguous from 0 and `latest` is the last',
+  revs.revisions[0]?.revision === 0 && revs.latest === revs.revisions.length - 1);
+ok('  the base revision is the project-load discovery loop, with no parent',
+  revs.revisions[0]?.parent === null && /discovery loop/i.test(revs.revisions[0]?.note || ''),
+  revs.revisions[0]?.note);
+ok('  the verdict writes in leg 13 each froze a revision',
+  revs.revisions.some((r) => /^verdict/i.test(r.note || '')),
+  `notes=[${revs.revisions.map((r) => r.note).join(' | ')}]`);
+ok('  a listing carries counts but never inlines the graph N times',
+  revs.revisions.every((r) => r.joints === undefined && r.counts && typeof r.counts.total === 'number'));
+
+const snap0 = await raw('GET', '/api/revisions/0');
+ok('GET /api/revisions/:n loads one full snapshot, records included',
+  snap0.status === 200 && snap0.body?.ok === true
+    && Array.isArray(snap0.body?.joints) && snap0.body.joints.length > 0,
+  `${snap0.body?.joints?.length} record(s)`);
+
+// The root revision has no parent, so its diff is against the empty graph: every
+// record reads as ADDED. This is the deterministic end of the chain.
+const diff0 = await jget('/api/revisions/0/diff');
+ok('GET /api/revisions/:n/diff defaults to the parent, and the root has none',
+  diff0.ok === true && diff0.against === null
+    && diff0.added?.length === snap0.body.joints.length && diff0.changed?.length === 0,
+  `+${diff0.added?.length} added vs the empty graph`);
+
+const verdictRev = revs.revisions.find((r) => /^verdict/i.test(r.note || ''));
+if (verdictRev) {
+  const dv = await jget(`/api/revisions/${verdictRev.revision}/diff`);
+  ok('  a verdict revision\u2019s diff shows the status/verdict that decision moved',
+    dv.ok === true && dv.against === verdictRev.parent
+      && (dv.changed || []).some((c) => c.changes?.verdict || c.changes?.status),
+    `${dv.changed?.length} changed record(s) vs r${dv.against}`);
+  const dx = await jget(`/api/revisions/${verdictRev.revision}/diff?against=0`);
+  ok('  ?against=0 diffs across the whole chain rather than against the parent',
+    dx.ok === true && dx.against === 0);
+} else {
+  ok('  a verdict revision exists to diff', false, 'no revision note began with "verdict"');
+}
+
+const rev404 = await raw('GET', '/api/revisions/9999');
+ok('GET /api/revisions/:n 404s a missing revision', rev404.status === 404 && rev404.body?.code === 'NO_REVISION', `${rev404.status}`);
+const diff404 = await raw('GET', '/api/revisions/9999/diff');
+ok('GET /api/revisions/:n/diff 404s a missing revision', diff404.status === 404 && diff404.body?.code === 'NO_REVISION', `${diff404.status}`);
+
 console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} \u2014 ${pass} passed, ${fail} failed\n`);
 process.exit(fail === 0 ? 0 : 1);

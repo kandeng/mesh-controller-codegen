@@ -152,6 +152,66 @@ export function createRenderFarm({ timeoutMs = DEFAULT_CAPTURE_TIMEOUT_MS, onEve
     });
   }
 
+  // Ask a renderer for a MOTION FAN: one joint driven through several angles from
+  // a single fixed camera, plus a swept composite. Task 18.
+  //
+  // It shares the whole capture lifecycle — pick(), the pending map, deliver(),
+  // fail(), release(), detach() — because a fan is one logical request that
+  // resolves once, exactly like a single frame; only the WS message differs
+  // (kind:'motion-request', carrying the joint and its angles) and only the upload
+  // endpoint differs (/api/observe/motion, which takes the whole fan in one body).
+  // Reusing `pending`/`deliver` is what lets a renderer nack or a disconnect fail a
+  // fan through the identical code path, so a motion round degrades the same way a
+  // vision round does.
+  //
+  // `request`: { joint, view, angles, mode, focusNodes, round, viewport,
+  //              rendererId, timeoutMs }
+  async function captureMotion(request = {}) {
+    const renderer = request.rendererId
+      ? (() => { const s = byId.get(request.rendererId); return s ? renderers.get(s) : null; })()
+      : pick();
+    if (!renderer) {
+      const err = new Error(request.rendererId
+        ? `no renderer with id ${request.rendererId}`
+        : 'no browser renderer with a loaded model is connected');
+      err.code = 'NO_RENDERER';
+      throw err;
+    }
+    if (!renderer.hasModel) {
+      const err = new Error('the connected renderer has no model loaded');
+      err.code = 'NO_MODEL';
+      throw err;
+    }
+
+    const requestId = `mot_${Date.now().toString(36)}_${nextId()}`;
+    const budget = Number(request.timeoutMs) > 0 ? Number(request.timeoutMs) : timeoutMs;
+
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        fail(requestId, `renderer did not deliver a motion fan within ${budget}ms`);
+      }, budget);
+      pending.set(requestId, { resolve, reject, timer, rendererId: renderer.id });
+
+      renderer.inflight += 1;
+      renderer.lastUsed = Date.now();
+      const sent = wsSend(renderer.socket, {
+        kind: 'motion-request',
+        requestId,
+        round: request.round ?? null,
+        // The joint travels whole: the viewer rebuilds the preview pivot from
+        // { id, type, nodes, anchor, tests } and cannot drive a fan without them.
+        joint: request.joint ?? null,
+        view: request.view ?? null,
+        angles: Array.isArray(request.angles) ? request.angles : null,
+        mode: request.mode || 'photo',
+        focusNodes: Array.isArray(request.focusNodes) ? request.focusNodes : null,
+        viewport: request.viewport ?? null,
+        motionUrl: '/api/observe/motion',
+      });
+      if (!sent) fail(requestId, 'renderer socket is not writable');
+    });
+  }
+
   // The renderer said "cannot do that" before trying (no model, unknown view,
   // WebGL context lost). Fail fast rather than burn the timeout.
   function nack(requestId, error = 'renderer refused the capture') {
@@ -211,6 +271,6 @@ export function createRenderFarm({ timeoutMs = DEFAULT_CAPTURE_TIMEOUT_MS, onEve
 
   return {
     attach, update, detach, list, status, pick,
-    capture, deliver, nack, cancel, fail, dispose,
+    capture, captureMotion, deliver, nack, cancel, fail, dispose,
   };
 }

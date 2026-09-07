@@ -10,7 +10,7 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { useProjectStore } from '../composables/useProjectStore.js';
 import { useTheme } from '../composables/useTheme.js';
-import { registerViewerCapture, registerViewerCaptureAt, registerViewerModel } from '../composables/useViewerCapture.js';
+import { registerViewerCapture, registerViewerCaptureAt, registerViewerCaptureMotion, registerViewerModel } from '../composables/useViewerCapture.js';
 import { useRenderFarm } from '../composables/useRenderFarm.js';
 
 const { state } = useProjectStore();
@@ -307,6 +307,203 @@ function captureAt(view, { mode = 'photo', focusNodes = null, viewport = null } 
   }
 }
 
+// ---- phase-3 task 18: motion-fan capture ------------------------------------
+// captureAt FREEZES the preview at rest; a motion fan needs the exact opposite —
+// the SAME preview pivot driven through a fan of angles from ONE fixed camera, so
+// the only thing that changes between frames is this joint's own rotation.
+//
+// The question these frames answer is SEMANTIC ONLY: "what is this moving thing,
+// is the motion sensible". WHICH nodes move and by how much is already measured
+// exactly by the rigidity gate, so nothing here is a measurement — it is evidence
+// for a judgement. That is why the fan is small (a few poses) and the frames are
+// modest: a 12-frame 1024px survey would answer a question nobody is asking.
+//
+// FULLY SYNCHRONOUS, and that is load-bearing rather than a convenience: every
+// pose is rendered, tagged and swept inside one task, so the preview tick — which
+// re-parents the pivot for the ACTIVE joint on every animation frame — can never
+// interleave between two poses and silently redraw the fan about the wrong joint.
+// The swept composite is an onion-skin built by accumulating each render onto a
+// second 2D canvas (earliest pose faintest, latest solid), so the arc of motion is
+// visible in a single image without a video path.
+//
+// The burned-in corner tag is REDUNDANCY, not the primary annotation: the prompt
+// text says "frame 2 = 30 deg" authoritatively, and the tag is what survives a
+// model that reorders the images.
+const MAX_MOTION_ANGLES = 6;
+
+// Small high-contrast pill in the top-left. Kept small and cornered so it never
+// covers the moving part, but legible enough to do its job as reordering
+// insurance. roundRect is guarded because a tag that fails to draw must degrade to
+// no tag, not to a thrown capture.
+function drawCornerTag(ctx, text, vp) {
+  try {
+    const pad = Math.max(4, Math.round(vp.h * 0.014));
+    const fs = Math.max(13, Math.round(vp.h * 0.05));
+    ctx.font = `600 ${fs}px ui-monospace, SFMono-Regular, Menlo, monospace`;
+    ctx.textBaseline = 'top';
+    const w = Math.ceil(ctx.measureText(text).width);
+    const bw = w + pad * 2, bh = fs + pad * 2, r = Math.round(pad * 0.9);
+    ctx.fillStyle = 'rgba(8,10,14,0.72)';
+    ctx.beginPath();
+    if (typeof ctx.roundRect === 'function') ctx.roundRect(pad, pad, bw, bh, r); else ctx.rect(pad, pad, bw, bh);
+    ctx.fill();
+    ctx.fillStyle = '#e8eef6';
+    ctx.fillText(text, pad * 2, pad);
+  } catch { /* a missing tag must never cost the frame */ }
+}
+
+// Drive the pivot to ONE explicit angle about the joint's primary axis. Mirrors
+// applyPreview's per-type mapping, but from a given angle instead of accumulated
+// knob values, and setting all three components so a previous pose can never leak
+// into the next. Model space is Z-up: rotor spin and hinge angle are about Z; a
+// gimbal fan shows pitch, about a horizontal (X) axis.
+function setDriveAngle(j, angleDeg) {
+  if (!pivot) return;
+  const a = (Number(angleDeg) || 0) * DEG2RAD;
+  if (j?.type === 'gimbal') pivot.rotation.set(a, 0, 0);
+  else pivot.rotation.set(0, 0, a);
+  pivot.updateMatrixWorld(true);
+}
+
+// Draw the fan. Returns { frames, composite, joint, angles, mode, view } or null.
+function captureMotion(joint, { view, angles = null, mode = 'photo', focusNodes = null, viewport = null } = {}) {
+  if (!renderer || !drone) return null;
+  if (!joint || !joint.id) return null;
+  const pose = view?.pose;
+  if (!Array.isArray(pose?.eye) || !Array.isArray(pose?.target)) return null;
+
+  const fan = (Array.isArray(angles) && angles.length ? angles : [0, 30, 60])
+    .map((a) => Number(a) || 0).slice(0, MAX_MOTION_ANGLES);
+  // One pose is not motion. Refuse rather than hand back a "fan" that cannot show
+  // an arc — the whole point is the change between frames.
+  if (fan.length < 2) { status.value = 'motion fan needs at least 2 angles'; return null; }
+
+  const vp = {
+    w: Math.max(16, Number(viewport?.w) || 768),
+    h: Math.max(16, Number(viewport?.h) || 768),
+    fov: Math.max(1, Math.min(170, Number(viewport?.fov) || 45)),
+  };
+
+  // Scene space = world space - center (identical to captureAt; see its note).
+  const eye = [pose.eye[0] - center.x, pose.eye[1] - center.y, pose.eye[2] - center.z];
+  const tgt = [pose.target[0] - center.x, pose.target[1] - center.y, pose.target[2] - center.z];
+  const dist = Math.hypot(eye[0] - tgt[0], eye[1] - tgt[1], eye[2] - tgt[2]);
+  if (!(dist > 1e-6)) return null;
+
+  const focus = Array.isArray(focusNodes) && focusNodes.length ? new Set(focusNodes.map(String)) : null;
+  const inFocus = (o) => {
+    if (!focus) return true;
+    let cur = o; let guard = 0;
+    while (cur && guard < 64) { if (focus.has(cur.name)) return true; cur = cur.parent; guard += 1; }
+    return false;
+  };
+
+  const saved = {
+    size: renderer.getSize(new THREE.Vector2()),
+    pixelRatio: renderer.getPixelRatio(),
+    fov: camera.fov, aspect: camera.aspect, near: camera.near, far: camera.far, zoom: camera.zoom,
+    up: camera.up.clone(), position: camera.position.clone(), quaternion: camera.quaternion.clone(),
+    background: scene.background,
+    gridVisible: grid ? grid.visible : null,
+    overlayVisible: overlay ? overlay.visible : null,
+    orbitEnabled: orbit.enabled, orbitTarget: orbit.target.clone(),
+    pivotRotation: pivot ? pivot.rotation.clone() : null,
+    // Whether the live pivot ALREADY belongs to this joint. If so it is the active
+    // preview's own pivot and must be restored, not torn down; otherwise we built
+    // one for a non-active joint and must dismantle it so the tick can rebuild the
+    // active one.
+    wasPivot: !!(pivot && pivotJointId === joint.id),
+  };
+
+  // solo hides everything outside the focus so the swept arc reads as just the
+  // moving assembly against the backdrop — the clearest possible "is this motion
+  // sensible" picture. photo keeps the whole machine for context.
+  const savedVis = new Map();
+  const applySolo = () => {
+    if (mode !== 'solo') return;
+    drone.traverse((o) => { if (o.isMesh && !inFocus(o)) { savedVis.set(o, o.visible); o.visible = false; } });
+  };
+  const restoreVis = () => { for (const [o, v] of savedVis) o.visible = v; savedVis.clear(); };
+
+  const mkCanvas = () => { const c = document.createElement('canvas'); c.width = vp.w; c.height = vp.h; return c; };
+  const tagCanvas = mkCanvas(); const tagCtx = tagCanvas.getContext('2d');
+  const sweepCanvas = mkCanvas(); const sweepCtx = sweepCanvas.getContext('2d');
+
+  try {
+    ensurePivot(joint);
+    if (!pivot) { status.value = `motion: no pivot could be built for ${joint.id} (no nodes or anchor)`; return null; }
+    if (grid) grid.visible = false;
+    if (overlay) overlay.visible = false;
+    orbit.enabled = false;
+    applySolo();
+
+    renderer.setPixelRatio(1);
+    renderer.setSize(vp.w, vp.h, false);
+    scene.background = saved.background;
+
+    camera.fov = vp.fov;
+    camera.aspect = vp.w / vp.h;
+    camera.up.set(0, 0, 1);            // model space is Z-up
+    camera.near = Math.max(0.01, dist * 0.01);
+    camera.far = dist * 4 + radius * 4 + 10;
+    camera.zoom = 1;
+    camera.position.set(eye[0], eye[1], eye[2]);
+    camera.lookAt(tgt[0], tgt[1], tgt[2]);
+    camera.updateProjectionMatrix();
+    camera.updateMatrixWorld(true);
+
+    const frames = [];
+    const n = fan.length;
+    fan.forEach((angle, i) => {
+      setDriveAngle(joint, angle);
+      renderer.render(scene, camera);
+      // Read the WebGL buffer in the SAME synchronous task (no preserveDrawingBuffer),
+      // exactly as captureAt does, then tag it on a 2D canvas.
+      tagCtx.clearRect(0, 0, vp.w, vp.h);
+      tagCtx.drawImage(renderer.domElement, 0, 0, vp.w, vp.h);
+      const tag = `${i + 1} \u00b7 ${angle}\u00b0`;
+      drawCornerTag(tagCtx, tag, vp);
+      frames.push({ index: i + 1, angle, tag, dataUrl: tagCanvas.toDataURL('image/png'), width: vp.w, height: vp.h });
+      // Onion-skin accumulation: earliest pose faintest, latest solid, so the sweep
+      // reads as motion from the first pose to the last.
+      sweepCtx.globalAlpha = n <= 1 ? 1 : 0.25 + 0.75 * (i / (n - 1));
+      sweepCtx.drawImage(renderer.domElement, 0, 0, vp.w, vp.h);
+    });
+    sweepCtx.globalAlpha = 1;
+    drawCornerTag(sweepCtx, `sweep ${fan[0]}\u2013${fan[n - 1]}\u00b0`, vp);
+
+    return {
+      frames,
+      composite: { kind: 'sweep', dataUrl: sweepCanvas.toDataURL('image/png'), width: vp.w, height: vp.h, angles: fan },
+      joint: { id: joint.id, type: joint.type || null },
+      angles: fan,
+      mode,
+      view: { id: view?.id ?? null, spec: view?.spec ?? null, pose: view?.pose ?? null },
+    };
+  } catch (e) {
+    status.value = `captureMotion threw: ${e.message}`;
+    return null;
+  } finally {
+    restoreVis();
+    scene.background = saved.background;
+    if (grid) grid.visible = saved.gridVisible ?? true;
+    if (overlay) overlay.visible = saved.overlayVisible ?? true;
+    if (saved.wasPivot && pivot) { pivot.rotation.copy(saved.pivotRotation); pivot.updateMatrixWorld(true); }
+    else teardownPivot();
+    renderer.setPixelRatio(saved.pixelRatio);
+    renderer.setSize(saved.size.x, saved.size.y);
+    camera.fov = saved.fov; camera.aspect = saved.aspect;
+    camera.near = saved.near; camera.far = saved.far; camera.zoom = saved.zoom;
+    camera.up.copy(saved.up); camera.position.copy(saved.position);
+    camera.quaternion.copy(saved.quaternion);
+    camera.updateProjectionMatrix();
+    camera.updateMatrixWorld(true);
+    orbit.target.copy(saved.orbitTarget);
+    orbit.enabled = saved.orbitEnabled;
+    orbit.update();
+  }
+}
+
 // Tell the render farm what this tab can currently draw. Called on every model
 // change so the server never picks a tab that is showing a different mesh than
 // the one the plan was made against.
@@ -499,6 +696,7 @@ onMounted(() => {
   addEventListener('resize', resize);
   registerViewerCapture(captureFrame);
   registerViewerCaptureAt(captureAt);
+  registerViewerCaptureMotion(captureMotion);
   announceModel();
   if (state.viewer.glb) reload();
 });
@@ -508,6 +706,7 @@ onBeforeUnmount(() => {
   removeEventListener('resize', resize);
   registerViewerCapture(null);
   registerViewerCaptureAt(null);
+  registerViewerCaptureMotion(null);
   registerViewerModel(null);
   try { renderer?.dispose(); } catch { /* ignore */ }
 });

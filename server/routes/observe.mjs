@@ -25,7 +25,7 @@
 import { planViews, focusFromManifest, VIEWPORT } from '../../src/plugins/discovery/views.mjs';
 import {
   FRAME_MODES, MAX_FRAMES_PER_ROUND, frameKey, framePath, listRounds, loadColorMap,
-  loadPlan, loadRound, saveFrame, savePlan,
+  loadPlan, loadRound, motionFrameId, motionSweepId, saveFrame, savePlan,
 } from '../../src/plugins/discovery/observations.mjs';
 import { toViewerUrl } from '../../src/pipeline.mjs';
 
@@ -47,6 +47,16 @@ function splitImage(body) {
 // directory already sits under the statically-mounted runs/ prefix, so this is a
 // path rewrite, not a copy.
 const urlOf = (kernel, abs) => (abs ? toViewerUrl(kernel.host, kernel.runDir, abs) : null);
+
+// A motion fan's delivery payload carries the ABSOLUTE file path of each stored
+// PNG so the kernel can read the bytes back off disk. That path is server-internal
+// and must not reach the browser, so the HTTP response is mapped through these
+// before it is sent — the same reason /api/observations hands back a url, not a
+// directory. The delivered payload (farm.deliver) keeps the absolute path.
+const publicFrames = (frames) => (Array.isArray(frames)
+  ? frames.map(({ file, ...rest }) => rest)
+  : []);
+const publicComposite = (c) => (c ? (({ file, ...rest }) => rest)(c) : null);
 
 export function observeRoutes(app, kernel, farm) {
   // ---- farm status ----------------------------------------------------------
@@ -237,6 +247,90 @@ export function observeRoutes(app, kernel, farm) {
     return { ok: true, delivered: true, frame: stored.entry, url };
   });
 
+  // ---- motion fan delivery (task 18) ----------------------------------------
+  // The renderer's byte upload for a WHOLE FAN in one body: several pose frames
+  // plus a swept composite. Same store-then-resolve discipline as /frame — every
+  // PNG lands on disk BEFORE the waiting captureMotion is resolved, so a fan that
+  // arrives after its timeout is still evidence (answered 409, delivered:false).
+  //
+  // Each image is stored under a motion-specific key (motionFrameId/motionSweepId)
+  // so a fan never collides with a vision frame sharing the round directory, and
+  // the SAME frames.json index / MAX_FRAMES_PER_ROUND budget already governs it.
+  //
+  // This route does NOT write motion.json. That record carries the prompt, the
+  // model's reply and the assessment — none of which exist at delivery time — so
+  // the kernel's motion round writes it once, completely, mirroring how the vision
+  // path leaves proposals.json to the kernel rather than to /frame. What this
+  // route hands the waiting capture is the frame references (ids + absolute files,
+  // so the kernel can read the bytes back off disk exactly as visionRefine does).
+  app.post('/api/observe/motion', async (req, reply) => {
+    const b = req.body || {};
+    const round = rnd(b.round);
+    const jointId = b.jointId || b.joint?.id || b.requestId || null;
+    const mode = FRAME_MODES.includes(b.mode) ? b.mode : 'photo';
+
+    const rawFrames = Array.isArray(b.frames) ? b.frames : [];
+    if (!rawFrames.length) {
+      if (farm && b.requestId) farm.fail(String(b.requestId), 'motion fan carried no frames');
+      return reply.code(400).send({ ok: false, error: 'motion fan carried no frames' });
+    }
+
+    // A fan is one logical capture, but it is stored as N+1 ordinary frames. Any
+    // single pose that cannot be stored fails the whole fan — a fan with a hole in
+    // its arc is worse than no fan, because the model would reason about a motion
+    // it was not fully shown.
+    const storedFrames = [];
+    for (const f of rawFrames) {
+      const { dataBase64, mediaType } = splitImage(f);
+      const id = motionFrameId(jointId, f.index, mode);
+      const stored = saveFrame(kernel.runDir, round, {
+        id, mode, viewId: id, dataBase64, mediaType,
+        width: Number.isFinite(f.width) ? f.width : null,
+        height: Number.isFinite(f.height) ? f.height : null,
+        pose: b.view?.pose ?? null,
+        focus: b.focusNodes ?? null,
+        note: `motion pose ${f.index} @ ${f.angle}\u00b0`,
+      });
+      if (!stored.ok) {
+        if (farm && b.requestId) farm.fail(String(b.requestId), stored.error);
+        const code = /budget/.test(stored.error) ? 409 : /bytes/.test(stored.error) ? 413 : 400;
+        return reply.code(code).send({ ok: false, error: stored.error });
+      }
+      storedFrames.push({ index: f.index, angle: f.angle, tag: f.tag ?? null, id: stored.entry.id, file: stored.file, url: urlOf(kernel, stored.file) });
+    }
+
+    // The swept composite is a CONVENIENCE, not the evidence: the poses are what
+    // the model judges. So a composite that fails to store degrades the fan rather
+    // than failing it — the delivery still resolves with the pose frames intact.
+    let storedComposite = null;
+    if (b.composite && (b.composite.dataUrl || b.composite.dataBase64)) {
+      const { dataBase64, mediaType } = splitImage(b.composite);
+      const id = motionSweepId(jointId, mode);
+      const stored = saveFrame(kernel.runDir, round, {
+        id, mode, viewId: id, dataBase64, mediaType,
+        width: Number.isFinite(b.composite.width) ? b.composite.width : null,
+        height: Number.isFinite(b.composite.height) ? b.composite.height : null,
+        pose: b.view?.pose ?? null,
+        focus: b.focusNodes ?? null,
+        note: `motion sweep ${rawFrames[0]?.angle ?? 0}\u2013${rawFrames[rawFrames.length - 1]?.angle ?? 0}\u00b0`,
+      });
+      if (stored.ok) storedComposite = { id: stored.entry.id, kind: b.composite.kind || 'sweep', file: stored.file, url: urlOf(kernel, stored.file) };
+    }
+
+    const delivered = farm && b.requestId
+      ? farm.deliver(String(b.requestId), {
+        round, jointId, mode, angles: Array.isArray(b.angles) ? b.angles : storedFrames.map((f) => f.angle),
+        view: b.view ?? null, focusNodes: b.focusNodes ?? null,
+        frames: storedFrames, composite: storedComposite,
+      })
+      : false;
+    if (!delivered) {
+      kernel.diagnostics?.note?.('observe motion orphaned', { round, jointId, requestId: b.requestId || null });
+      return reply.code(409).send({ ok: true, delivered: false, frames: publicFrames(storedFrames), composite: publicComposite(storedComposite), error: 'no capture was waiting for this requestId; the fan was stored anyway' });
+    }
+    return { ok: true, delivered: true, frames: publicFrames(storedFrames), composite: publicComposite(storedComposite) };
+  });
+
   // ---- evidence read-back ---------------------------------------------------
 
   app.get('/api/observations', async () => ({
@@ -251,12 +345,22 @@ export function observeRoutes(app, kernel, farm) {
     const round = rnd(req.params.round);
     const rec = loadRound(kernel.runDir, round);
     if (!rec) return reply.code(404).send({ ok: false, error: `no observations for round ${round}` });
+    // A motion fan is stored as ordinary frames (motion.json references them by
+    // id), so its images are already servable through framePath. Map each id to a
+    // url here so the evidence browser can render the arc without a second call.
+    const motionUrl = (id) => (id ? urlOf(kernel, framePath(kernel.runDir, round, id)) : null);
+    const motion = rec.motion ? {
+      ...rec.motion,
+      frames: (Array.isArray(rec.motion.frames) ? rec.motion.frames : []).map((f) => ({ ...f, url: motionUrl(f.id) })),
+      composite: rec.motion.composite ? { ...rec.motion.composite, url: motionUrl(rec.motion.composite.id) } : null,
+    } : null;
     return {
       ok: true,
       round,
       plan: rec.plan,
       reply: rec.reply,
       proposals: rec.proposals,
+      motion,
       frames: rec.frames.map((f) => ({
         ...f,
         url: urlOf(kernel, framePath(kernel.runDir, round, f.id)),

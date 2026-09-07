@@ -52,5 +52,23 @@ export function useKernelApi() {
     observations: () => get('/api/observations'),
     observation: (round) => get(`/api/observations/${Number(round) || 0}`),
     observationColors: (round, id) => get(`/api/observations/${Number(round) || 0}/colors/${encodeURIComponent(id)}`),
+
+    // ---- phase 3 task 17: the human verdict gate ---------------------------
+    // Everything the observation panel draws for ONE joint: the frames behind the
+    // claim, the reasoning, the uncertainties, the current verdict and the
+    // symmetry peers a verdict may be offered to. One call, so the panel is usable
+    // the moment a joint is clicked.
+    jointEvidence: (id) => get(`/api/joints/${encodeURIComponent(id)}/evidence`),
+    // The peer offer on its own, for a panel that only needs to redraw the
+    // checkboxes after a verdict rather than re-fetch every thumbnail.
+    jointPeers: (id) => get(`/api/joints/${encodeURIComponent(id)}/peers`),
+    // The ONLY route to `confirmed`/`rejected`. postRaw, not post: a refusal here
+    // is a 400 or a 404 whose body names the field that was turned down and why,
+    // and throwing the status away would leave the panel able to say only "it
+    // failed" about an edit it could have repaired. Note there is deliberately no
+    // 409 — a skipped amortization is a footnote on a verdict that SUCCEEDED, and
+    // arrives nested under `amortized`, so the panel must not read it as a failure.
+    // body: { decision:'accept'|'reject'|'edit', edits, note, actor, amortizeTo }
+    setVerdict: (id, body) => postRaw(`/api/joints/${encodeURIComponent(id)}/verdict`, body || {}),
   };
 }

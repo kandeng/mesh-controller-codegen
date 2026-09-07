@@ -10,13 +10,18 @@
 //   D) focusNames restricts the plan, planCloseUps aims at its anchors
 //   E) focusFromManifest turns the manifest + joints + blade suspects into the
 //      name set a vision round should actually spend frames on
+//   F) regionsFromSuggestViews turns round 1's "look here again" back into a
+//      camera pose — the edge that makes the loop active rather than a pipeline
 //
 // Usage: node test/verify-views.mjs
 import { bladeCandidates, parseGlb } from '../src/lib/gltf.mjs';
+import { MAX_LEGEND } from '../src/plugins/discovery/vision-prompt.mjs';
 import {
-  VIEWPORT, candidateSpecs, coverageOf, fitDistance, focusFromManifest, kdCells,
+  AZIMUTH_RETRY, REGION_MAX_R, REGION_MIN_R, REGION_PAD, VIEWPORT,
+  candidateSpecs, coverageOf, fitDistance, focusFromManifest, kdCells,
   makeCamera, modelRadius, modelTarget, namedIndex, nodeBox, planCloseUps,
-  planViews, poseFromSpec, project, projectNode, renderTargets,
+  planViews, poseFromSpec, project, projectNode, regionsFromSuggestViews,
+  renderTargets, unfitDistance,
 } from '../src/plugins/discovery/views.mjs';
 
 const GLB = 'samples/drone_dji_inspire3.glb';
@@ -153,14 +158,106 @@ const photos = budget.views.filter((v) => v.mode === 'photo');
     ok('D: focusNames restricts the target set', true, 'nothing unseen — full coverage reached');
   }
 
-  const anchors = [[10, 0, 5], [-10, 0, 5]];
-  const cu = planCloseUps(anchors.map((a, i) => ({ id: `r${i}`, anchor: a, radius: 3, azimuth: 0 })), { perRegion: 2 });
-  ok('D: close-ups are emitted per region', cu.length === anchors.length * 2, `${cu.length} poses`);
+  // Round-2 close-ups, anchored on REAL parts (the two named extremes in x) so
+  // region membership and `sees` are both non-empty and the assertions mean
+  // something. Arbitrary points in empty space would prove only the arithmetic.
+  const boxOf = new Map();
+  for (const n of targets) {
+    const nm = named.get(n.i);
+    const b = nodeBox(n);
+    if (!nm || !b) continue;
+    const cur = boxOf.get(nm);
+    if (!cur || Math.hypot(...b.h) > Math.hypot(...cur.h)) boxOf.set(nm, b);
+  }
+  const extremes = [...boxOf.entries()].reduce((acc, e) => ({
+    lo: e[1].c[0] < acc.lo[1].c[0] ? e : acc.lo,
+    hi: e[1].c[0] > acc.hi[1].c[0] ? e : acc.hi,
+  }), { lo: [...boxOf.entries()][0], hi: [...boxOf.entries()][0] });
+  const regions = [extremes.lo, extremes.hi].map(([nm, b]) => ({
+    id: nm,
+    anchor: b.c.slice(),
+    radius: Math.max(2, Math.max(...b.h) * 3),
+    azimuth: 30,
+    reason: 'test region',
+  }));
+  const cu = planCloseUps(g, regions, { perRegion: 2 });
+
+  ok('D: close-ups are emitted per region', cu.views.length >= regions.length * 2,
+    `${cu.views.length} poses for ${regions.length} regions`);
   ok('D: close-ups aim at their own anchors',
-    cu.every((c, i) => c.pose.target[0] === anchors[Math.floor(i / 2)][0] && c.pose.target[2] === anchors[Math.floor(i / 2)][2]));
+    cu.views.every((v) => regions.some((r) => v.pose.target[0] === r.anchor[0]
+      && v.pose.target[1] === r.anchor[1] && v.pose.target[2] === r.anchor[2])),
+    `${[...new Set(cu.views.map((v) => v.region))].join(', ')}`);
   ok('D: close-up distance is fitted to the region, not the model',
-    cu.every((c) => Math.abs(c.spec.distance - fitDistance(3, VIEWPORT, 1.15)) < 1e-9),
-    `d=${cu[0]?.spec.distance.toFixed(2)} for radius 3 (model wradius ${modelRadius(g).toFixed(1)})`);
+    cu.views.every((v) => {
+      const r = regions.find((x) => x.id === v.region);
+      return v.spec.distance <= fitDistance(r.radius, VIEWPORT, 1.15) + 1e-9
+        && v.spec.distance < fitDistance(modelRadius(g), VIEWPORT, 1.15);
+    }),
+    `d=${cu.views[0]?.spec.distance.toFixed(2)} vs model fit ${fitDistance(modelRadius(g), VIEWPORT, 1.15).toFixed(2)}`);
+
+  // A legend that overflows MAX_LEGEND drops colours, and the dropped ones are
+  // unresolvable — so a close-up either fits the budget or proves it zoomed in as
+  // far as it could. Ghosts are exempt by design: narrowing a ghost trades away
+  // the interior coverage it is the only route to.
+  ok('D: every close-up mask legend fits the budget, or was tightened trying',
+    cu.views.every((v) => v.mode === 'ghost' || v.covers <= MAX_LEGEND || v.tightened != null),
+    `covers ${Math.min(...cu.views.map((v) => v.covers))}-${Math.max(...cu.views.map((v) => v.covers))} vs legend budget ${MAX_LEGEND}; tightened ${cu.views.filter((v) => v.tightened != null).length}/${cu.views.length}`);
+
+  // THE round-2 invariant. A colorId mask must be focused, and `sees` is the only
+  // source of a focus list — a close-up plan without it degrades round 2 to plain
+  // photos exactly where the exact colour channel was the whole point.
+  ok('D: EVERY close-up predicts its own visibility, so a round-2 mask can be focused',
+    cu.views.every((v) => Array.isArray(v.sees) && v.sees.length > 0),
+    `sees ${Math.min(...cu.views.map((v) => v.sees.length))}-${Math.max(...cu.views.map((v) => v.sees.length))} parts`);
+  ok('D: close-up views carry the same shape planViews emits',
+    cu.views.every((v) => v.id && v.mode && v.spec && v.pose
+      && typeof v.covers === 'number' && Number.isFinite(v.marginal) && Array.isArray(v.sees)),
+    `keys ${Object.keys(cu.views[0] || {}).join(',')}`);
+  ok('D: the two poses per region differ, so an occluded part gets a second look',
+    regions.every((r) => {
+      const vs = cu.views.filter((v) => v.region === r.id && v.mode !== 'ghost');
+      return vs.length >= 2 && new Set(vs.map((v) => `${v.spec.azimuth}|${v.spec.elevation}`)).size === vs.length;
+    }),
+    cu.views.filter((v) => v.mode !== 'ghost').map((v) => `az${v.spec.azimuth}/el${v.spec.elevation}`).join(' '));
+  ok('D: a ghost close-up is only bought for a part no opaque close-up framed',
+    cu.views.filter((v) => v.mode === 'ghost').every((v) => v.sees.length > 0)
+      && (cu.views.some((v) => v.mode === 'ghost') ? cu.interiorOnly.length > 0 : true),
+    `${cu.views.filter((v) => v.mode === 'ghost').length} ghost(s), interiorOnly ${cu.interiorOnly.length}`);
+  ok('D: the close-up plan reports coverage of what it was unsure about',
+    cu.targets > 0 && cu.coverage >= 0 && cu.coverage <= 1,
+    `${cu.covered}/${cu.targets} region parts framed (${(cu.coverage * 100).toFixed(1)}%)`);
+  ok('D: maxViews caps the round-2 plan', planCloseUps(g, regions, { perRegion: 4, maxViews: 3 }).views.length <= 3);
+
+  // Prove the legend-fit loop actually runs. At the real budget it rarely does —
+  // a whole-model region frames only ~38 parts because occlusion hides the rest —
+  // so drive it with a budget smaller than what the region frames, and compare
+  // against the same plan with tightening disabled. The point is not the number
+  // 12; it is that the planner zooms in just until the legend fits, says so, and
+  // never shrinks the thing it is measuring coverage of.
+  const TIGHT_BUDGET = 12;
+  const wholeRegion = [{ id: 'whole', anchor: modelTarget(g), radius: modelRadius(g) }];
+  const wide = planCloseUps(g, wholeRegion, { perRegion: 1, legendBudget: TIGHT_BUDGET });
+  const loose = planCloseUps(g, wholeRegion, { perRegion: 1, legendBudget: 0 });
+  const wv = wide.views[0]; const lv = loose.views[0];
+  ok('D: an over-wide region is zoomed in until its legend fits',
+    wv && lv && wv.tightened != null && wv.tightened < 1
+      && wv.covers <= TIGHT_BUDGET && wv.covers < lv.covers
+      && wv.spec.distance < lv.spec.distance,
+    `covers ${lv.covers} -> ${wv.covers} (budget ${TIGHT_BUDGET}), d ${lv.spec.distance.toFixed(1)} -> ${wv.spec.distance.toFixed(1)}, ratio ${wv.tightened}`);
+  // Tightening narrows the CAMERA, not the REGION. `targets` is the membership
+  // denominator, so it must not move — otherwise a zoom would quietly redefine
+  // what was being measured and coverage would look better for free. `covered`
+  // falling is the honest cost of the trade: a narrower frustum sees less.
+  ok('D: tightening narrows the CAMERA without shrinking the REGION',
+    wide.targets === loose.targets && wide.covered <= loose.covered,
+    `${wide.targets} region parts either way; framed ${loose.covered} -> ${wide.covered}`);
+  // At the real budget the whole-model region already fits, so nothing is zoomed
+  // — tightening must be a last resort, not a default that throws away coverage.
+  ok('D: at the real legend budget an over-wide region is left alone',
+    planCloseUps(g, wholeRegion, { perRegion: 1 }).views[0].covers <= MAX_LEGEND
+      && planCloseUps(g, wholeRegion, { perRegion: 1 }).views[0].tightened == null,
+    `${lv.covers} parts fit ${MAX_LEGEND} without zooming`);
 
   // A cell frame must exist for the small parts: the candidate set has to contain
   // poses much closer than whole-model framing, or greedy can never buy the
@@ -258,6 +355,138 @@ const photos = budget.views.filter((v) => v.mode === 'photo');
     `${fp.views.length} frames for ${fp.targets} focused nodes at ${(fp.coverage * 100).toFixed(1)}% (whole-model budget: ${budget.views.length} frames for ${budget.targets})`);
   ok('E: a focused plan never claims a node outside the focus',
     fp.views.every((v) => v.covers <= fp.targets));
+}
+
+// ---- F) round 2: a suggestView becomes a place to aim ------------------------
+// The active-loop edge `hypothesis --suggestView--> observation` is only real if
+// a model's sentence can be turned back into a camera pose. suggestView.target
+// arrives in three shapes (a node name, a frame id, free text) and each needs a
+// different lookup, so all three are exercised here against REAL frames from a
+// REAL round-1 plan.
+{
+  const R = modelRadius(g);
+  const plan1 = planViews(g, { maxViews: 6 });
+  const cell = plan1.views.find((v) => v.spec.kind === 'cell');
+  const ring = plan1.views.find((v) => v.spec.kind === 'ring');
+  const part = cell.sees[0];
+  const peers = cell.sees.slice(1, 6);
+  const frames = [
+    { id: `${ring.id}.photo`, viewId: ring.id, mode: 'photo' },
+    { id: `${cell.id}.colorId`, viewId: cell.id, mode: 'colorId' },
+  ];
+  const grounded = [
+    { index: 0, frameId: `${cell.id}.colorId`, names: [part] },
+    { index: 1, frameId: `${ring.id}.photo`, names: [] },
+  ];
+  // Two records that share the word "rotor" so the ambiguity guard has something
+  // to refuse. No node name in this model contains it, so a match can only come
+  // from manifest vocabulary.
+  const mf = [
+    { id: 'rotor_fl', label: 'front left rotor', nodes: [part, peers[0]].filter(Boolean) },
+    { id: 'rotor_fr', label: 'front right rotor', nodes: peers.slice(1, 3) },
+  ];
+  const run = (svs, o = {}) => regionsFromSuggestViews(g, svs, {
+    grounded, plan: plan1, frames, manifest: mf, ...o,
+  });
+
+  // Independent oracle for "where is this part": recomputed here from the mesh
+  // nodes rather than read back from the module under test.
+  const centreOf = (nm) => {
+    let out = null;
+    for (const n of targets) {
+      if (named.get(n.i) !== nm) continue;
+      const b = nodeBox(n);
+      if (!b) continue;
+      if (!out) { out = { c: b.c.slice(), h: b.h.slice() }; continue; }
+      for (let k = 0; k < 3; k += 1) {
+        const lo = Math.min(out.c[k] - out.h[k], b.c[k] - b.h[k]);
+        const hi = Math.max(out.c[k] + out.h[k], b.c[k] + b.h[k]);
+        out.c[k] = (lo + hi) / 2; out.h[k] = (hi - lo) / 2;
+      }
+    }
+    return out;
+  };
+
+  ok('F: unfitDistance inverts fitDistance',
+    [1, 7.5, R, 3 * R].every((r) => [1, 1.15, 2].every((m) => Math.abs(unfitDistance(fitDistance(r, VIEWPORT, m), VIEWPORT, m) - r) < 1e-6)),
+    `round trip at margin 1/1.15/2`);
+
+  // (1) derived, box-only: target IS a node name.
+  const byName = run([{ index: 0, frameId: `${cell.id}.colorId`, target: part, reason: 'grounding was geometric only', origin: 'derived' }]);
+  const rn = byName.regions[0];
+  ok('F: a derived suggestView naming a PART resolves to exactly that part',
+    byName.regions.length === 1 && rn.how === 'name' && rn.names.join() === part
+      && byName.unresolved.length === 0 && byName.skipped.length === 0,
+    `${rn.how} -> ${rn.names.join(',')}`);
+  const pb = centreOf(part);
+  ok('F: a named region is anchored on the part and sized to it, inside the clamp',
+    rn.anchor.every((v, k) => Math.abs(v - pb.c[k]) < 1e-9)
+      && Math.abs(rn.radius - Math.max(REGION_MIN_R * R, Math.min(REGION_MAX_R * R, Math.hypot(...pb.h) * REGION_PAD))) < 1e-9,
+    `r=${rn.radius.toFixed(2)} in [${(REGION_MIN_R * R).toFixed(2)}, ${(REGION_MAX_R * R).toFixed(2)}] from a part ${Math.hypot(...pb.h).toFixed(2)} across`);
+
+  // (2) derived, disagree: target IS a frame id.
+  const byFrame = run([{ index: 1, frameId: `${ring.id}.photo`, target: `${ring.id}.photo`, reason: 'the box and the colours disagreed', origin: 'derived' }]);
+  const rf = byFrame.regions[0];
+  ok('F: a derived suggestView naming a FRAME resolves to that frame\'s aim point',
+    byFrame.regions.length === 1 && rf.how === 'frame-aim' && rf.names.length === 0
+      && rf.anchor.every((v, k) => Math.abs(v - ring.pose.target[k]) < 1e-9),
+    `${rf.how} anchor=${rf.anchor.map((v) => v.toFixed(1)).join(',')}`);
+  ok('F: a frame-only region is sized to the frame it came from, never to the whole model',
+    rf.radius <= REGION_MAX_R * R + 1e-9 && rf.radius < R,
+    `r=${rf.radius.toFixed(2)} vs model ${R.toFixed(2)}`);
+  ok('F: round 2 re-aims from a DIFFERENT bearing than the frame that was unsure',
+    rf.azimuth === (ring.spec.azimuth + AZIMUTH_RETRY) % 360,
+    `az ${ring.spec.azimuth} -> ${rf.azimuth}`);
+
+  // (3) model-origin free text.
+  const byText = run([{ index: 2, frameId: `${ring.id}.photo`, target: `please look again at ${part} from below and behind`, reason: 'it is hidden by the hull', origin: 'model' }]);
+  ok('F: a model request in free text still finds the part it names',
+    byText.regions.length === 1 && byText.regions[0].how === 'name-in-text'
+      && byText.regions[0].names.join() === part,
+    `${byText.regions[0]?.how} from "${part}"`);
+  const byJoint = run([{ index: 3, frameId: null, target: 'front left rotor', reason: 'not sure it spins', origin: 'model' }]);
+  ok('F: a model request in JOINT vocabulary resolves through the manifest',
+    byJoint.regions.length === 1 && byJoint.regions[0].how === `manifest:${mf[0].id}`
+      && byJoint.regions[0].names.length === mf[0].nodes.length,
+    `${byJoint.regions[0]?.how} -> ${byJoint.regions[0]?.names.length} parts`);
+
+  // Refusing is a behaviour, not an absence of one: an ambiguous request must be
+  // REPORTED, because a close-up aimed at a plausible-looking part spends the
+  // round-2 budget answering a question nobody asked.
+  const vague = run([{ index: 4, frameId: null, target: 'rotor', reason: 'which rotor?', origin: 'model' }]);
+  ok('F: an ambiguous request is reported, never guessed',
+    vague.regions.length === 0 && vague.unresolved.length === 1 && /no part/.test(vague.unresolved[0].why),
+    `${vague.unresolved[0]?.why}`);
+  const junk = regionsFromSuggestViews(g, [null, {}, { target: 42 }, { target: 'x' }], { plan: plan1, frames });
+  ok('F: junk suggestViews cannot throw or invent a region',
+    junk.regions.length === 0 && junk.unresolved.length === 4,
+    `${junk.unresolved.length} reported of 4 junk entries`);
+  ok('F: no suggestViews means no round 2', run([]).regions.length === 0
+    && regionsFromSuggestViews(g, null).regions.length === 0);
+
+  // Ranking decides who survives a collision: the model asked, so the model wins.
+  const both = run([
+    { index: 0, frameId: `${cell.id}.colorId`, target: part, reason: 'geometric only', origin: 'derived' },
+    { index: 2, frameId: `${ring.id}.photo`, target: `look again at ${part}`, reason: 'hidden by the hull', origin: 'model' },
+  ]);
+  ok('F: the same parts suggested twice buy ONE region, and the model\'s request wins it',
+    both.regions.length === 1 && both.regions[0].origin === 'model'
+      && both.skipped.length === 1 && both.skipped[0].origin === 'derived',
+    `kept ${both.regions[0].origin}/${both.regions[0].how}, dropped ${both.skipped[0].origin}`);
+
+  const many = run(peers.map((nm, k) => ({ index: k, frameId: `${cell.id}.colorId`, target: nm, reason: 'r', origin: 'derived' })), { maxRegions: 2 });
+  ok('F: maxRegions caps how much round 2 may spend',
+    many.regions.length === 2 && many.skipped.length === peers.length - 2
+      && many.skipped.every((s) => /cap/.test(s.why)),
+    `${many.regions.length} regions kept, ${many.skipped.length} over the cap`);
+
+  // The whole point, end to end: the regions feed the planner unmodified, and the
+  // frames it buys actually SHOW the part that was in doubt.
+  const cu = planCloseUps(g, byName.regions, { perRegion: 2 });
+  ok('F: the close-up a suggestView buys actually FRAMES the part it was unsure about',
+    cu.views.length > 0 && cu.views.some((v) => v.sees.includes(part))
+      && cu.views.every((v) => Array.isArray(v.sees) && v.sees.length > 0),
+    `${cu.views.length} frames, ${cu.covered}/${cu.targets} region parts framed`);
 }
 
 console.log(`\n${fail === 0 ? 'VIEWS_PROBE_OK' : 'VIEWS_PROBE_FAILED'} \u2014 ${pass} passed, ${fail} failed\n`);

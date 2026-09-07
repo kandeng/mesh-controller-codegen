@@ -1,8 +1,13 @@
 // Joint routes — list discovered joints, publish the renderer-registry contract
 // (the render ids the frontend must implement), and serve the deterministic RIG
 // REPORT the debugging assistant relies on (GET /api/joints/:id/rig). The
-// per-joint slot graph lives in project.mjs (/api/joints/:id/slots); this module
-// is the read-only catalog + rig inspector.
+// per-joint slot graph lives in project.mjs (/api/joints/:id/slots).
+//
+// This module also carries the manifest's write surface — the phase-2 refine, the
+// phase-3 vision campaign and the phase-3 human verdict — because all three are
+// "change what we believe about the joints" and a reader looking for that should
+// not have to know which phase produced it. Every one of them delegates straight
+// to the kernel; nothing here decides anything.
 import { KNOWN_RENDERS } from '../slots.mjs';
 import { jointSummary } from './project.mjs';
 import { parseGlb } from '../../src/lib/gltf.mjs';
@@ -66,12 +71,25 @@ export function jointRoutes(app, kernel) {
     return r;
   });
 
-  // Phase 3: trigger ONE vision round — the kernel plans poses, a connected
-  // browser tab draws them, and a multimodal model reads the frames.
+  // Phase 3: trigger a vision CAMPAIGN — the kernel plans poses, a connected
+  // browser tab draws them, a multimodal model reads the frames and says where it
+  // was unsure, and a second round goes and looks there. One press, up to two
+  // rounds, each with its own observation directory.
   //
-  // The body is the round's own tuning surface (all optional): { round, mode,
+  // The body is the campaign's own tuning surface (all optional): { round, mode,
   // focus, maxViews, minCoverage, allowGhost, ghostViews, maxFrames, maskPairs,
   // ghostFrames, orientation, rendererId, timeoutMs, viewport }.
+  //
+  // Task-16 knobs, and the important property is that they can only ever LOWER
+  // the ceiling — `rounds` is clamped to MAX_VISION_ROUNDS and `extraViews` to
+  // MAX_EXTRA_VIEWS, and a request above either is answered with the capped value
+  // plus a warning saying so. A knob that could raise the bound would let a caller
+  // talk the machine into a longer look than a human authorised, which is exactly
+  // what the bounded-auto decision was there to prevent:
+  //   rounds      how many rounds this press may run (1 = the old single round)
+  //   extraViews  frames round 2 may buy ON TOP of round 1 (0 = no round 2)
+  //   maxRegions  how many distinct doubts round 2 may aim at
+  //   perRegion   close-up poses per aimed region
   //
   // Status codes are per-CAUSE, mirroring /api/observe/*, because each one tells
   // the operator to do something different:
@@ -98,6 +116,127 @@ export function jointRoutes(app, kernel) {
     ok: true,
     joints: (kernel.current.joints || []).map(jointSummary),
   }));
+
+  // Phase 3 task 17: the evidence behind ONE claim — the frames the model was
+  // looking at, what it said, where it said it was unsure, and who a verdict may
+  // be offered to. One call rather than four because the panel is opened by a
+  // click on a joint and a human waiting on four round trips before they can read
+  // anything is a human who starts pressing buttons without looking.
+  //
+  // `frames` is the claim's own evidence and `rounds` is the whole observation
+  // history, so the same panel can answer "what did it see" and "what did we ever
+  // look at" without a second endpoint. Frame BYTES are never inlined — each
+  // frame carries a servable `url` under the statically-mounted runs/ prefix.
+  app.get('/api/joints/:id/evidence', async (req, reply) => {
+    const r = kernel.jointEvidence(req.params.id);
+    if (!r.ok) return reply.code(r.code === 'NO_RECORD' ? 404 : 400).send(r);
+    return r;
+  });
+
+  // Phase 3 task 17: the symmetry peers of one joint — who a verdict on it may be
+  // OFFERED to, and why each one qualifies. Read-only and safe to poll: the panel
+  // calls it when a joint is selected so the checkboxes are already drawn by the
+  // time the human has read the evidence.
+  app.get('/api/joints/:id/peers', async (req, reply) => {
+    const r = kernel.jointPeers(req.params.id);
+    if (!r.ok) return reply.code(r.code === 'NO_RECORD' ? 404 : 400).send(r);
+    return r;
+  });
+
+  // Phase 3 task 17: the human verdict. The only route to `confirmed`/`rejected`
+  // — no model and no test can produce either, which is the whole point of having
+  // a human gate.
+  //
+  // Body: { decision:'accept'|'reject'|'edit', edits:{label|type|nodes|anchor|axis},
+  //         note, actor, amortizeTo:[peer ids] }
+  //
+  // `amortizeTo` is the lateral edge: it passes THIS verdict on to symmetry peers
+  // the human explicitly selected. It is never defaulted to "all peers", and an
+  // `edit` cannot be amortized at all — it is written in this joint's own node
+  // names, and a mirror's nodes are different nodes.
+  //
+  // Status codes are per-CAUSE like the rest of this file. There are only two,
+  // because the verdict write path only refuses for two reasons:
+  //   404 no such joint
+  //   400 no project loaded / unknown decision / an edit with nothing editable
+  // A refusal leaves the on-disk manifest byte-identical, so this is safe to press
+  // twice — `manifestUntouched:true` in the body says so explicitly.
+  //
+  // There is deliberately NO 409. The amortization outcome arrives nested under
+  // `amortized`, never as the top-level `code`, because `amortizeVerdict` only
+  // runs AFTER the verdict itself has been applied — so its four refusals
+  // (NO_VERDICT, NOT_AMORTIZABLE, NO_PEERS, NOTHING_APPLIED) describe a footnote
+  // on a write that succeeded. Promoting any of them to an HTTP error would tell
+  // the human their accept did not happen, and they would press it again. The
+  // verdict and its amortization are reported SEPARATELY for exactly that reason:
+  // an accept that applied while one mirror was skipped is a success with a
+  // footnote, not a failure.
+  app.post('/api/joints/:id/verdict', async (req, reply) => {
+    const r = kernel.setVerdict({ ...(req.body || {}), id: req.params.id });
+    if (!r.ok) return reply.code(r.code === 'NO_RECORD' ? 404 : 400).send(r);
+    return r;
+  });
+
+  // Phase 3 task 18: drive ONE joint through its motion and ask a multimodal model
+  // a SEMANTIC-ONLY question — "what is this moving thing, is the motion sensible".
+  // Which nodes move and by how much is already measured exactly by the rigidity
+  // gate, so this round annotates the record (rec.motion) and never touches
+  // confidence or status: the battery owns status, the human owns the verdict.
+  //
+  // Body (all optional): { angles:[deg], mode:'photo'|'solo', round, viewport,
+  //   rendererId, timeoutMs }. angles defaults to MOTION_ANGLES [0,30,60]; the
+  // fan plus one swept composite are drawn synchronously in the browser so the
+  // preview tick can never re-parent the pivot mid-fan.
+  //
+  // Status codes are per-CAUSE like the rest of this file, because each tells the
+  // operator to do something different:
+  //   404 no such joint                -> check the id
+  //   400 no project / no nodes        -> POST /api/project, or the joint is empty
+  //   409 renderer has no model        -> load the mesh in the viewer tab
+  //   500 the planner could not frame  -> a bug, not an operator action
+  //   502 the model failed             -> start the DSH host / check vision_model
+  //   503 nothing was available        -> open a viewer tab, or wait for a live agent
+  // A refusal leaves the on-disk record byte-identical, so this is safe to press
+  // twice — `manifestUntouched:true` in the body says so explicitly.
+  app.post('/api/joints/:id/motion', async (req, reply) => {
+    const r = await kernel.motionRefine({ ...(req.body || {}), jointId: req.params.id });
+    if (!r.ok) {
+      const code = r.code === 'NO_RECORD' ? 404
+        : (r.code === 'NO_PROJECT' || r.code === 'NO_MANIFEST' || r.code === 'NO_NODES') ? 400
+          : r.code === 'NO_MODEL' ? 409
+            : (r.code === 'NO_REGION' || r.code === 'NO_VIEWS') ? 500
+              : (r.code === 'VISION_DEGRADED' || r.code === 'MOTION_FAILED') ? 502
+                : 503;
+      return reply.code(code).send(r);
+    }
+    return r;
+  });
+
+  // Phase 3 task 19: the TIME axis. Every belief-changing write (a loop round, a
+  // verdict, an amortization, a rigidity reopen) froze the whole manifest graph as
+  // `manifest.r<N>.json`. These three read that chain back — list it, load one, and
+  // diff one against its parent. All read-only, so they are safe to poll.
+  //
+  // Branching for the time axis, graph for the justification axis: a revision is a
+  // commit of the graph, and `parent` is normally N-1 but need not be, so re-running
+  // a round from an earlier state makes a branch with no VCS and no graph framework.
+  app.get('/api/revisions', async () => kernel.revisions());
+
+  app.get('/api/revisions/:n', async (req, reply) => {
+    const r = kernel.revision(Number(req.params.n));
+    if (!r.ok) return reply.code(404).send(r);
+    return r;
+  });
+
+  // ?against=<m> diffs against a specific revision; with no query the diff is
+  // against the snapshot's own parent, which answers "what did this round change?"
+  app.get('/api/revisions/:n/diff', async (req, reply) => {
+    const q = req.query?.against;
+    const against = q != null && q !== '' ? Number(q) : null;
+    const r = kernel.revisionDiff(Number(req.params.n), against);
+    if (!r.ok) return reply.code(404).send(r);
+    return r;
+  });
 
   // The render-id -> component/control contract, so the frontend renderer registry
   // and the backend slot graph cannot drift apart.

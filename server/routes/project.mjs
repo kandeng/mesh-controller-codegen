@@ -27,6 +27,12 @@ function jointSummary(j) {
     // vision-sourced chip differently because its evidence is a frame a human can
     // open, not a sentence in a node dump.
     ...(j.origin ? { origin: j.origin } : {}),
+    // Phase 3 task 17: what a human decided, and — when the decision was inherited
+    // from a symmetry peer — whose verdict it really was. The panel renders a
+    // confirmed chip differently when `amortizedFrom` is set, because "a person
+    // looked at this joint" and "a person looked at its mirror" are different
+    // claims and only one of them is direct evidence.
+    ...(j.verdict ? { verdict: j.verdict } : {}),
   };
 }
 

@@ -3,22 +3,30 @@
 //   1. Load the mesh (.glb)
 //   2. Load an existing controller script, OR have the AI generate one to a path you choose
 //   3. The controllable joints the AI discovered
-//   4. Drive each joint's knobs and verify the live 3D behavior
+//   4. Read the evidence behind each claim and give your verdict
+//   5. Drive each joint's knobs and verify the live 3D behavior
 //
 // File picking calls the backend's NATIVE OS dialog (POST /api/fs/pick), which is
 // the only way to obtain a real absolute path — a sandboxed browser can never
 // expose one. Every path field also stays editable, so manual entry works even
 // when no dialog tool is installed (the backend then returns ok:false).
-import { ref } from 'vue';
+import { computed, ref } from 'vue';
 import { useProjectStore } from '../composables/useProjectStore.js';
 import { useKernelApi } from '../composables/useKernelApi.js';
 import { useSlotRouting } from '../composables/useSlotRouting.js';
 import JointList from './JointList.vue';
 import KnobPanel from './KnobPanel.vue';
+import ObservationPanel from './ObservationPanel.vue';
 
 const { state } = useProjectStore();
 const api = useKernelApi();
 const { selectJoint } = useSlotRouting();
+
+// How many claims are still waiting on a person. Shown in the step-4 hint because
+// a gate nobody knows is pending is a gate that gets waved through, and the count
+// is the one number that says "there is reading to do here".
+const pending = computed(() => state.joints.filter((j) => j.status === 'needs-verdict').length);
+const judged = computed(() => state.joints.filter((j) => j.status === 'confirmed' || j.status === 'rejected').length);
 
 // Step 1 — mesh
 const glbPath = ref('samples/drone_dji_inspire3.glb');
@@ -181,9 +189,24 @@ async function generate() {
 
     <hr class="rule" />
 
-    <!-- STEP 4 — verify with the knobs -->
+    <!-- STEP 4 — read the evidence, give the verdict -->
     <section class="step">
-      <header class="step-head"><span class="num">4</span><span class="title">Verify each joint's controller</span></header>
+      <header class="step-head"><span class="num">4</span><span class="title">Judge what the AI found</span></header>
+      <p class="hint">
+        Select a joint above, then read the frames behind its claim, what the model said and where it
+        admitted it was unsure. Accepting or rejecting is the only way a joint becomes
+        <code>confirmed</code> — no test and no model can do it.
+        <b v-if="pending" class="pend">{{ pending }} waiting</b>
+        <b v-if="judged" class="done">{{ judged }} judged</b>
+      </p>
+      <ObservationPanel />
+    </section>
+
+    <hr class="rule" />
+
+    <!-- STEP 5 — verify with the knobs -->
+    <section class="step">
+      <header class="step-head"><span class="num">5</span><span class="title">Verify each joint's controller</span></header>
       <p class="hint">Select each joint and watch the 3D mesh on the left. If something looks wrong, message or screenshot the chatbot to ask the AI for a fix.</p>
       <KnobPanel />
     </section>
@@ -211,6 +234,12 @@ async function generate() {
 .title { color: var(--text); font-weight: 600; font-size: 13px; }
 .title code { color: var(--value); background: var(--surface-3); padding: 0 4px; border-radius: 4px; font-size: 12px; }
 .hint { color: var(--faint); font-size: 12px; margin: 0; line-height: 1.45; }
+.hint code { color: var(--value); background: var(--surface-3); padding: 0 4px; border-radius: 4px; font-size: 11px; }
+/* The two counts read differently on purpose: one is work outstanding, the other
+   is work done, and a panel that showed them in the same colour would not tell an
+   operator whether they were finished. */
+.hint .pend { color: #b58900; font-weight: 600; }
+.hint .done { color: var(--good); font-weight: 600; }
 
 /* nested sub-options in step 2 */
 .sub { display: flex; flex-direction: column; gap: 6px; padding-left: 10px; border-left: 2px solid var(--border-2); }

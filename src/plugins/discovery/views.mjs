@@ -21,10 +21,28 @@
 // cannot drift apart. gltf.mjs is server-side only, and so is this module —
 // geometry.mjs already imports it the same way.
 import { bladeCandidates } from '../../lib/gltf.mjs';
+import { MAX_LEGEND } from './vision-prompt.mjs';
+
+// Legend-fit search for a round-2 close-up: how many times to zoom in, and by how
+// much, when the first framing predicts more parts than a readable colour legend
+// can list. Geometric rather than a solved inverse, because "how many parts fit"
+// is not a smooth function of distance once occlusion is in it.
+const LEGEND_FIT_TRIES = 4;
+const LEGEND_FIT_STEP = 0.6;
 
 // Frames are planned against this virtual viewport; the renderer is asked for
 // the same size so projected pixel areas match what the model actually sees.
 export const VIEWPORT = { w: 1024, h: 1024, fov: 45 };
+
+// Motion fans (task 18) are drawn SMALLER than survey frames on purpose: the
+// question is SEMANTIC ("what is this moving thing, is the motion sensible"), not
+// a pixel-exact measurement — the rigidity gate already measures which nodes move
+// and by how much. A smaller frame keeps a 3-pose fan plus its swept composite
+// comfortably inside one upload, and 768px is ample for a judgement.
+export const MOTION_VIEWPORT = { w: 768, h: 768, fov: 45 };
+// The default fan: rest, then two equal steps. Enough to show an arc; few enough
+// that the whole multi-image turn is a rounding error against the context window.
+export const MOTION_ANGLES = [0, 30, 60];
 
 // A node must paint at least this much to be "seen": a 2px sliver carries no
 // recognisable shape. Calibrated for a 1024px frame of a drone-scale model.
@@ -485,23 +503,463 @@ export function focusFromManifest(g, manifest, joints, { mode = 'frontier' } = {
   return want;
 }
 
-// Round-2 close-ups: tight poses aimed at a region the model said it was unsure
-// about. Same spherical grammar, but the target is the region anchor and the
-// distance is fitted to the region's own radius, not the whole model's.
-export function planCloseUps(regions, { perRegion = 2, elevations = [15, 45], margin = 1.15, viewport = VIEWPORT } = {}) {
-  const out = [];
-  (regions || []).forEach((reg, i) => {
-    const anchor = Array.isArray(reg.anchor) ? reg.anchor : [reg.anchor?.x ?? 0, reg.anchor?.y ?? 0, reg.anchor?.z ?? 0];
-    const rad = Math.max(1e-3, Number(reg.radius ?? 1));
-    const d = fitDistance(rad, viewport, margin);
-    elevations.slice(0, perRegion).forEach((el, k) => {
-      const az = (reg.azimuth ?? 0) + k * 60;
-      const spec = { kind: 'close-up', azimuth: az, elevation: el, distance: d, target: anchor };
-      out.push({
-        id: `cu${i}_${k}`, kind: 'close-up', region: reg.id || reg.target || `region${i}`,
-        spec, pose: poseFromSpec(spec, { wradius: rad }),
+// Sphere-vs-AABB distance: how far `p` is from the NEAREST POINT of the box, so
+// 0 means inside. The centre-distance test alone is wrong here — a large hull
+// panel whose centre sits outside a small region sphere still overlaps it, and
+// that panel is exactly the thing occluding the region.
+function boxDist(b, p) {
+  const dx = Math.max(Math.abs(b.c[0] - p[0]) - b.h[0], 0);
+  const dy = Math.max(Math.abs(b.c[1] - p[1]) - b.h[1], 0);
+  const dz = Math.max(Math.abs(b.c[2] - p[2]) - b.h[2], 0);
+  return Math.hypot(dx, dy, dz);
+}
+
+// Grow one box to the union of many. Used both to merge the mesh nodes that
+// share a name and to size a round-2 region around the parts it is about.
+function unionBoxes(bs) {
+  let out = null;
+  for (const b of bs) {
+    if (!b) continue;
+    if (!out) { out = { c: b.c.slice(), h: b.h.slice() }; continue; }
+    for (let k = 0; k < 3; k += 1) {
+      const lo = Math.min(out.c[k] - out.h[k], b.c[k] - b.h[k]);
+      const hi = Math.max(out.c[k] + out.h[k], b.c[k] + b.h[k]);
+      out.c[k] = (lo + hi) / 2;
+      out.h[k] = (hi - lo) / 2;
+    }
+  }
+  return out;
+}
+
+// Union the boxes of every mesh node that shares a name. Several mesh nodes map
+// to one named ancestor, and a region test against any single one of them would
+// miss the rest of the part.
+function namedBoxes(g, targets, label) {
+  const out = new Map();
+  const acc = new Map();
+  for (const n of targets) {
+    const nm = label(n);
+    const b = nodeBox(n);
+    if (!nm || !b) continue;
+    const arr = acc.get(nm);
+    if (arr) arr.push(b); else acc.set(nm, [b]);
+  }
+  for (const [nm, bs] of acc) out.set(nm, unionBoxes(bs));
+  return out;
+}
+
+// Inverse of fitDistance: the framing radius a camera at distance `d` fully
+// contains. Round 2 needs it to recover the region a previous frame was fitted
+// to, from the only thing recorded about that frame — its pose.
+export function unfitDistance(d, vp = VIEWPORT, margin = 1.0) {
+  const half = (Math.max(1, Math.min(170, vp.fov)) * Math.PI / 180) / 2;
+  return Math.max(1e-6, (Number(d) || 0) * Math.sin(half) / Math.max(1e-6, margin));
+}
+
+// Round-2 close-ups: tight poses aimed at a region a previous round said it was
+// unsure about. Same spherical grammar as the cell pass, but the aim point is the
+// region anchor and the distance is fitted to the REGION's radius, not the
+// model's.
+//
+// It takes `g` and returns a PLAN, not a bare list of poses, for one reason that
+// decides whether round 2 works at all: a colorId mask must be FOCUSED, and the
+// only source of a focus list is `sees`. An unfocused mask paints every named
+// part in the model (~345 on the sample) and its legend is unreadable, so the one
+// channel that was supposed to ground EXACTLY degrades into a guess. The earlier
+// signature `planCloseUps(regions)` dropped `g`, so nothing could compute
+// visibility and round 2 would have silently produced plain photos only.
+//
+// Two passes, mirroring planViews, because the canonical suggestView reason is
+// "X is hidden by the hull" and no opaque pose can ever answer that:
+//   1. OPAQUE close-ups, `perRegion` per region, spread over elevation AND
+//      azimuth — a part that was ambiguous from one side is usually not from
+//      another.
+//   2. GHOST close-ups, spent ONLY on the region parts pass 1 could not frame.
+//
+// Views come out in the SAME shape planViews emits ({id, mode, spec, pose,
+// marginal, covers, sees}) so selectShots, the prompt builder and grounding treat
+// a round-2 plan exactly like a round-1 one.
+export function planCloseUps(g, regions, {
+  perRegion = 2, elevations = [15, 45], azimuthOffsets = [0, 60, 150, 210],
+  margin = 1.15, viewport = VIEWPORT, maxViews = 12, minArea = MIN_AREA,
+  allowGhost = true, legendBudget = MAX_LEGEND,
+} = {}) {
+  const list = (regions || []).filter(Boolean);
+  const named = namedIndex(g);
+  const targets = renderTargets(g);
+  const label = (n) => named.get(n.i);
+  const boxes = namedBoxes(g, targets, label);
+  const maxRad = targets.reduce((m, n) => Math.max(m, Math.max(...nodeBox(n).h)), 0);
+
+  // Normalise each region once: anchor as [x,y,z], radius, and the named parts it
+  // is ABOUT (sphere-AABB, not centre distance). `targets` here is the round's
+  // denominator — "of the things we were unsure about, how many did we manage to
+  // frame" — which is the only coverage question round 2 can answer.
+  const regs = list.map((reg, i) => {
+    const anchor = Array.isArray(reg.anchor)
+      ? reg.anchor.map(Number)
+      : [Number(reg.anchor?.x ?? 0), Number(reg.anchor?.y ?? 0), Number(reg.anchor?.z ?? 0)];
+    const radius = Math.max(1e-3, Number(reg.radius ?? 1));
+    const members = [...boxes.entries()]
+      .filter(([, b]) => boxDist(b, anchor) <= radius)
+      .map(([nm]) => nm);
+    return {
+      id: reg.id || reg.target || `region${i}`,
+      anchor, radius, members,
+      // Carried through because `shoot` reads it off the NORMALISED region: a
+      // caller that asks for a specific bearing (the model said "from below and
+      // behind") would otherwise silently get azimuth 0 every time.
+      azimuth: Number.isFinite(reg.azimuth) ? Number(reg.azimuth) : 0,
+      reason: reg.reason ? String(reg.reason).slice(0, 240) : null,
+      origin: reg.origin || 'derived',
+    };
+  });
+
+  const cap = Math.max(1, maxViews | 0);
+  const views = [];
+  const seenSoFar = new Set();
+
+  // `sees` is capped for plan.json's sake, so the ORDER decides what survives.
+  // Nearest-to-the-aim-point first: a close-up whose legend drops the very parts
+  // it was bought for is worse than no legend at all.
+  const ordered = (covers, anchor) => {
+    const d = (nm) => { const b = boxes.get(nm); return b ? boxDist(b, anchor) : Infinity; };
+    return [...covers]
+      .sort((a, b) => (d(a) - d(b)) || (a < b ? -1 : a > b ? 1 : 0))
+      .slice(0, SEES_CAP);
+  };
+
+  const shoot = (reg, i, k, { ghost = false } = {}) => {
+    if (views.length >= cap) return null;
+    const memberSet = new Set(reg.members);
+
+    // One framed candidate at a given FRAMING radius. The framing radius is not
+    // the region radius: the region radius says what the uncertainty is ABOUT
+    // (membership, and therefore the coverage denominator), while the framing
+    // radius says how tight the camera is. They have to be separable or tightening
+    // the shot would silently shrink the thing we are trying to measure.
+    const frameAt = (frameRadius) => {
+      const d = fitDistance(frameRadius, viewport, margin);
+      const spec = {
+        kind: 'close-up',
+        azimuth: (reg.azimuth + (azimuthOffsets[k % Math.max(1, azimuthOffsets.length)] || 0)) % 360,
+        elevation: elevations[k % Math.max(1, elevations.length)],
+        distance: d,
+        target: reg.anchor,
+      };
+      const pose = poseFromSpec(spec, { wradius: frameRadius });
+      const cam = makeCamera(pose.eye, pose.target, viewport);
+      // A ghost is scored against the REGION's own parts with occlusion off: it is
+      // bought to show what the hull hides, so counting the hull would let one
+      // ghost be spent on something an opaque pose already frames.
+      const pool = ghost ? targets.filter((n) => memberSet.has(label(n))) : targets;
+      const covers = coverageOf(cam, pool, {
+        minArea, label, reach: reachOf(spec, g, maxRad), occlude: !ghost,
       });
+      return { spec, pose, covers, frameRadius };
+    };
+
+    // Tighten until the predicted legend fits. A mask whose legend overflows
+    // MAX_LEGEND is the failure round 2 exists to avoid: the colours that get
+    // dropped are unresolvable, and they are just as likely to be the disputed
+    // part as the ones that stayed. Geometric shrink, bounded, keeping the
+    // tightest frame if none ever fits.
+    //
+    // Ghosts are NOT tightened. A ghost is the only route to an enclosed part, so
+    // narrowing its frustum trades away exactly the coverage it was bought for —
+    // a truncated ghost legend is a lesser evil than a ghost that cannot see the
+    // part inside the hull.
+    let chosen = null;
+    const tries = ghost || !(legendBudget > 0) ? 1 : LEGEND_FIT_TRIES;
+    for (let t = 0; t < tries; t += 1) {
+      const cand = frameAt(reg.radius * LEGEND_FIT_STEP ** t);
+      if (!cand.covers.size) { if (t === 0) return null; break; }
+      if (!chosen || cand.covers.size < chosen.covers.size) chosen = cand;
+      if (cand.covers.size <= legendBudget) { chosen = cand; break; }
+    }
+    if (!chosen || !chosen.covers.size) return null;
+
+    const { spec, pose, covers } = chosen;
+    let marginal = 0;
+    for (const nm of covers) if (!seenSoFar.has(nm)) marginal += 1;
+    for (const nm of covers) seenSoFar.add(nm);
+    const view = {
+      id: `cu${i}_${k}${ghost ? 'g' : ''}`,
+      mode: ghost ? 'ghost' : 'photo',
+      kind: 'close-up',
+      region: reg.id,
+      ...(reg.reason ? { reason: reg.reason } : {}),
+      ...(ghost ? { baseId: `cu${i}_${k}` } : {}),
+      spec, pose, marginal, covers: covers.size, sees: ordered(covers, reg.anchor),
+      // Recorded because it is the difference between "we aimed at the region" and
+      // "we aimed at the region and had to zoom in twice to make it readable".
+      ...(chosen.frameRadius !== reg.radius ? { tightened: +(chosen.frameRadius / reg.radius).toFixed(3) } : {}),
+    };
+    views.push(view);
+    return view;
+  };
+
+  const n = Math.max(1, perRegion | 0);
+  regs.forEach((reg, i) => { for (let k = 0; k < n; k += 1) shoot(reg, i, k); });
+
+  // Pass 2: ghosts for whatever pass 1 could not frame. One per region at most —
+  // a region whose parts are all interior needs a single transparent frame, and
+  // spending the round-2 budget on four of them would crowd out the other regions.
+  const framed = new Set(views.flatMap((v) => v.sees));
+  if (allowGhost) {
+    regs.forEach((reg, i) => {
+      if (views.length >= cap) return;
+      if (reg.members.every((nm) => framed.has(nm))) return;
+      shoot(reg, i, 0, { ghost: true });
+    });
+  }
+
+  const want = new Set(regs.flatMap((r) => r.members));
+  const coveredAll = new Set(views.flatMap((v) => v.sees));
+  const covered = [...want].filter((nm) => coveredAll.has(nm));
+  return {
+    views,
+    regions: regs.map(({ members, ...r }) => ({ ...r, members: members.length })),
+    targets: want.size,
+    covered: covered.length,
+    coverage: want.size ? covered.length / want.size : 1,
+    // Parts we aimed at and STILL could not frame, even transparently. That is a
+    // fact about the model (fully enclosed, or below MIN_AREA at any distance the
+    // region radius allows), not a planner shortfall, so it is reported not hidden.
+    unseen: [...want].filter((nm) => !coveredAll.has(nm)),
+    interiorOnly: [...want].filter((nm) => !framed.has(nm) && coveredAll.has(nm)),
+  };
+}
+
+// ---- round 2: from a model's request back to a place to aim -------------------
+
+// A resolved region is padded so the close-up frames the part AND its immediate
+// neighbours. A lone part with no context is unrecognisable, and the neighbours
+// are what let the model say "that is the hub at the end of the front-left arm"
+// rather than "that is a cylinder".
+export const REGION_PAD = 1.6;
+// Radii are clamped to fractions of the model radius. The floor keeps one tiny
+// part from producing a frame so tight it is nothing but texture; the ceiling
+// keeps a free-text region from degenerating back into round 1's whole-model
+// view — the very frame that was already ambiguous.
+export const REGION_MIN_R = 0.03;
+export const REGION_MAX_R = 0.35;
+// Round 2 looks from a DIFFERENT bearing than the frame that was unsure. The same
+// azimuth would reproduce the same occlusion, and therefore the same ambiguity.
+export const AZIMUTH_RETRY = 90;
+// Short names match everything ("arm" inside "landing_arm_strut"), so substring
+// resolution ignores them and falls through to the grounded-parts fallback.
+const MIN_NAME_TOKEN = 3;
+
+const normText = (s) => String(s ?? '').toLowerCase().replace(/[_\-.:/\\]+/g, ' ').replace(/\s+/g, ' ').trim();
+const slug = (s) => (String(s ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 24) || 'aim');
+
+// The model reports whichever name it saw in the prompt, and we cannot ask it to
+// distinguish a part from the container holding it. So a name resolves to itself
+// when it carries geometry, and otherwise to the named parts underneath it that
+// do — both are legitimate answers to "look at X again".
+function nameResolver(g, boxes, named) {
+  const byName = new Map();
+  const kids = new Map();
+  for (const n of g.nodes) {
+    if (n.name) { const a = byName.get(n.name); if (a) a.push(n.i); else byName.set(n.name, [n.i]); }
+    if (n.parent != null && n.parent >= 0) { const a = kids.get(n.parent); if (a) a.push(n.i); else kids.set(n.parent, [n.i]); }
+  }
+  const resolve = (name) => {
+    if (!name) return [];
+    if (boxes.has(name)) return [name];
+    const roots = byName.get(name);
+    if (!roots || !roots.length) return [];
+    const out = new Set();
+    const stack = [...roots];
+    let guard = 0;
+    while (stack.length && guard < 50000) {
+      const i = stack.pop(); guard += 1;
+      const nm = named.get(i);
+      if (nm && boxes.has(nm)) out.add(nm);
+      for (const c of kids.get(i) || []) stack.push(c);
+    }
+    return [...out].sort();
+  };
+  return { resolve, names: [...new Set([...boxes.keys(), ...byName.keys()])] };
+}
+
+// Turn round 1's `suggestViews` into regions `planCloseUps` can aim at. This is
+// the `hypothesis --suggestView--> observation` edge becoming executable: the
+// model said where it was unsure, and something has to convert that sentence into
+// a camera pose.
+//
+// suggestView.target arrives in three shapes (see suggestFor in vision-propose),
+// and each needs a different lookup:
+//   model    free text            "the front-left rotor hub"
+//   derived  a NODE NAME          names[0] of the proposal it came from
+//   derived  a FRAME ID           the frame whose channels disagreed
+// Resolution is a ladder from most to least specific, and the last rung is the
+// set of parts that proposal actually grounded to — because a suggestView always
+// has an index, and the grounded parts are never a guess.
+//
+// Anything that resolves to nothing is REPORTED, not approximated. A close-up
+// aimed at a plausible-looking part is worse than no close-up: it spends the
+// round-2 budget and produces a confident answer to a question nobody asked.
+export function regionsFromSuggestViews(g, suggestViews, {
+  grounded = [], plan = null, frames = [], manifest = null,
+  maxRegions = 4, viewport = VIEWPORT, margin = 1.15,
+} = {}) {
+  const list = (suggestViews || []).filter((s) => s && typeof s === 'object');
+  const named = namedIndex(g);
+  const boxes = namedBoxes(g, renderTargets(g), (n) => named.get(n.i));
+  const { resolve, names } = nameResolver(g, boxes, named);
+  const R = modelRadius(g);
+  const clampR = (r) => Math.max(REGION_MIN_R * R, Math.min(REGION_MAX_R * R, r));
+
+  // A frame reference may be the FRAME id (`v3.colorId`) or the VIEW id (`v3`),
+  // depending on which rung produced it, so index both.
+  const viewById = new Map((plan?.views || []).map((v) => [String(v.id), v]));
+  const frameToView = new Map();
+  for (const f of frames || []) {
+    const v = viewById.get(String(f?.viewId ?? '')) || viewById.get(String(f?.id ?? ''));
+    if (!v) continue;
+    if (f.id != null) frameToView.set(String(f.id), v);
+    if (f.viewId != null) frameToView.set(String(f.viewId), v);
+  }
+  const lookup = (ref) => (ref == null || ref === '' ? null
+    : viewById.get(String(ref)) || frameToView.get(String(ref)) || null);
+  const groundedByIndex = new Map((grounded || []).filter((x) => x && x.index != null).map((x) => [x.index, x]));
+
+  const namesInText = (text) => {
+    const low = String(text ?? '').toLowerCase();
+    const hits = new Set();
+    for (const nm of names) {
+      const key = String(nm).toLowerCase();
+      if (key.length < MIN_NAME_TOKEN || !low.includes(key)) continue;
+      for (const r of resolve(nm)) hits.add(r);
+    }
+    return [...hits].sort();
+  };
+
+  // Unambiguous max only — the discipline reopenFromRigidity already uses. Two
+  // records scoring equally means the text did not pick one, and picking anyway
+  // would spend a frame on a part nobody was unsure about.
+  const manifestMatch = (text) => {
+    const low = normText(text);
+    if (!low) return null;
+    const toks = low.split(' ').filter((t) => t.length >= MIN_NAME_TOKEN);
+    const scored = [];
+    for (const rec of manifest || []) {
+      const parts = [...new Set((rec?.nodes || []).flatMap((n) => resolve(n)))];
+      if (!parts.length) continue;
+      const id = normText(rec?.id);
+      const lab = normText(rec?.label);
+      const phrase = Math.max(
+        id && low.includes(id) ? (low === id ? 3 : 2) : 0,
+        lab && low.includes(lab) ? (low === lab ? 3 : 2) : 0,
+      );
+      const words = new Set([...id.split(' '), ...lab.split(' ')].filter(Boolean));
+      const shared = toks.filter((t) => words.has(t)).length;
+      scored.push({ rec, parts, score: phrase * 10 + shared });
+    }
+    const ranked = scored.filter((s) => s.score > 0).sort((a, b) => b.score - a.score);
+    if (!ranked.length || (ranked[1] && ranked[1].score === ranked[0].score)) return null;
+    return ranked[0];
+  };
+
+  const resolved = [];
+  const unresolved = [];
+  // Report the entries that were not even objects. Silently dropping them would
+  // hide a producer bug behind a round 2 that just did less than it was told.
+  (suggestViews || []).forEach((s, i) => {
+    if (s && typeof s === 'object') return;
+    unresolved.push({ index: i, target: null, frameId: null, reason: null, origin: 'model', why: 'suggestView was not an object' });
+  });
+  list.forEach((sv, i) => {
+    const target = sv.target == null ? '' : String(sv.target);
+    const gr = sv.index != null ? groundedByIndex.get(sv.index) : null;
+    const frameView = lookup(target) || lookup(sv.frameId);
+    const aim = frameView?.spec?.target || frameView?.pose?.target || null;
+    // Only offset a bearing we actually know. A region named from free text has
+    // no failed frame behind it, so azimuth 0 plus the planner's own spread is
+    // the honest answer.
+    const azimuth = Number.isFinite(frameView?.spec?.azimuth)
+      ? (frameView.spec.azimuth + AZIMUTH_RETRY) % 360 : 0;
+
+    let parts = resolve(target);
+    let how = parts.length ? 'name' : null;
+    if (!parts.length) {
+      const inText = namesInText(target);
+      if (inText.length) { parts = inText; how = 'name-in-text'; }
+    }
+    if (!parts.length) {
+      const m = manifestMatch(target);
+      if (m) { parts = m.parts; how = `manifest:${m.rec.id}`; }
+    }
+    if (!parts.length && Array.isArray(gr?.names)) {
+      const gn = [...new Set(gr.names.flatMap((n) => resolve(n)))].sort();
+      if (gn.length) { parts = gn; how = 'grounded-parts'; }
+    }
+    if (!parts.length && !aim) {
+      unresolved.push({
+        index: sv.index ?? i, target, frameId: sv.frameId || null,
+        reason: sv.reason || null, origin: sv.origin || 'model',
+        why: 'target matched no part, no joint and no frame we shot',
+      });
+      return;
+    }
+    // Nothing named it, but we know the frame that was unsure — so aim there
+    // again from another bearing. Recorded as its own rung because a region with
+    // no names gets no mask (a colorId legend is built from names), only photos
+    // and ghosts.
+    if (!parts.length) how = 'frame-aim';
+
+    const box = parts.length ? unionBoxes(parts.map((nm) => boxes.get(nm))) : null;
+    const anchor = box ? box.c.slice() : aim.map(Number);
+    if (!anchor.every(Number.isFinite)) {
+      unresolved.push({
+        index: sv.index ?? i, target, frameId: sv.frameId || null,
+        reason: sv.reason || null, origin: sv.origin || 'model',
+        why: 'resolved to a pose with no finite aim point',
+      });
+      return;
+    }
+    // With parts, size the region to them. Without, recover the radius the frame
+    // was fitted to — the pose is the only thing recorded about it — which for a
+    // cell frame is exactly the cell, and for a whole-model ring clamps to the
+    // ceiling instead of re-shooting round 1.
+    const radius = clampR(box
+      ? Math.hypot(...box.h) * REGION_PAD
+      : unfitDistance(frameView?.spec?.distance ?? 2.5 * R, viewport, margin));
+
+    resolved.push({
+      id: `sv${i}_${slug(parts[0] || target || sv.frameId)}`,
+      index: sv.index ?? i, target, how, names: parts,
+      anchor, radius, azimuth,
+      reason: sv.reason || null, origin: sv.origin || 'model',
+      frameId: sv.frameId || null,
     });
   });
-  return out;
+
+  // The model's own request outranks one we synthesized, and a region we could
+  // NAME outranks one we could only locate — naming it is what makes the close-up
+  // mask focusable. Sort is stable, so equal ranks keep suggestion order.
+  const rank = (r) => ((r.origin === 'model' ? 0 : 1) * 2) + (r.names.length ? 0 : 1);
+  // Rank BEFORE dedup. Two suggestViews about the same parts are one region —
+  // buying both would spend the round-2 budget on the same close-up from two
+  // nearby bearings — and the survivor should be the model's explicit request,
+  // not whichever happened to come first in the list.
+  const ordered = resolved.slice().sort((a, b) => rank(a) - rank(b));
+  const byKey = new Map();
+  const skipped = [];
+  for (const r of ordered) {
+    const key = r.names.length
+      ? r.names.join('|')
+      : `aim:${r.anchor.map((v) => v.toFixed(1)).join(',')}`;
+    const prev = byKey.get(key);
+    if (prev) { skipped.push({ ...r, why: `same ${prev.names.length ? 'parts' : 'aim point'} as ${prev.id}` }); continue; }
+    byKey.set(key, r);
+  }
+  const cap = Math.max(1, maxRegions | 0);
+  const deduped = [...byKey.values()];
+  const regions = deduped.slice(0, cap);
+  for (const r of deduped.slice(cap)) skipped.push({ ...r, why: `over the ${cap}-region cap` });
+
+  return { regions, resolved: regions, unresolved, skipped };
 }

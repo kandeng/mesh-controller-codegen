@@ -169,6 +169,59 @@ export function loadColorMap(runDir, round, id) {
   return readJson(resolve(roundDir(runDir, round), entry.colorMap));
 }
 
+// ---- motion fans (task 18) --------------------------------------------------
+
+// The storage ids of a motion fan's images. They live in the SAME round directory
+// and the SAME frames.json index as vision frames, so every existing read path —
+// the frame URL mapper, the evidence browser, MAX_FRAMES_PER_ROUND — already works
+// on them. The `mot_` prefix and the pose index keep a fan from colliding with a
+// plan view id, and route the composite to its own key.
+//
+// Both go through frameKey(), so a fan drawn in `solo` and the same fan in `photo`
+// are two sets of evidence rather than one silently overwriting the other.
+export const motionFrameId = (jointId, index, mode = 'photo') => frameKey(`mot_${safeId(jointId)}_p${Number(index) || 0}`, mode);
+export const motionSweepId = (jointId, mode = 'photo') => frameKey(`mot_${safeId(jointId)}_sweep`, mode);
+
+// The fan's own record: which joint was driven, through which angles, in which
+// mode, what the model made of it, and the frame ids behind each pose. The BYTES
+// are not here — they are the PNGs saveFrame wrote, referenced by id — so this file
+// stays small enough to hand back in an API response.
+//
+// Persisted for the same reason a vision round is: a motion claim must be
+// falsifiable later. "We drove rotor_fl through 0/30/60 and the model said the
+// spin looked sensible" has a file answer, with the exact frames, or it is a
+// memory.
+export function saveMotion(runDir, round, {
+  jointId = null, angles = [], mode = 'photo', view = null, focusNodes = null,
+  frames = [], composite = null, prompt = null, reply = null,
+  assessment = null, model = null, ms = null, warnings = null,
+} = {}) {
+  if (!runDir) return null;
+  const dir = ensure(roundDir(runDir, round));
+  const file = resolve(dir, 'motion.json');
+  writeJson(file, {
+    ts: new Date().toISOString(),
+    round: Number(round) || 0,
+    jointId,
+    angles,
+    mode,
+    view,
+    focusNodes,
+    // Frame references (ids), not bytes: the pixels are the PNGs saveFrame wrote.
+    frames,
+    composite,
+    prompt,
+    reply,
+    assessment,
+    model,
+    ms,
+    warnings,
+  });
+  return file;
+}
+
+export function loadMotion(runDir, round) { return readJson(resolve(roundDir(runDir, round), 'motion.json')); }
+
 // ---- model exchange ---------------------------------------------------------
 
 // The prompt/reply pair, verbatim. Kept even when validation rejects every
@@ -237,6 +290,7 @@ export function listRounds(runDir) {
         hasPlan: existsSync(resolve(dir, 'plan.json')),
         hasReply: existsSync(resolve(dir, 'reply.json')),
         hasProposals: existsSync(resolve(dir, 'proposals.json')),
+        hasMotion: existsSync(resolve(dir, 'motion.json')),
         modes: [...new Set(frames.map((f) => f.mode))],
       };
     });
@@ -254,5 +308,6 @@ export function loadRound(runDir, round) {
     frames: readIndex(dir),
     reply: loadReply(runDir, round),
     proposals: loadProposals(runDir, round),
+    motion: loadMotion(runDir, round),
   };
 }

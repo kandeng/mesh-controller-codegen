@@ -12,8 +12,21 @@ const api = useKernelApi();
 
 const TYPE_ICON = { rotor: '✈', gimbal: '🎥', hinge: '🔩' };
 
-// Phase-1 hypothesis verdict chip: green ✓ when the deterministic battery
-// auto-accepted the joint, amber ! when a human verdict is needed.
+// Hypothesis verdict chip: green ✓ when the deterministic battery auto-accepted
+// the joint or a HUMAN confirmed it, amber ! when a human verdict is needed, red
+// ✗ when a human rejected it. A confirmed joint whose verdict was inherited from
+// a symmetry peer is drawn in blue instead of green, because "a person looked at
+// this joint" and "a person looked at its mirror" are different claims and only
+// one of them is direct evidence.
+const chipOf = (j) => {
+  const d = j.verdict?.decision;
+  if (j.status === 'rejected') return { g: '✗', c: 'bad' };
+  if (j.status === 'confirmed') return j.verdict?.amortizedFrom ? { g: '✓', c: 'peer' } : { g: '✓', c: 'ok' };
+  if (j.status === 'auto-accepted') return { g: '✓', c: 'ok' };
+  if (d === 'edit') return { g: '✎', c: 'edit' };
+  return { g: '!', c: 'warn' };
+};
+
 const chipTip = (j) => {
   const ev = (j.evidence || []).join(', ') || 'no evidence';
   const ts = (j.tests || []).map((t) => `${t.pass ? '✓' : '✗'} ${t.name}${t.detail ? ` — ${t.detail}` : ''}`).join('\n');
@@ -24,7 +37,13 @@ const chipTip = (j) => {
   const from = j.origin ? `\norigin: ${j.origin}` : '';
   const said = j.reasoning ? `\nmodel: ${j.reasoning}` : '';
   const unsure = (j.uncertainties || []).length ? `\nunsure: ${j.uncertainties.join('; ')}` : '';
-  return `evidence: ${ev}\nconfidence: ${j.confidence ?? '—'}${from}${said}${unsure}${ts ? `\n${ts}` : ''}`;
+  // Phase 3 task 17: who decided, and whether they decided about THIS joint. An
+  // inherited verdict that did not say so would be indistinguishable from a
+  // direct one, and the whole point of the human gate is that the difference
+  // matters.
+  const v = j.verdict;
+  const judged = v ? `\nverdict: ${v.decision} by ${v.actor}${v.amortizedFrom ? ` (inherited from ${v.amortizedFrom})` : ''}${v.note ? ` — ${v.note}` : ''}` : '';
+  return `evidence: ${ev}\nconfidence: ${j.confidence ?? '—'}${from}${said}${unsure}${judged}${ts ? `\n${ts}` : ''}`;
 };
 
 // Phase-2: ask the AI for one batch of proposals over the needs-verdict
@@ -141,8 +160,7 @@ async function visionRefine() {
         <span class="icon">{{ TYPE_ICON[j.type] || '•' }}</span>
         <span class="label">{{ j.label }}</span>
         <span class="meta">{{ j.type }} · {{ j.nodeCount }}</span>
-        <span v-if="j.status === 'auto-accepted'" class="chip ok" :title="chipTip(j)">✓</span>
-        <span v-else-if="j.status === 'needs-verdict'" class="chip warn" :title="chipTip(j)">!</span>
+        <span class="chip" :class="chipOf(j).c" :title="chipTip(j)">{{ chipOf(j).g }}</span>
       </li>
     </ul>
     <div v-if="!state.joints.length" class="empty">No joints discovered yet.</div>
@@ -166,6 +184,12 @@ li.active { border-color: var(--accent-2); background: var(--item-active); }
 .chip { font-size: 10px; font-weight: 700; border-radius: 8px; padding: 0 5px; line-height: 15px; border: 1px solid; }
 .chip.ok { color: var(--good); border-color: var(--good); }
 .chip.warn { color: #b58900; border-color: #b58900; }
+.chip.bad { color: var(--bad); border-color: var(--bad); }
+/* A confirmed joint whose verdict travelled from a symmetry peer. Blue rather
+   than green so the list can be scanned for the claims a person has NOT looked
+   at directly — which is the honest reading of "confirmed" here. */
+.chip.peer { color: #7aa5c9; border-color: #3d5a73; }
+.chip.edit { color: #b58900; border-color: #b58900; border-style: dashed; }
 .refine {
   margin-left: 8px; font-size: 10px; font-family: inherit; cursor: pointer;
   color: var(--accent-2, #6aa); background: none; border: 1px solid var(--border-accent, #456);

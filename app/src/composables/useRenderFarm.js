@@ -115,6 +115,68 @@ async function onRenderRequest(msg) {
   }
 }
 
+// One MOTION FAN (task 18): draw the joint through its angles plus a swept
+// composite, then upload the whole fan in ONE body. Same fail-fast discipline as
+// onRenderRequest — every refusal answers with a `render-ack` so the waiting
+// captureMotion fails immediately instead of burning its timeout. The requestId
+// namespaces the ack, so one nack handler serves both single frames and fans.
+async function onMotionRequest(msg) {
+  const nack = (error) => {
+    state.failed += 1;
+    state.lastError = error;
+    send({ kind: 'render-ack', requestId: msg.requestId, ok: false, error });
+  };
+
+  state.inflight += 1;
+  let fan = null;
+  try {
+    fan = useViewerCapture().captureMotion(msg.joint, {
+      view: msg.view,
+      angles: msg.angles,
+      mode: msg.mode || 'photo',
+      focusNodes: msg.focusNodes,
+      viewport: msg.viewport,
+    });
+  } catch (e) {
+    nack(`motion render threw: ${e.message}`);
+    return;
+  } finally {
+    state.inflight -= 1;
+  }
+
+  if (!fan?.frames?.length) { nack('renderer produced no motion fan (no model, no pivot for that joint, or the pose has no eye/target)'); return; }
+
+  try {
+    const res = await fetch(msg.motionUrl || '/api/observe/motion', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        requestId: msg.requestId,
+        round: msg.round ?? 0,
+        jointId: msg.joint?.id || null,
+        angles: fan.angles,
+        mode: msg.mode || fan.mode || 'photo',
+        view: msg.view ?? null,
+        focusNodes: msg.focusNodes ?? null,
+        frames: fan.frames.map((f) => ({
+          index: f.index, angle: f.angle, tag: f.tag,
+          dataUrl: f.dataUrl, width: f.width, height: f.height,
+        })),
+        composite: fan.composite ? { dataUrl: fan.composite.dataUrl, width: fan.composite.width, height: fan.composite.height, kind: fan.composite.kind } : null,
+      }),
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      if (res.status === 409) { state.rendered += 1; state.lastError = 'motion fan stored after its capture timed out'; return; }
+      throw new Error(`${res.status} ${text.slice(0, 160)}`);
+    }
+    state.rendered += 1;
+    state.lastError = null;
+  } catch (e) {
+    nack(`motion upload failed: ${e.message}`);
+  }
+}
+
 function connect() {
   if (ws) return ws;
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -134,6 +196,7 @@ function connect() {
     let msg; try { msg = JSON.parse(m.data); } catch { return; }
     if (msg.kind === 'renderer-welcome') { state.rendererId = msg.rendererId ?? null; return; }
     if (msg.kind === 'render-request') { onRenderRequest(msg); return; }
+    if (msg.kind === 'motion-request') { onMotionRequest(msg); return; }
     // `render-cancel` needs no action here: a capture is one synchronous draw,
     // so by the time a cancel arrives the frame is already uploaded or failed.
   };
