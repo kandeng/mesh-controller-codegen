@@ -69,6 +69,37 @@ export async function parseGlb(path) {
     return null;
   }
 
+  // Local AABB of the first mesh in the subtree: the UNION over primitives of the
+  // accessor min/max. Kept strictly separate from `ext` above (which is the
+  // per-axis max of per-primitive SPANS, the input to the phase-1 blade
+  // heuristic) so adding world bboxes cannot perturb discovery results.
+  //
+  // Why this matters: `ext` alone cannot place a bbox. CAD-style exports bake
+  // absolute vertex coordinates into the accessor and leave the node at the
+  // origin, so centring a bbox on the node's world translation puts it in empty
+  // space — up to tens of units away from the geometry it describes.
+  function subtreeBox(i) {
+    const stack = [i];
+    while (stack.length) {
+      const n = nodes[stack.pop()];
+      if (n.mesh != null) {
+        let mn = null; let mx = null;
+        for (const p of (meshes[n.mesh] || {}).primitives || []) {
+          const a = accs[(p.attributes || {}).POSITION];
+          if (!a || !a.min || !a.max) continue;
+          if (!mn) { mn = a.min.slice(0, 3); mx = a.max.slice(0, 3); continue; }
+          for (let k = 0; k < 3; k += 1) {
+            if (a.min[k] < mn[k]) mn[k] = a.min[k];
+            if (a.max[k] > mx[k]) mx[k] = a.max[k];
+          }
+        }
+        if (mn) return { min: mn, max: mx };
+      }
+      stack.push(...(n.children || []));
+    }
+    return null;
+  }
+
   const info = nodes.map((n, i) => {
     // glTF nodes carry EITHER trs OR a 4x4 matrix (column-major). Sketchfab
     // exports frequently use matrix only — ignoring it collapses every world
@@ -95,6 +126,7 @@ export async function parseGlb(path) {
       lm: Array.isArray(n.matrix) && n.matrix.length === 16 ? n.matrix : null, // matrix-form local transform
       mesh: n.mesh != null,
       ext: xyExtent(i),
+      box: subtreeBox(i),
     };
   });
 
@@ -137,6 +169,31 @@ export async function parseGlb(path) {
     wm[i] = mul4(p >= 0 ? worldMat(p) : IDENT, localMat(nodes[i]));
     return wm[i];
   }
+  // World AABB of a local box: push the 8 corners through the full world matrix
+  // and re-bound. Column-major, so element (row r, col c) is m[c*4 + r].
+  // Conservative under rotation (an OBB's AABB is never smaller than the OBB),
+  // which is exactly what a visibility planner wants: it may over-claim a node
+  // is on screen, it will never claim an off-screen node is visible.
+  function worldBox(m, b) {
+    let x0 = Infinity; let y0 = Infinity; let z0 = Infinity;
+    let x1 = -Infinity; let y1 = -Infinity; let z1 = -Infinity;
+    for (let k = 0; k < 8; k += 1) {
+      const x = k & 1 ? b.max[0] : b.min[0];
+      const y = k & 2 ? b.max[1] : b.min[1];
+      const z = k & 4 ? b.max[2] : b.min[2];
+      const wx = m[0] * x + m[4] * y + m[8] * z + m[12];
+      const wy = m[1] * x + m[5] * y + m[9] * z + m[13];
+      const wz = m[2] * x + m[6] * y + m[10] * z + m[14];
+      if (wx < x0) x0 = wx; if (wx > x1) x1 = wx;
+      if (wy < y0) y0 = wy; if (wy > y1) y1 = wy;
+      if (wz < z0) z0 = wz; if (wz > z1) z1 = wz;
+    }
+    return {
+      min: [x0, y0, z0], max: [x1, y1, z1],
+      c: [(x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2],
+      h: [(x1 - x0) / 2, (y1 - y0) / 2, (z1 - z0) / 2],
+    };
+  }
   info.forEach((_, i) => worldMat(i));
   info.forEach((n, i) => {
     const m = wm[i];
@@ -144,6 +201,7 @@ export async function parseGlb(path) {
     n.wp = [m[12], m[13], m[14]];
     n.ws = [Math.hypot(m[0], m[1], m[2]), Math.hypot(m[4], m[5], m[6]), Math.hypot(m[8], m[9], m[10])];
     n.wext = n.ext ? { ex: n.ext.ex * n.ws[0], ey: n.ext.ey * n.ws[1], ez: n.ext.ez * n.ws[2] } : null;
+    n.wb = n.box ? worldBox(m, n.box) : null; // true placed world bbox
   });
 
   const extOf = (x) => Math.max(x.ex, x.ey);
@@ -154,6 +212,28 @@ export async function parseGlb(path) {
   const cy = info.reduce((a, n) => a + n.wp[1], 0) / info.length;
   const radius = Math.max(1e-9, ...info.map((n) => Math.hypot(n.wp[0] - cx, n.wp[1] - cy)));
   info.forEach((n) => { n.r = Math.hypot(n.wp[0] - cx, n.wp[1] - cy); });
+
+  // World bbox of the whole model, unioned over PLACED mesh boxes, plus its
+  // circumradius. `radius` above measures the spread of node ORIGINS, which is a
+  // fine discovery proxy but a poor framing proxy — a model whose geometry is
+  // baked into vertices can have every origin at 0. Camera framing uses this.
+  let bx0 = Infinity; let by0 = Infinity; let bz0 = Infinity;
+  let bx1 = -Infinity; let by1 = -Infinity; let bz1 = -Infinity;
+  for (const n of info) {
+    if (!n.wb) continue;
+    if (n.wb.min[0] < bx0) bx0 = n.wb.min[0];
+    if (n.wb.min[1] < by0) by0 = n.wb.min[1];
+    if (n.wb.min[2] < bz0) bz0 = n.wb.min[2];
+    if (n.wb.max[0] > bx1) bx1 = n.wb.max[0];
+    if (n.wb.max[1] > by1) by1 = n.wb.max[1];
+    if (n.wb.max[2] > bz1) bz1 = n.wb.max[2];
+  }
+  const hasBounds = Number.isFinite(bx0) && Number.isFinite(bx1);
+  const bounds = hasBounds ? { min: [bx0, by0, bz0], max: [bx1, by1, bz1] } : null;
+  const bcenter = hasBounds ? [(bx0 + bx1) / 2, (by0 + by1) / 2, (bz0 + bz1) / 2] : [cx, cy, 0];
+  const wradius = hasBounds
+    ? Math.max(1e-9, 0.5 * Math.hypot(bx1 - bx0, by1 - by0, bz1 - bz0))
+    : radius;
   return {
     nodes: info,
     names: new Set(info.map((x) => x.name)),
@@ -161,6 +241,9 @@ export async function parseGlb(path) {
     maxWExt,
     radius,
     center: [cx, cy],
+    bounds,
+    bcenter,
+    wradius,
     count: nodes.length,
     animations: (g.animations || []).length,
     parser,

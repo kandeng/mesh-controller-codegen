@@ -1,12 +1,14 @@
-// App bootstrap — mount Vue, connect the kernel event stream, and hydrate any
-// in-progress project from the backend so a page reload resumes where you were.
-// The agent transcript is restored separately by ChatPanel (session store).
+// App bootstrap — mount Vue, connect the kernel event stream, volunteer this tab
+// as a renderer, and hydrate any in-progress project from the backend so a page
+// reload resumes where you were. The agent transcript is restored separately by
+// ChatPanel (session store).
 import { createApp } from 'vue';
 import App from './App.vue';
 import './style.css';
 import { useProjectStore } from './composables/useProjectStore.js';
 import { useKernelApi } from './composables/useKernelApi.js';
 import { useTheme } from './composables/useTheme.js';
+import { useRenderFarm } from './composables/useRenderFarm.js';
 
 // Apply the persisted theme (localStorage) before mount so the first paint is
 // already correct — no dark->light flash.
@@ -19,6 +21,11 @@ const api = useKernelApi();
 
 // Live kernel bus events (auto-reconnects if the backend isn't up yet).
 connectEvents();
+
+// Phase 3: this tab is a render node. The server has no WebGL context, so the
+// poses the NBV planner chooses are drawn here and posted back. Separate socket,
+// separate lifecycle — see composables/useRenderFarm.js.
+useRenderFarm().connect();
 
 // Resumability: if a mesh was already discovered this server boot, restore the
 // joints + viewer so the UI reflects server truth on load.

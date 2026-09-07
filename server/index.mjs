@@ -12,10 +12,12 @@ import fastifyCors from '@fastify/cors';
 
 import { createKernelHost } from './kernel-host.mjs';
 import { registerEventsSocket } from './events-socket.mjs';
+import { createRenderFarm } from './render-farm.mjs';
 import { projectRoutes } from './routes/project.mjs';
 import { jointRoutes } from './routes/joints.mjs';
 import { agentRoutes } from './routes/agent.mjs';
 import { fsRoutes } from './routes/fs.mjs';
+import { observeRoutes } from './routes/observe.mjs';
 import { createDshAgent } from './dsh-agent.mjs';
 
 export async function startServer({ configPath = null, port = 0, verbose = false } = {}) {
@@ -48,15 +50,34 @@ export async function startServer({ configPath = null, port = 0, verbose = false
 
   const agent = createDshAgent(kernel);
   kernel.attachAgent(agent); // kernel drives L2 proposal rounds through the same supervisor
-  const disposeEvents = registerEventsSocket(app, kernel);
+
+  // Browser render farm: the server has no WebGL context by design, so poses are
+  // drawn by whichever connected tab has the model loaded. Created BEFORE the
+  // events socket because that socket is the farm's command channel.
+  const farm = createRenderFarm({
+    onEvent: (e) => kernel.diagnostics?.note?.(`render-farm ${e.type}`, e),
+  });
+  app.decorate('renderFarm', farm);
+  // The kernel drives vision rounds through the farm directly (plan -> capture ->
+  // propose is one atomic operation), so it needs the same handle the routes have.
+  kernel.attachFarm(farm);
+
+  const disposeEvents = registerEventsSocket(app, kernel, farm);
   projectRoutes(app, kernel);
   jointRoutes(app, kernel);
   fsRoutes(app, kernel);
+  observeRoutes(app, kernel, farm);
   await agentRoutes(app, kernel, agent);
 
   // Resumability + health.
   app.get('/api/session/resume', async () => ({ ok: true, session: kernel.sessionStore.get() }));
-  app.get('/api/health', async () => ({ ok: true, plugins: kernel.pluginSummary, runDir: kernel.runDir, agent: agent.status() }));
+  app.get('/api/health', async () => ({
+    ok: true,
+    plugins: kernel.pluginSummary,
+    runDir: kernel.runDir,
+    agent: agent.status(),
+    renderFarm: farm.status(),
+  }));
 
   const finalPort = port > 0 ? port : kernel.config.viewerPort;
   await app.listen({ host: '127.0.0.1', port: finalPort });
@@ -72,7 +93,7 @@ export async function startServer({ configPath = null, port = 0, verbose = false
   process.once('SIGINT', () => close('SIGINT').finally(() => process.exit(130)));
   process.once('SIGTERM', () => close('SIGTERM').finally(() => process.exit(143)));
 
-  return { app, kernel, agent, port: finalPort, address, close };
+  return { app, kernel, agent, farm, port: finalPort, address, close };
 }
 
 // Direct run: node server/index.mjs [--port n] [--config f] [--verbose]

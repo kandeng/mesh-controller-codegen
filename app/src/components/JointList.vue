@@ -1,7 +1,7 @@
 <script setup>
 // JointList — the discovered maximal-scope joint units. Selecting one sets it
 // active and pulls its slot graph (which knobs/overlays to render).
-import { computed, ref } from 'vue';
+import { computed, onMounted, ref } from 'vue';
 import { useProjectStore } from '../composables/useProjectStore.js';
 import { useSlotRouting } from '../composables/useSlotRouting.js';
 import { useKernelApi } from '../composables/useKernelApi.js';
@@ -17,7 +17,14 @@ const TYPE_ICON = { rotor: '✈', gimbal: '🎥', hinge: '🔩' };
 const chipTip = (j) => {
   const ev = (j.evidence || []).join(', ') || 'no evidence';
   const ts = (j.tests || []).map((t) => `${t.pass ? '✓' : '✗'} ${t.name}${t.detail ? ` — ${t.detail}` : ''}`).join('\n');
-  return `evidence: ${ev}\nconfidence: ${j.confidence ?? '—'}${ts ? `\n${ts}` : ''}`;
+  // Phase 3: what the model SAID and where it told us it was UNSURE. A
+  // confidence number cannot be argued with; "blade count unclear" can — which
+  // is the entire point of putting it on the chip a human is about to judge.
+  // Only vision-sourced records carry these, so they are appended conditionally.
+  const from = j.origin ? `\norigin: ${j.origin}` : '';
+  const said = j.reasoning ? `\nmodel: ${j.reasoning}` : '';
+  const unsure = (j.uncertainties || []).length ? `\nunsure: ${j.uncertainties.join('; ')}` : '';
+  return `evidence: ${ev}\nconfidence: ${j.confidence ?? '—'}${from}${said}${unsure}${ts ? `\n${ts}` : ''}`;
 };
 
 // Phase-2: ask the AI for one batch of proposals over the needs-verdict
@@ -44,6 +51,71 @@ async function refine() {
     refining.value = false;
   }
 }
+
+// Phase 3: ask a multimodal model to LOOK at the mesh. One bounded round — the
+// server plans poses, a browser tab draws them, the model reads the frames, and
+// the same deterministic battery disposes whatever it proposes. Verdicts stay
+// human (Task 17).
+//
+// Unlike AI refine this is NOT gated on needs-verdict: the question it answers is
+// "what did we miss entirely", which is most valuable when discovery is already
+// confident it has found everything.
+const visionBusy = ref(false);
+const visionMsg = ref('');
+const farmReady = ref(false);
+// Whether the last message is a REFUSAL. Kept separate from `farmReady` on
+// purpose: keying the amber styling off the farm would paint a successful round's
+// result as a warning on any machine that has since closed its viewer tab.
+const visionBad = ref(false);
+
+// Cheap liveness probe. The button is offered either way, but its tooltip says
+// up front whether a viewer tab is attached — a round that refuses after the
+// user waits for a plan is a worse experience than one that warns on hover.
+async function refreshFarm() {
+  try {
+    const f = await api.observeFarm();
+    farmReady.value = f?.available === true;
+  } catch {
+    farmReady.value = false;
+  }
+}
+onMounted(refreshFarm);
+
+const visionTitle = computed(() => (farmReady.value
+  ? 'Look at the mesh: plan camera poses, render them in this tab, and let a vision model propose joints'
+  : 'Needs a viewer tab with the mesh loaded (and a live multimodal model) — the round will explain what is missing'));
+
+async function visionRefine() {
+  if (visionBusy.value) return;
+  visionBusy.value = true;
+  visionMsg.value = '';
+  visionBad.value = false;
+  try {
+    const { status, body } = await api.visionRefine();
+    if (!body?.ok) {
+      // `unmet` names EVERY missing precondition at once, so the user fixes the
+      // whole list in one pass rather than discovering the next blocker on the
+      // next press. That is the only reason the endpoint returns a list.
+      const why = (body?.unmet || []).map((u) => u.error).filter(Boolean);
+      visionMsg.value = why.length ? why.join(' · ') : (body?.error || `refused (${status})`);
+      visionBad.value = true;
+      return;
+    }
+    if (body.added) {
+      const j = await api.joints();
+      if (j.ok) state.joints = j.joints;
+    }
+    visionMsg.value = body.added
+      ? `+${body.added} from ${body.frames} frame(s), round ${body.round}`
+      : (body.reason || `${body.frames ?? 0} frame(s) read, nothing proposed`);
+  } catch (e) {
+    visionMsg.value = e.message;
+    visionBad.value = true;
+  } finally {
+    visionBusy.value = false;
+    await refreshFarm();
+  }
+}
 </script>
 
 <template>
@@ -53,7 +125,11 @@ async function refine() {
       <button v-if="needsVerdict" class="refine" :disabled="refining" title="Ask the AI for one batch of joint proposals over the uncertain units" @click="refine">
         {{ refining ? '…' : '✦ AI refine' }}
       </button>
+      <button v-if="state.joints.length" class="refine vision" :disabled="visionBusy" :title="visionTitle" @click="visionRefine">
+        {{ visionBusy ? '…' : '◉ Vision refine' }}
+      </button>
       <span v-if="refineMsg" class="refinemsg">{{ refineMsg }}</span>
+      <span v-if="visionMsg" class="refinemsg" :class="{ bad: visionBad }">{{ visionMsg }}</span>
     </div>
     <ul>
       <li
@@ -96,6 +172,10 @@ li.active { border-color: var(--accent-2); background: var(--item-active); }
   border-radius: 8px; padding: 1px 7px;
 }
 .refine:disabled { opacity: 0.5; cursor: default; }
+/* The vision button is a different KIND of ask — it spends a render round trip
+   and a model turn, not just a prompt — so it reads differently at a glance. */
+.refine.vision { color: #7aa5c9; border-color: #3d5a73; }
 .refinemsg { margin-left: 6px; font-size: 10px; color: var(--faint); }
+.refinemsg.bad { color: #b58900; }
 .empty { color: var(--faint); font-style: italic; padding: 6px 2px; }
 </style>

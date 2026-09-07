@@ -66,6 +66,34 @@ export function jointRoutes(app, kernel) {
     return r;
   });
 
+  // Phase 3: trigger ONE vision round — the kernel plans poses, a connected
+  // browser tab draws them, and a multimodal model reads the frames.
+  //
+  // The body is the round's own tuning surface (all optional): { round, mode,
+  // focus, maxViews, minCoverage, allowGhost, ghostViews, maxFrames, maskPairs,
+  // ghostFrames, orientation, rendererId, timeoutMs, viewport }.
+  //
+  // Status codes are per-CAUSE, mirroring /api/observe/*, because each one tells
+  // the operator to do something different:
+  //   400 no project loaded      -> POST /api/project
+  //   409 renderer has no model  -> load the mesh in the viewer tab
+  //   500 the planner threw      -> a bug, not an operator action
+  //   502 the model failed       -> start the DSH host / check the vision_model
+  //   503 nothing was available  -> open a viewer tab, or wait for a live agent
+  // A refusal never touches the manifest, so the button is safe to press twice.
+  app.post('/api/manifest/vision-refine', async (req, reply) => {
+    const r = await kernel.visionRefine(req.body || {});
+    if (!r.ok) {
+      const code = r.code === 'NO_PROJECT' ? 400
+        : r.code === 'NO_MODEL' ? 409
+          : r.code === 'PLAN_FAILED' ? 500
+            : (r.code === 'VISION_DEGRADED' || r.code === 'VISION_FAILED') ? 502
+              : 503;
+      return reply.code(code).send(r);
+    }
+    return r;
+  });
+
   app.get('/api/joints', async () => ({
     ok: true,
     joints: (kernel.current.joints || []).map(jointSummary),

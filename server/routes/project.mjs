@@ -17,6 +17,16 @@ function jointSummary(j) {
     anchor: j.anchor,
     axis: j.axis,
     commands: (j.commands || []).map((c) => ({ name: c.name, kind: c.kind, min: c.min, max: c.max, step: c.step, unit: c.unit, default: c.default })),
+    // Phase 3: what the vision model SAID and where it was UNSURE. These are the
+    // two things a human gate actually reads — a confidence number alone cannot
+    // be argued with, but "blade count unclear" can. Carried only when present so
+    // phase-1/2 joints do not grow three empty fields each.
+    ...(j.reasoning ? { reasoning: j.reasoning } : {}),
+    ...(j.uncertainties?.length ? { uncertainties: j.uncertainties } : {}),
+    // Which producer made the claim ('L2-ai', 'L2-vision', ...). The UI labels a
+    // vision-sourced chip differently because its evidence is a frame a human can
+    // open, not a sentence in a node dump.
+    ...(j.origin ? { origin: j.origin } : {}),
   };
 }
 

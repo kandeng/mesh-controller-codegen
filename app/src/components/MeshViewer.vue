@@ -10,7 +10,8 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { useProjectStore } from '../composables/useProjectStore.js';
 import { useTheme } from '../composables/useTheme.js';
-import { registerViewerCapture } from '../composables/useViewerCapture.js';
+import { registerViewerCapture, registerViewerCaptureAt, registerViewerModel } from '../composables/useViewerCapture.js';
+import { useRenderFarm } from '../composables/useRenderFarm.js';
 
 const { state } = useProjectStore();
 const { state: themeState } = useTheme();
@@ -98,6 +99,222 @@ function captureFrame() {
   return renderer.domElement.toDataURL('image/png');
 }
 
+// ---- phase-3 pose-driven capture --------------------------------------------
+// The NBV planner works in ABSOLUTE parseGlb world space; this scene is that same
+// space minus the model's own bbox centre (`drone.position.sub(center)` above).
+// A planned pose therefore arrives as absolute eye/target and both are shifted by
+// -center. The eye-target VECTOR is preserved exactly, so direction, distance and
+// framing are faithful; only the aim point inherits any tiny difference between
+// parseGlb's placed-bbox centre and THREE's Box3 centre.
+//
+// The planner also projects against a fixed virtual viewport (1024x1024, fov 45).
+// A capture must use the SAME intrinsics or the projected pixel areas the planner
+// reasoned about describe a different image than the one we send. So captureAt
+// overrides size, pixel ratio, fov, aspect, near/far and the camera basis, then
+// restores every one of them in a finally — the live view resumes untouched.
+const DUP_NAME = /^Object_\d+$/;
+
+// Nearest non-duplicate ancestor: the name the manifest, the joints and the
+// planner's own `namedIndex` all speak in. Mirrors views.mjs exactly, because a
+// colour id that resolves to `Object_211` is useless to the grounding step.
+function namedOf(o) {
+  let cur = o; let guard = 0;
+  while (cur && DUP_NAME.test(cur.name || '') && cur.parent && guard < 64) { cur = cur.parent; guard += 1; }
+  return (cur && cur.name) || o.name || `node_${o.id}`;
+}
+
+// Low-discrepancy colour ids. Consecutive parts must land FAR apart in colour
+// space: the context is antialiased, so an edge between two parts blends, and a
+// blend of two neighbouring ids can itself be a valid id. Spread over three
+// irrationals and keep every channel clear of 0 so no id can be mistaken for the
+// black backdrop either.
+const SPREAD = [0.6180339887498949, 0.7548776662466927, 0.5698402909980532];
+function colorIdOf(k) {
+  const n = k + 1;
+  const ch = SPREAD.map((a) => Math.max(24, Math.min(255, Math.round(((n * a) % 1) * 255))));
+  return (ch[0] << 16) | (ch[1] << 8) | ch[2];
+}
+const hex6 = (v) => `#${v.toString(16).padStart(6, '0')}`;
+
+// Draw ONE frame from a planned pose. Modes:
+//   photo    the model as it is — what a human would photograph
+//   ghost    shell translucent, focus opaque: reaches the parts the planner
+//            reported as interior-only, which no opaque pose can ever see
+//   solo     ONLY the focus draws: the cheapest way to ground what a sub-assembly
+//            (e.g. a gimbal) is actually made of
+//   colorId  flat unlit unique colour per focused part -> a segmentation mask and
+//            an exact pixel->name map, so grounding needs no model inference
+// Returns { dataUrl, width, height, mode, colorMap } or null.
+function captureAt(view, { mode = 'photo', focusNodes = null, viewport = null } = {}) {
+  if (!renderer || !drone) return null;
+  const pose = view?.pose;
+  if (!Array.isArray(pose?.eye) || !Array.isArray(pose?.target)) return null;
+
+  const vp = {
+    w: Math.max(16, Number(viewport?.w) || 1024),
+    h: Math.max(16, Number(viewport?.h) || 1024),
+    fov: Math.max(1, Math.min(170, Number(viewport?.fov) || 45)),
+  };
+
+  // Scene space = world space - center.
+  const eye = [pose.eye[0] - center.x, pose.eye[1] - center.y, pose.eye[2] - center.z];
+  const tgt = [pose.target[0] - center.x, pose.target[1] - center.y, pose.target[2] - center.z];
+  const dist = Math.hypot(eye[0] - tgt[0], eye[1] - tgt[1], eye[2] - tgt[2]);
+  if (!(dist > 1e-6)) return null;
+
+  const focus = Array.isArray(focusNodes) && focusNodes.length ? new Set(focusNodes.map(String)) : null;
+  // A focus name is usually a CONTAINER, and the things that actually draw are
+  // its descendants, so membership is decided by walking up the parent chain.
+  const inFocus = (o) => {
+    if (!focus) return true;
+    let cur = o; let guard = 0;
+    while (cur && guard < 64) { if (focus.has(cur.name)) return true; cur = cur.parent; guard += 1; }
+    return false;
+  };
+
+  const saved = {
+    size: renderer.getSize(new THREE.Vector2()),
+    pixelRatio: renderer.getPixelRatio(),
+    fov: camera.fov, aspect: camera.aspect, near: camera.near, far: camera.far, zoom: camera.zoom,
+    up: camera.up.clone(), position: camera.position.clone(), quaternion: camera.quaternion.clone(),
+    background: scene.background,
+    gridVisible: grid ? grid.visible : null,
+    overlayVisible: overlay ? overlay.visible : null,
+    orbitEnabled: orbit.enabled, orbitTarget: orbit.target.clone(),
+    pivotRotation: pivot ? pivot.rotation.clone() : null,
+  };
+
+  const meshes = [];
+  drone.traverse((o) => { if (o.isMesh) meshes.push(o); });
+  const savedMats = new Map();
+  const savedVis = new Map();
+  const disposables = [];
+  const colorMap = {};
+
+  const applyMode = () => {
+    if (mode === 'photo') return;
+    if (mode === 'colorId') {
+      // One colour per NAMED part, not per mesh: a part can be several meshes and
+      // grounding must return the name the manifest speaks in.
+      const ids = new Map();
+      for (const m of meshes) {
+        if (!inFocus(m)) { savedVis.set(m, m.visible); m.visible = false; continue; }
+        const nm = namedOf(m);
+        if (!ids.has(nm)) {
+          const v = colorIdOf(ids.size);
+          ids.set(nm, v);
+          colorMap[hex6(v)] = nm;
+        }
+        savedMats.set(m, m.material);
+        // Unlit and tone-mapping-free: the pixel must be EXACTLY the id colour.
+        const mat = new THREE.MeshBasicMaterial({ color: ids.get(nm), toneMapped: false, fog: false });
+        disposables.push(mat);
+        m.material = mat;
+      }
+      return;
+    }
+    if (mode === 'solo') {
+      for (const m of meshes) if (!inFocus(m)) { savedVis.set(m, m.visible); m.visible = false; }
+      return;
+    }
+    if (mode === 'ghost') {
+      // Everything still draws, but the enclosing shell goes translucent so the
+      // interior-only parts become visible. depthWrite stays on for the focused
+      // parts only, so ghosts do not occlude each other by draw order.
+      for (const m of meshes) {
+        savedMats.set(m, m.material);
+        const hot = inFocus(m);
+        const src = Array.isArray(m.material) ? m.material[0] : m.material;
+        const mat = new THREE.MeshStandardMaterial({
+          color: src?.color ? src.color.clone() : new THREE.Color(0x8899aa),
+          transparent: true, opacity: hot ? 0.95 : 0.12,
+          depthWrite: hot, side: THREE.DoubleSide,
+        });
+        disposables.push(mat);
+        m.material = mat;
+      }
+    }
+  };
+
+  const restore = () => {
+    for (const [m, mat] of savedMats) m.material = mat;
+    for (const [m, v] of savedVis) m.visible = v;
+    for (const d of disposables) { try { d.dispose(); } catch { /* ignore */ } }
+    savedMats.clear(); savedVis.clear(); disposables.length = 0;
+    scene.background = saved.background;
+    if (grid) grid.visible = saved.gridVisible ?? true;
+    if (overlay) overlay.visible = saved.overlayVisible ?? true;
+    if (pivot && saved.pivotRotation) { pivot.rotation.copy(saved.pivotRotation); pivot.updateMatrixWorld(true); }
+    renderer.setPixelRatio(saved.pixelRatio);
+    renderer.setSize(saved.size.x, saved.size.y);
+    camera.fov = saved.fov; camera.aspect = saved.aspect;
+    camera.near = saved.near; camera.far = saved.far; camera.zoom = saved.zoom;
+    camera.up.copy(saved.up); camera.position.copy(saved.position);
+    camera.quaternion.copy(saved.quaternion);
+    camera.updateProjectionMatrix();
+    camera.updateMatrixWorld(true);
+    orbit.target.copy(saved.orbitTarget);
+    orbit.enabled = saved.orbitEnabled;
+    orbit.update();
+  };
+
+  try {
+    // Freeze the animated preview at the REST pose: a vision frame must show the
+    // model as discovered, not mid-spin, or the model is being asked to name
+    // parts of a configuration that does not exist in the rig.
+    if (pivot) { pivot.rotation.set(0, 0, 0); pivot.updateMatrixWorld(true); }
+    // The grid and the joint-axis marker are UI, not geometry. A vision frame
+    // carrying a 20x20 grid invites the model to comment on the grid.
+    if (grid) grid.visible = false;
+    if (overlay) overlay.visible = false;
+    orbit.enabled = false;
+
+    applyMode();
+
+    // updateStyle=false leaves the CSS box alone: the drawing buffer becomes the
+    // planned frame size while the visible canvas keeps its layout size, and the
+    // restore below puts both back before the browser ever composites.
+    renderer.setPixelRatio(1);
+    renderer.setSize(vp.w, vp.h, false);
+    // A mask needs a backdrop that is not a valid id colour; photo/ghost/solo
+    // keep the user's theme so the frame looks like the model, not like a CAD
+    // viewport.
+    scene.background = mode === 'colorId' ? new THREE.Color(0x000000) : saved.background;
+
+    camera.fov = vp.fov;
+    camera.aspect = vp.w / vp.h;
+    camera.up.set(0, 0, 1);            // model space is Z-up
+    camera.near = Math.max(0.01, dist * 0.01);
+    camera.far = dist * 4 + radius * 4 + 10;
+    camera.zoom = 1;
+    camera.position.set(eye[0], eye[1], eye[2]);
+    camera.lookAt(tgt[0], tgt[1], tgt[2]);
+    camera.updateProjectionMatrix();
+    camera.updateMatrixWorld(true);
+
+    renderer.render(scene, camera);
+    const dataUrl = renderer.domElement.toDataURL('image/png');
+    return {
+      dataUrl, width: vp.w, height: vp.h, mode,
+      colorMap: mode === 'colorId' ? colorMap : null,
+      parts: mode === 'colorId' ? Object.keys(colorMap).length : null,
+    };
+  } catch (e) {
+    status.value = `captureAt(${mode}) threw: ${e.message}`;
+    return null;
+  } finally {
+    restore();
+  }
+}
+
+// Tell the render farm what this tab can currently draw. Called on every model
+// change so the server never picks a tab that is showing a different mesh than
+// the one the plan was made against.
+function announceModel() {
+  registerViewerModel({ hasModel: !!drone, glb: loadedGlb });
+  useRenderFarm().refresh();
+}
+
 async function loadModel(url) {
   if (!url || url === loadedGlb) return;
   teardownPivot();
@@ -122,6 +339,9 @@ async function loadModel(url) {
   orbit.target.set(0, 0, 0);
   orbit.update();
   status.value = '';
+  // Announce LAST: the farm may pick this tab the instant it hears "model
+  // loaded", and every part of the scene must already be in its rest state.
+  announceModel();
 }
 
 // ---- isolated single-joint preview -----------------------------------------
@@ -264,6 +484,7 @@ async function reload() {
     updateOverlay();
   } catch (e) {
     status.value = `load failed: ${e.message}`;
+    announceModel();
   }
 }
 
@@ -277,6 +498,8 @@ onMounted(() => {
   tick();
   addEventListener('resize', resize);
   registerViewerCapture(captureFrame);
+  registerViewerCaptureAt(captureAt);
+  announceModel();
   if (state.viewer.glb) reload();
 });
 
@@ -284,6 +507,8 @@ onBeforeUnmount(() => {
   cancelAnimationFrame(raf);
   removeEventListener('resize', resize);
   registerViewerCapture(null);
+  registerViewerCaptureAt(null);
+  registerViewerModel(null);
   try { renderer?.dispose(); } catch { /* ignore */ }
 });
 </script>
