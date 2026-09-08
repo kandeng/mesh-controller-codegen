@@ -234,6 +234,13 @@ async function toggleRound(r) {
   }
 }
 
+// Replay this round's camera path in the 3D view (the vision-round tour). The
+// trigger lives here, beside the round's frames, because "show me how the AI
+// looked" is a question about THIS round's evidence.
+function toggleTour(n) {
+  state.tourRound = state.tourRound === n ? null : n;
+}
+
 const kb = (n) => (n == null ? '' : `${Math.round(n / 1024)} KB`);
 const modeTip = (f) => `${f.id} · ${f.mode}${f.width ? ` · ${f.width}×${f.height}` : ''}${f.bytes ? ` · ${kb(f.bytes)}` : ''}`;
 </script>
@@ -410,13 +417,20 @@ const modeTip = (f) => `${f.id} · ${f.mode}${f.width ? ` · ${f.width}×${f.hei
     <section v-else-if="tab === 'rounds'" class="rounds">
       <div v-if="!rounds.length" class="empty">No observation round has been run yet.</div>
       <div v-for="r in rounds" :key="r.round" class="round">
-        <button class="rhead" @click="toggleRound(r)">
-          <span class="rid">r{{ r.round }}</span>
-          {{ r.frames }} frame(s) · {{ kb(r.bytes) }}
-          <span v-for="m in r.modes" :key="m" class="tag tiny">{{ m }}</span>
-          <span v-if="r.hasReply" class="tag tiny">reply</span>
-          <span v-if="r.hasProposals" class="tag tiny">proposals</span>
-        </button>
+        <div class="rrow">
+          <button class="rhead" @click="toggleRound(r)">
+            <span class="rid">r{{ r.round }}</span>
+            {{ r.frames }} frame(s) · {{ kb(r.bytes) }}
+            <span v-for="m in r.modes" :key="m" class="tag tiny">{{ m }}</span>
+            <span v-if="r.hasReply" class="tag tiny">reply</span>
+            <span v-if="r.hasProposals" class="tag tiny">proposals</span>
+          </button>
+          <button
+            class="tourbtn" :class="{ on: state.tourRound === r.round }"
+            title="Replay this round's camera path in the 3D view"
+            @click="toggleTour(r.round)"
+          >{{ state.tourRound === r.round ? '■ stop' : '▶ tour' }}</button>
+        </div>
         <div v-if="openRound === r.round" class="strip">
           <div v-if="roundBusy" class="empty">loading…</div>
           <figure v-for="f in roundFrames" :key="f.id" class="thumb">
@@ -556,6 +570,13 @@ button.primary { border-color: var(--accent); }
 /* rounds browser */
 .rounds { display: flex; flex-direction: column; gap: 6px; }
 .round { display: flex; flex-direction: column; gap: 6px; }
+.rrow { display: flex; gap: 6px; align-items: stretch; }
+.rrow .rhead { flex: 1; }
+.tourbtn {
+  flex: none; cursor: pointer; font-family: ui-monospace, monospace; font-size: 10px;
+  background: none; border: 1px solid #3d5a73; border-radius: 7px; color: #7aa5c9; padding: 0 9px;
+}
+.tourbtn.on { color: #062; background: var(--good); border-color: var(--good); }
 .rhead {
   display: flex; gap: 6px; align-items: center; flex-wrap: wrap; cursor: pointer;
   background: none; border: 1px solid var(--border-2); border-radius: 7px;

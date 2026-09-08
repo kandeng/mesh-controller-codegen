@@ -53,6 +53,16 @@ export function useKernelApi() {
     observation: (round) => get(`/api/observations/${Number(round) || 0}`),
     observationColors: (round, id) => get(`/api/observations/${Number(round) || 0}/colors/${encodeURIComponent(id)}`),
 
+    // ---- phase 3 task 19: the TIME axis — the revision chain ----------------
+    // Every belief-changing write (a loop round, a verdict, an amortization, a
+    // rigidity reopen) froze the whole manifest graph as `manifest.r<N>.json`.
+    // These three read that chain back: list it (metadata only, no records), load
+    // one full snapshot, and diff one against its parent. All read-only, so the
+    // 3D scrubber can poll them freely while it replays discovery stop by stop.
+    revisions: () => get('/api/revisions'),
+    revision: (n) => get(`/api/revisions/${Number(n)}`),
+    revisionDiff: (n, against) => get(`/api/revisions/${Number(n)}/diff${against != null ? `?against=${Number(against)}` : ''}`),
+
     // ---- phase 3 task 17: the human verdict gate ---------------------------
     // Everything the observation panel draws for ONE joint: the frames behind the
     // claim, the reasoning, the uncertainties, the current verdict and the

@@ -18,17 +18,45 @@
 //      synthesizes one — this is what round 2 aims itself with
 //   G) shot selection and ONE whole round with plan/capture/propose all faked —
 //      no browser, no model — plus resume semantics over a reopened record
+//   G3) a confirm of an id the manifest has never heard of is re-routed to a
+//      grounded candidate (the mesh geometry found nothing in), and a confirm may
+//      only ever LIFT a record — never demote one physics already auto-accepted
+//   G4) a project reload mid-campaign aborts at every phase boundary, with the
+//      manifest provably untouched and not one further frame spent
+//   G5) the omni survey tier is FORCED: four oblique looks plus a true top and a
+//      true bottom, paid for before masks and ghosts, inside the hard frame cap
+//   G6) every frame is annotated with the fov, the machine's real extent and the
+//      screen-axis mapping it was drawn in — and with NO mapping rather than a
+//      guessed one when the basis is unavailable
+//   G7) an INDEPENDENT lane does not inherit another producer's guesses: a machine
+//      guess stops blocking its parts, agreement becomes corroboration, and only a
+//      HUMAN verdict stays off-limits
+//   G8) two producer lanes run concurrently against clones and are reconciled by
+//      NODE SET into one writer — same parts corroborate, disjoint parts coexist
+//   G9) the category prior aims the camera and supplies a count to falsify, and
+//      has NO path into the manifest: a guess can never become a joint
 //   H) every failure path bails with the manifest provably untouched, and an
 //      empty reply counts as success rather than as a crash
 //   I) the model's reasoning and doubts survive the trip to the wire the UI reads
 //
 // Usage: node test/verify-vision.mjs
 import { parseGlb } from '../src/lib/gltf.mjs';
-import { makeCamera, namedIndex, nodeBox, planViews, rectOf, renderTargets } from '../src/plugins/discovery/views.mjs';
+import { makeCamera, namedIndex, nodeBox, planViews, rectOf, renderTargets, VIEWPORT } from '../src/plugins/discovery/views.mjs';
 import {
   cloudAnchor, cloudAxis, visionPropose, L2_VISION_BASE_CONFIDENCE,
 } from '../src/plugins/discovery/vision-propose.mjs';
-import { MAX_EXTRA_VIEWS, MAX_VISION_ROUNDS, runVisionCampaign, runVisionRound, selectShots } from '../src/plugins/discovery/loop.mjs';
+import {
+  buildVisionPrompt, frameLine, sceneFacts, screenAxes,
+} from '../src/plugins/discovery/vision-prompt.mjs';
+import {
+  MAX_EXTRA_VIEWS, MAX_VISION_ROUNDS, reconcileLanes, runProducerLanes,
+  runVisionCampaign, runVisionRound, selectShots, SHOT_BUDGET,
+} from '../src/plugins/discovery/loop.mjs';
+import {
+  buildExpectationPrompt, expectationGap, expectationIsUsable, isExpectationPrompt,
+  MAX_INSTANCE_COUNT, parseExpectation, surveyPhotos, verifiedInstances,
+} from '../src/plugins/discovery/expectation.mjs';
+import { regionsFromExpectations } from '../src/plugins/discovery/grounding.mjs';
 import { frameKey } from '../src/plugins/discovery/observations.mjs';
 // The serializer that stands between a merged record and the browser. Importing
 // it from the server is safe headlessly: routes/project.mjs pulls in only
@@ -657,6 +685,814 @@ function makeFakes(replyOf) {
     `${m2.length} records, history=${m2[0]?.history?.length}, status=${m2[0]?.status}`);
 }
 
+// ---- G2) the live-progress tap emits the beats in the order the UI animates --
+// The 3D theater animates strictly from these kinds, in this order; a reorder or
+// a dropped beat would show up as a glyph that never moves or a dashed mark that
+// never solidifies. Pin the wire contract headlessly, with no browser and no
+// model, exactly like the rest of this file.
+{
+  const f = makeFakes((loc) => J([{
+    op: 'new', type: 'rotor', frameId: loc.frameId, regionColors: [loc.color], axis: [0, 0, 1],
+  }]));
+  const beats = [];
+  const res = await runVisionCampaign(g, [], [], {
+    plan: f.plan, capture: f.capture, propose: f.propose,
+    rounds: 1, extraViews: 0,
+    emit: (kind, payload) => beats.push([kind, payload]),
+  });
+  const kinds = beats.map(([k]) => k);
+  const at = (k) => kinds.indexOf(k);
+  // Anchors are {x,y,z} objects on manifest records and [x,y,z] arrays on plan
+  // poses; the contract the theater relies on is "a finite 3-vector", not a shape.
+  const isV3 = (p) => (Array.isArray(p) ? p : [p?.x, p?.y, p?.z]).every((n) => Number.isFinite(n));
+  ok('G2: the campaign emitted every beat the theater animates',
+    ['vision:round', 'vision:plan', 'vision:ask', 'vision:reply', 'vision:propose', 'vision:verdict']
+      .every((k) => kinds.includes(k)),
+    J(kinds));
+  ok('G2: beats arrive in the order the look-around actually happens',
+    at('vision:round') < at('vision:plan') && at('vision:plan') < at('vision:ask')
+    && at('vision:ask') < at('vision:reply') && at('vision:reply') < at('vision:propose')
+    && at('vision:propose') < at('vision:verdict'), J(kinds));
+  const planBeat = beats.find(([k]) => k === 'vision:plan')?.[1];
+  ok('G2: vision:plan carries eye+target for every view so the camera path can be drawn',
+    (planBeat?.views || []).length > 0
+    && planBeat.views.every((v) => isV3(v.eye) && isV3(v.target)),
+    J(planBeat?.views?.length));
+  const propBeat = beats.find(([k]) => k === 'vision:propose')?.[1];
+  ok('G2: vision:propose carries an anchor per entry so a dashed mark can be placed',
+    (propBeat?.entries || []).length === 1 && isV3(propBeat.entries[0].anchor),
+    J(propBeat?.entries));
+  const verdBeat = beats.find(([k]) => k === 'vision:verdict')?.[1];
+  ok('G2: vision:verdict names what the battery accepted so marks can solidify',
+    res.added === 1 && verdBeat?.added === 1
+    && Array.isArray(verdBeat?.proposals) && verdBeat.proposals.length === 1,
+    J(verdBeat));
+}
+
+// ---- G3) a confirm of a joint the manifest has never heard of -----------------
+// The failure this pins: a mesh whose node names are numeric (drone_dji_air3)
+// gives the geometry heuristics NOTHING, so the manifest starts empty and every
+// rotor the model sees arrives as op:"confirm" of an id it inferred from the
+// naming convention. Refusing those for an invalid targetId threw away the only
+// evidence on the table and the run reported "0 joints discovered". They are now
+// re-routed to `new`, with the trust boundary exactly where it always was:
+// grounding resolves the nodes, physics disposes the confidence, a human holds
+// the verdict. A confirm of a KNOWN id is unchanged by any of this.
+{
+  const frames = [photoFrame, maskFrame];
+  const run = (items, m = []) => visionPropose({ reply: J(items), g, manifest: m, frames, plan });
+  const isV3 = (a) => [a?.x, a?.y, a?.z].every((n) => Number.isFinite(n));
+
+  const known = run([{
+    op: 'confirm', targetId: 'hinge_claimed', type: 'hinge', frameId: photoFrame.id,
+    regionBox: subjectBox, reasoning: 'I can see this hinge',
+  }], manifest());
+  ok('G3: a confirm of a KNOWN id stays a corroboration and creates no record',
+    known.records.length === 0 && known.confirms.length === 1
+    && known.confirms[0].targetId === 'hinge_claimed',
+    J({ records: known.records.length, confirms: known.confirms.length }));
+
+  // The air3 reply verbatim in shape: an EMPTY manifest, a box, no axis, no
+  // anchor, and a targetId nobody issued.
+  const orphan = run([{
+    op: 'confirm', targetId: 'rotor_br_0', type: 'rotor', frameId: photoFrame.id,
+    regionBox: subjectBox,
+    reasoning: 'two blades bolted to a finned motor bell at the end of an arm',
+    uncertainties: ['left/right labelling assumes screen-right is +X'],
+  }]);
+  const conv = orphan.records[0];
+  ok('G3: a confirm of an UNKNOWN id becomes a grounded candidate instead of being dropped',
+    orphan.records.length === 1 && orphan.confirms.length === 0,
+    J({ records: orphan.records.length, confirms: orphan.confirms.length, w: orphan.warnings.slice(0, 2) }));
+  ok('G3: the converted record keeps the id the model invented as provenance',
+    (conv?.evidence || []).includes('confirm-converted:rotor_br_0'), J(conv?.evidence));
+  ok('G3: the converted record states the doubt about its own origin and keeps the doubts the model declared',
+    (conv?.uncertainties || []).some((u) => u.includes('not in the current joint map'))
+    && (conv?.uncertainties || []).some((u) => u.includes('screen-right')),
+    J(conv?.uncertainties?.slice(0, 3)));
+  ok('G3: the converted record is grounded from its REGION, never from the invented name',
+    conv?.origin === 'L2-vision' && (conv?.nodes || []).includes(subject)
+    && conv?.grounding?.source === 'box' && conv?.id !== 'rotor_br_0',
+    `${conv?.id} via ${conv?.grounding?.source} (${conv?.nodes?.length} node(s))`);
+  ok('G3: the axis it was never asked for comes from geometry or from a stated convention',
+    isV3(conv?.axis) && ['geometry', 'convention'].includes(conv?.axisSource) && isV3(conv?.anchor),
+    `axis=${conv?.axisSource} anchor=${conv?.anchorSource}`);
+  ok('G3: confidence is still disposed by physics, never by the model',
+    conv?.confidence === L2_VISION_BASE_CONFIDENCE && conv?.modelConfidence === undefined,
+    `conf=${conv?.confidence}`);
+
+  // Conversion re-routes EVIDENCE; it is not a licence to invent a joint from an
+  // id alone. With nothing to ground, the old refusal still stands.
+  const locatorless = run([{ op: 'confirm', targetId: 'rotor_fl_3' }]);
+  ok('G3: a locator-less confirm of an unknown id is still refused',
+    locatorless.records.length === 0 && locatorless.confirms.length === 0
+    && locatorless.warnings.some((w) => w.includes('valid targetId')),
+    J(locatorless.warnings.slice(0, 1)));
+}
+
+// A corroboration may only ever LIFT. Revision r1 of the air3 run showed the
+// opposite: rotors geometry had auto-accepted came back from the model as
+// confirms and were CAPPED below the auto-accept line, demoting them to
+// needs-verdict. The cap exists so no number of model agreements can cross that
+// line by itself — it must never pull a record back below a line physics lifted
+// it over.
+{
+  const strong = rec({
+    id: 'rotor_fr_1', type: 'rotor', nodes: [subject], confidence: 0.9, status: 'auto-accepted',
+    tests: [{ name: 'isolation', pass: true, level: 'fail', detail: 'clean' }],
+  });
+  const weak = rec({
+    id: 'rotor_bl_2', type: 'rotor', nodes: [other], confidence: 0.7, status: 'needs-verdict', tests: [],
+  });
+  const f = makeFakes(() => J([
+    { op: 'confirm', targetId: 'rotor_fr_1', reasoning: 'two blades on a finned motor bell' },
+    { op: 'confirm', targetId: 'rotor_bl_2', reasoning: 'the same construction on the other arm' },
+  ]));
+  const man = [strong, weak];
+  const res = await runVisionRound(g, [{ ...strong }, { ...weak }], man, {
+    plan: f.plan, capture: f.capture, propose: f.propose,
+  });
+  ok('G3: a confirm never DEMOTES a record physics already auto-accepted',
+    res.ok === true && res.added === 0 && res.confirms === 2
+    && strong.confidence === 0.9 && strong.status === 'auto-accepted'
+    && strong.evidence.includes('l2-vision-confirm'),
+    `conf=${strong.confidence} status=${strong.status} ev=${J(strong.evidence)}`);
+  ok('G3: a confirm still LIFTS a record below the line, but not across it',
+    weak.confidence === 0.75 && weak.status === 'needs-verdict'
+    && weak.evidence.includes('l2-vision-confirm'),
+    `conf=${weak.confidence} status=${weak.status}`);
+}
+
+// ---- G4) a reload mid-campaign stops the spend and merges nothing -------------
+// The air3 run also lost a whole campaign to a race: frames were rendered and a
+// reply merged into arrays belonging to a project that no longer existed, then
+// the NEW (empty) manifest was saved while the log reported "+1 record" — a
+// success message about nothing. An abort predicate lets the caller say "the
+// project you were handed is gone" at every phase boundary: before a round
+// starts, before each frame is rendered, and before the model is asked.
+{
+  const f = makeFakes((loc) => J([{
+    op: 'new', type: 'rotor', frameId: loc.frameId, regionColors: [loc.color], axis: [0, 0, 1],
+  }]));
+  const man = [];
+  const res = await runVisionRound(g, [], man, {
+    plan: f.plan, capture: f.capture, propose: f.propose, abort: () => true,
+  });
+  ok('G4: an aborted round refuses before spending a single frame or turn',
+    res.ok === false && res.code === 'PROJECT_RELOADED' && res.manifestUntouched === true
+    && f.calls.capture === 0 && f.calls.propose === 0 && man.length === 0,
+    `${res.code} — rendered=${f.calls.capture} turns=${f.calls.propose}`);
+
+  // An abort that lands MID-capture must stop the remaining frames as well:
+  // a reload halfway through a 12-frame budget should not render 10 more.
+  const f2 = makeFakes(() => '[]');
+  let rendered = 0;
+  const res2 = await runVisionRound(g, [], [], {
+    plan: f2.plan,
+    capture: async (v, m, focus) => { rendered += 1; return f2.capture(v, m, focus); },
+    propose: f2.propose,
+    abort: () => rendered >= 2,
+  });
+  ok('G4: an abort mid-capture stops the remaining frames and never asks the model',
+    res2.ok === false && res2.code === 'PROJECT_RELOADED' && res2.manifestUntouched === true
+    && rendered === 2 && f2.calls.propose === 0,
+    `rendered=${rendered} turns=${f2.calls.propose} — ${res2.reason}`);
+
+  // Campaign level: round 1 merges, then the project changes, so round 2 must
+  // not be started at all — no second plan, no second batch of frames.
+  const f3 = makeFakes((loc) => J([{
+    op: 'new', type: 'rotor', frameId: loc.frameId, regionColors: [loc.color], axis: [0, 0, 1],
+    uncertainties: ['blade count unclear'],
+    suggestView: { target: 'the same rotor from below', reason: 'the hub is hidden' },
+  }]));
+  const man3 = [];
+  let reloaded = false;
+  const res3 = await runVisionCampaign(g, [], man3, {
+    plan: f3.plan, capture: f3.capture, propose: f3.propose,
+    rounds: 2, extraViews: 2, abort: () => reloaded,
+    emit: (kind) => { if (kind === 'vision:verdict') reloaded = true; },
+  });
+  ok('G4: a campaign whose project changed starts no further round and says why',
+    res3.code === 'PROJECT_RELOADED' && res3.roundCount === 1 && f3.calls.plan === 1
+    && res3.stop.includes('reloaded') && man3.length === 1,
+    J({ code: res3.code, rounds: res3.roundCount, plans: f3.calls.plan, stop: res3.stop, man: man3.length }));
+}
+
+// ---- G5) the omni survey tier is forced, not chosen ---------------------------
+// The machine type is unknown before the first frame is rendered, so the only
+// honest opening move is to look at the WHOLE thing from every side, including
+// the two directions a coverage-greedy ring never picks: straight down and
+// straight up. Those six frames are bought before anything else, and the budget
+// for them comes out of the mask/ghost allowance rather than out of the cap.
+{
+  const surveys = bigPlan.views.filter((v) => v.spec?.kind === 'survey');
+  ok('G5: the planner forces a whole omni survey tier into the plan',
+    surveys.length === SHOT_BUDGET.survey && surveys.every((v) => v.mode !== 'ghost'),
+    `${surveys.length} survey of ${bigPlan.views.length} planned views`);
+
+  const poles = surveys.map((v) => v.spec.pole || 'oblique');
+  ok('G5: the tier is four oblique looks plus a TRUE top and a TRUE bottom',
+    poles.filter((p) => p === 'oblique').length === 4 && poles.includes('top') && poles.includes('bottom'),
+    J(poles));
+  ok('G5: the poles really are at +/-90 elevation, not at the old +/-80 clamp',
+    surveys.filter((v) => v.spec.pole).every((v) => Math.abs(v.spec.elevation) === 90),
+    J(surveys.filter((v) => v.spec.pole).map((v) => `${v.spec.pole}:${v.spec.elevation}`)));
+  ok('G5: every survey frame is fitted to the WHOLE machine, at one shared distance',
+    new Set(surveys.map((v) => Math.round(v.spec.distance))).size === 1
+    && surveys.every((v) => v.spec.distance > 0),
+    J([...new Set(surveys.map((v) => v.spec.distance.toFixed(1)))]));
+
+  const shots = selectShots(bigPlan.views);
+  const surveyShots = shots.filter((s) => s.view.spec?.kind === 'survey');
+  ok('G5: the whole survey tier is shot, and still fits inside the hard frame cap',
+    surveyShots.length === surveys.length && shots.length <= 12,
+    `${surveyShots.length} survey frames of ${shots.length} shots (cap 12)`);
+  ok('G5: the survey tier is spent FIRST, so nothing else can crowd it out',
+    shots.slice(0, surveys.length).every((s) => s.view.spec?.kind === 'survey' && s.mode === 'photo'),
+    J(shots.slice(0, surveys.length).map((s) => `${s.viewId}/${s.mode}`)));
+  ok('G5: a cap of exactly the tier size yields the survey and NOTHING else',
+    (() => {
+      const s6 = selectShots(bigPlan.views, { maxFrames: SHOT_BUDGET.survey });
+      return s6.length === SHOT_BUDGET.survey && s6.every((s) => s.view.spec?.kind === 'survey');
+    })(), J(selectShots(bigPlan.views, { maxFrames: SHOT_BUDGET.survey }).map((s) => s.viewId)));
+  ok('G5: when the cap cannot hold both, the survey tier wins over masks and ghosts',
+    (() => {
+      const s4 = selectShots(bigPlan.views, { maxFrames: 4 });
+      return s4.length === 4 && s4.every((s) => s.view.spec?.kind === 'survey');
+    })());
+
+  const cells = bigPlan.views.filter((v) => v.spec?.kind === 'cell');
+  const masks = shots.filter((s) => s.mode === 'colorId');
+  const ghosts = shots.filter((s) => s.mode === 'ghost');
+  ok('G5: after the tier is paid for, the retuned budget still buys mask pairs and a ghost',
+    masks.length === Math.min(SHOT_BUDGET.maskPairs, cells.length)
+    && masks.every((m) => Array.isArray(m.focusNodes) && m.focusNodes.length > 0)
+    && ghosts.length <= SHOT_BUDGET.ghostFrames,
+    J({ masks: masks.length, cells: cells.length, ghosts: ghosts.length, total: shots.length }));
+  ok('G5: no survey frame is masked - a whole-machine legend is unreadable, so the exact channel would not be exact',
+    shots.every((s) => !(s.mode === 'colorId' && s.view.spec?.kind === 'survey')),
+    J(masks.map((m) => `${m.viewId}:${m.view.spec?.kind}`)));
+  ok('G5: coverage is not sacrificed for the tier - the plan still sees essentially every part',
+    Number(bigPlan.coverage) >= 0.99, `coverage=${bigPlan.coverage}`);
+}
+
+// ---- G6) annotations that remove the model's guesswork ------------------------
+// The air3 round's dominant doubt was "left/right labelling assumes screen-right
+// is +X". That is not a fact the model should have to assume: we chose the pose,
+// we built the basis, and we can simply say so. Same for the fov and for how big
+// the machine is, without which "eye distance 163.1 units" is a meaningless number.
+{
+  const facts = sceneFacts(g, VIEWPORT, bigPlan.views.map((v) => ({ cam: v.cam })));
+  ok('G6: the scene facts carry the frame size, the fov, the radius and the extent',
+    facts.vp?.w === VIEWPORT.w && facts.vp?.fov === VIEWPORT.fov
+    && Number.isFinite(facts.radius) && facts.radius > 0
+    && Array.isArray(facts.extent) && facts.extent.length === 3 && facts.extent.every(Number.isFinite),
+    J({ vp: facts.vp, radius: +facts.radius.toFixed(1), extent: facts.extent?.map((x) => +x.toFixed(1)) }));
+
+  const photos = bigPlan.views.filter((v) => v.mode !== 'ghost').slice(0, 3);
+  const frames = photos.map((v) => ({
+    id: frameKey(v.id, 'photo'), viewId: v.id, mode: 'photo', dataBase64: PNG, mediaType: 'image/png',
+  }));
+  const p = buildVisionPrompt({ manifest: [], frames, plan: bigPlan, g, viewport: VIEWPORT });
+  const txt = p.text || '';
+  const lineOf = (id) => txt.split('\n').find((l) => l.includes(`"${id}"`) && l.includes('frame ')) || '';
+
+  ok('G6: the prompt states the fov and the frame size once, as a shared scene fact',
+    /fov 45/.test(txt) && new RegExp(`frame ${VIEWPORT.w}x${VIEWPORT.h} px`).test(txt));
+  ok('G6: the prompt states the machine radius and bounding box, so "eye distance" means something',
+    /radius \d+\.\d world units/.test(txt) && /bounding box [\d.]+ x [\d.]+ x [\d.]+/.test(txt),
+    J({ radius: +facts.radius.toFixed(1), extent: facts.extent?.map((x) => +x.toFixed(1)) }));
+  ok('G6: the prompt says the machine type is UNKNOWN and names what it might be',
+    /WE DO NOT KNOW WHAT MACHINE THIS IS/.test(txt) && /ground vehicle/.test(txt) && /aircraft/.test(txt));
+  ok('G6: EVERY frame line carries its own screen-axis mapping, fov and pixel size',
+    frames.every((f) => {
+      const l = lineOf(f.id);
+      return /screen-right = /.test(l) && /screen-up = /.test(l) && /fov 45/.test(l) && /1024x1024px/.test(l);
+    }), J(frames.map((f) => lineOf(f.id).match(/screen-right = [^,]+, screen-up = \S+/)?.[0])));
+  ok('G6: the mapping differs per pose, so it is derived from the basis and not a constant',
+    new Set(frames.map((f) => lineOf(f.id).match(/screen-right = [^,]+/)?.[0])).size === frames.length,
+    J(frames.map((f) => lineOf(f.id).match(/screen-right = ([^,]+)/)?.[1])));
+
+  // A frame replayed from disk with no plan beside it has no basis. Printing one
+  // anyway would be a lie the model believes; omitting it is honest and the
+  // grounding still works from the stored pose.
+  const bare = buildVisionPrompt({
+    manifest: [], frames: frames.map((f) => ({ ...f, viewId: 'no-such-view' })),
+    plan: { views: [] }, g: null, viewport: null,
+  });
+  ok('G6: with no basis available the annotation is OMITTED rather than guessed',
+    !!bare.text && !/screen-right/.test(bare.text) && !/SCENE \(every frame/.test(bare.text),
+    J(bare.text?.split('\n').filter((l) => /frame 1 =/.test(l))[0]?.slice(0, 90)));
+
+  const poleOf = (pk) => bigPlan.views.find((v) => v.spec?.pole === pk);
+  const basisOk = (c) => {
+    const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    return [...c.r, ...c.u, ...c.f].every(Number.isFinite)
+      && [c.r, c.u, c.f].every((v) => Math.abs(Math.hypot(...v) - 1) < 1e-9)
+      && Math.abs(dot(c.r, c.u)) < 1e-9 && Math.abs(dot(c.r, c.f)) < 1e-9 && Math.abs(dot(c.u, c.f)) < 1e-9;
+  };
+  ok('G6: both true poles have a finite, orthonormal basis - the up override did its job',
+    ['top', 'bottom'].every((pk) => { const v = poleOf(pk); return !!v && basisOk(v.cam); }),
+    J(['top', 'bottom'].map((pk) => `${pk}:${screenAxes(poleOf(pk)?.cam)}`)));
+  ok('G6: the bottom look is genuinely flipped, not the top look relabelled',
+    screenAxes(poleOf('top').cam) !== screenAxes(poleOf('bottom').cam)
+    && /screen-up = -/.test(screenAxes(poleOf('bottom').cam)));
+
+  const fl = (v) => frameLine({ id: v.id, mode: 'photo', spec: v.spec, cam: v.cam, covers: v.covers }, 0);
+  ok('G6: an oblique survey frame is NOT announced as a top-down one',
+    /oblique whole-machine survey view/.test(lineOf(frames[0].id)) && !/top-down/.test(lineOf(frames[0].id)),
+    lineOf(frames[0].id).slice(0, 120));
+  ok('G6: the pole frames are announced as the poles they really are',
+    /true top-down/.test(fl(poleOf('top'))) && /true bottom-up/.test(fl(poleOf('bottom'))));
+}
+
+// ---- G7) an independent lane inherits nothing ---------------------------------
+// Two producers that can read each other are one producer with an echo: the air3
+// round spent four of its five proposals agreeing with ids another pass had
+// invented. So the automatic lane is run blind to the other's conclusions - and
+// the one thing it is still told is what a HUMAN settled, because a person is not
+// a producer and their verdict is not a guess.
+{
+  const autoGuess = rec();                                        // nodes [other, third], auto-accepted
+  const humanVerdict = rec({ id: 'hinge_by_human', status: 'confirmed', verdict: { ok: true } });
+  // A DIFFERENT node set that overlaps one claimed node: this is the case the
+  // claimed-set narrowing decides. An identical set is handled by the dedupe below.
+  const overlap = J([{ op: 'new', type: 'rotor', frameId: 'm0', regionColors: ['#a1b2c3', '#d4e5f6'], axis: [0, 0, 1] }]);
+  const sameSet = J([{ op: 'new', type: 'rotor', frameId: 'm0', regionColors: ['#d4e5f6', '#112233'], axis: [0, 0, 1] }]);
+  const run = (reply, man, independent) => visionPropose({
+    reply, g, manifest: man, frames: [maskFrame], plan, independent,
+  });
+
+  const dep = run(overlap, [autoGuess], false);
+  const ind = run(overlap, [autoGuess], true);
+  ok('G7: a dependent lane is blocked by another machine\'s guess over one shared part',
+    dep.records.length === 0 && dep.warnings.some((w) => /already-claimed nodes/.test(w)),
+    J(dep.warnings.slice(0, 1)));
+  ok('G7: an INDEPENDENT lane proposes the same parts freely - a guess is not a claim',
+    ind.records.length === 1 && ind.records[0].origin === 'L2-vision'
+    && !ind.warnings.some((w) => /already-claimed nodes/.test(w)),
+    J({ records: ind.records.map((r) => `${r.id}:${r.nodes.length}`), w: ind.warnings.slice(0, 1) }));
+
+  const depSame = run(sameSet, [autoGuess], false);
+  const indSame = run(sameSet, [autoGuess], true);
+  ok('G7: agreement on the SAME parts is a duplicate to a dependent lane ...',
+    depSame.records.length === 0 && depSame.confirms.length === 0
+    && depSame.warnings.some((w) => /duplicate of an existing record/.test(w)),
+    J(depSame.warnings.slice(0, 1)));
+  ok('G7: ... and is CORROBORATION to an independent lane, never a second record',
+    indSame.records.length === 0 && indSame.confirms.length === 1
+    && indSame.confirms[0].targetId === autoGuess.id
+    && indSame.confirms[0].tag === 'cross-producer:L2-vision',
+    J(indSame.confirms));
+
+  ok('G7: a HUMAN verdict still blocks an independent lane - independence is from machines, not from people',
+    run(overlap, [humanVerdict], true).records.length === 0
+    && run(overlap, [humanVerdict], true).warnings.some((w) => /already-claimed nodes/.test(w)),
+    J(run(overlap, [humanVerdict], true).warnings.slice(0, 1)));
+  ok('G7: and agreeing with a human verdict can never mint a competing record either',
+    run(sameSet, [humanVerdict], true).records.length === 0);
+
+  const depP = buildVisionPrompt({ manifest: [autoGuess, humanVerdict], frames: [photoFrame], plan, g, viewport: VIEWPORT });
+  const indP = buildVisionPrompt({ manifest: [autoGuess, humanVerdict], frames: [photoFrame], plan, g, viewport: VIEWPORT, independent: true });
+  ok('G7: the independent prompt withholds the machine guess and lists only what a human settled',
+    /VALIDATED CONSTRAINTS/.test(depP.text) && depP.text.includes(autoGuess.id)
+    && /HUMAN-CONFIRMED CONSTRAINTS/.test(indP.text) && indP.text.includes(humanVerdict.id)
+    && !indP.text.includes(autoGuess.id),
+    J({ dep: depP.text.split('\n').filter((l) => /CONSTRAINTS/.test(l))[0], ind: indP.text.split('\n').filter((l) => /CONSTRAINTS/.test(l))[0] }));
+  ok('G7: the independent prompt says it is being kept in the dark, and why',
+    /INDEPENDENT OBSERVER/.test(indP.text) && /WITHHELD/.test(indP.text) && !/INDEPENDENT OBSERVER/.test(depP.text));
+
+  // The shape a FAILED geometry pass is adopted into: an empty manifest, not a
+  // refusal. air3 legitimately yields zero joints from numeric node names, and a
+  // lane that would not look without a baseline is a lane that cannot help there.
+  const fInd = makeFakes((loc) => J([{
+    op: 'new', type: 'rotor', frameId: loc.frameId, regionColors: [loc.color], axis: [0, 0, 1],
+  }]));
+  const manInd = [];
+  const resInd = await runVisionRound(g, [], manInd, {
+    plan: fInd.plan, capture: fInd.capture, propose: fInd.propose, independent: true,
+  });
+  ok('G7: an independent lane runs against an EMPTY manifest and still finds a joint',
+    resInd.ok === true && resInd.added === 1 && manInd[0]?.origin === 'L2-vision'
+    && /INDEPENDENT OBSERVER/.test(fInd.seen.promptText || ''),
+    J({ ok: resInd.ok, added: resInd.added, man: manInd.length }));
+  ok('G7: a NULL manifest is not an error to the prompt builder or to the gate - there is simply nothing to inherit',
+    (() => {
+      const np = buildVisionPrompt({ manifest: null, frames: [photoFrame], plan, g, viewport: VIEWPORT, independent: true });
+      const nv = visionPropose({ reply: sameSet, g, manifest: null, frames: [maskFrame], plan, independent: true });
+      return !!np.text && Array.isArray(nv.records) && nv.records.length === 1;
+    })());
+  ok('G7: the round still refuses when there is no array to merge into - adoption is the CALLER\'s decision',
+    (await runVisionRound(g, [], null, { plan: fInd.plan, capture: fInd.capture, propose: fInd.propose })).code === 'NO_MANIFEST');
+}
+
+// ---- G8) two producer lanes, one writer ---------------------------------------
+// Independence and a single writer pull in opposite directions: a producer shown
+// the other's output agrees with it, and two lanes merging into one array
+// concurrently would interleave the battery, the node-set dedupe and the id
+// allocation. So each lane runs against a CLONE, the clones are diffed, and the
+// deltas are applied serially through the one code path that writes a record.
+{
+  const mkRec = (id, origin, nodes, type = 'rotor') => ({
+    id, label: `${type} (${origin})`, type, nodes: [...nodes],
+    anchor: { x: 0, y: 0, z: 0 }, axis: { x: 0, y: 0, z: 1 },
+    evidence: [origin === 'L2-vision' ? 'l2-vision' : 'l2-batch'],
+    confidence: 0.7, origin, tests: [], status: 'needs-verdict', history: [],
+  });
+
+  const held = [mkRec('rotor_a', 'L1-geometry', [subject])];
+  const same = reconcileLanes(held, {
+    records: [mkRec('vis_rotor', 'L2-vision', [subject])], confirms: [],
+  }, { origin: 'L2-vision' });
+  ok('G8: the same node set from a second producer becomes corroboration, not a second record',
+    same.records.length === 0 && same.confirms.length === 1
+    && same.confirms[0].targetId === 'rotor_a' && same.confirms[0].tag === 'cross-producer:L2-vision'
+    && same.agreed.length === 1 && same.agreed[0].discardedId === 'vis_rotor', J(same.agreed));
+  ok('G8: identity is the node SET - neither order nor naming can turn one part into two joints',
+    (() => {
+      const r = reconcileLanes([mkRec('r_ab', 'L1-geometry', [subject, other])],
+        { records: [mkRec('v_ba', 'L2-vision', [other, subject])] }, { origin: 'L2-vision' });
+      return r.records.length === 0 && r.agreed.length === 1;
+    })());
+  ok('G8: a DISJOINT node set is admitted as its own record - agreement is not a precondition',
+    (() => {
+      const r = reconcileLanes(held, { records: [mkRec('vis_rotor', 'L2-vision', [other, third])] }, { origin: 'L2-vision' });
+      return r.records.length === 1 && r.records[0].id === 'vis_rotor' && r.confirms.length === 0 && r.agreed.length === 0;
+    })());
+  ok('G8: a TYPE disagreement between producers is reported, never silently resolved',
+    (() => {
+      const r = reconcileLanes([mkRec('gim_x', 'L1-geometry', [subject], 'gimbal')],
+        { records: [mkRec('vis_x', 'L2-vision', [subject], 'rotor')] }, { origin: 'L2-vision' });
+      return r.records.length === 0 && r.agreed[0]?.typeMismatch?.kept === 'gimbal' && r.agreed[0].typeMismatch.lane === 'rotor';
+    })(), J(reconcileLanes([mkRec('gim_x', 'L1-geometry', [subject], 'gimbal')],
+      { records: [mkRec('vis_x', 'L2-vision', [subject], 'rotor')] }, { origin: 'L2-vision' }).agreed[0]?.typeMismatch));
+  ok('G8: one lane claiming the same parts twice is reconciled against ITSELF, not admitted twice',
+    (() => {
+      const r = reconcileLanes([], { records: [mkRec('a', 'L2-vision', [subject]), mkRec('b', 'L2-vision', [subject])] }, { origin: 'L2-vision' });
+      return r.records.length === 1 && r.agreed.length === 1;
+    })());
+  ok('G8: a confirm a lane produced itself is carried across untouched, and a record with no nodes cannot enter',
+    reconcileLanes(held, { records: [mkRec('empty', 'L2-vision', [])], confirms: [{ targetId: 'rotor_a', tag: 'l2-vision-confirm' }] }, { origin: 'L2-vision' }).confirms.length === 1
+    && reconcileLanes(held, { records: [mkRec('empty', 'L2-vision', [])] }, { origin: 'L2-vision' }).records.length === 0);
+
+  const real = [];
+  const beats = [];
+  const laneRes = await runProducerLanes(g, [], real, {
+    text: async (m) => { m.push(mkRec('text_rotor', 'L2-ai', [subject])); return { ok: true, added: 1 }; },
+    vision: async (m) => {
+      m.push(mkRec('vis_rotor', 'L2-vision', [subject]));
+      return { ok: true, added: 1, frames: 11, expectation: { category: 'quadrotor drone' }, gaps: [{ type: 'rotor', expected: 4, found: 1, missing: 3 }] };
+    },
+    emit: (kind, payload) => beats.push({ kind, payload }),
+  });
+  ok('G8: two producers that found the SAME part leave ONE record in the real manifest',
+    real.length === 1 && laneRes.added === 1 && laneRes.agreed.length === 1
+    && laneRes.lanes.text?.merged === 1 && laneRes.lanes.vision?.merged === 0
+    && laneRes.lanes.vision?.corroborated === 1,
+    J({ real: real.map((r) => r.id), added: laneRes.added, text: laneRes.lanes.text?.merged, vision: laneRes.lanes.vision?.merged }));
+  ok('G8: the survivor carries the other lane\'s corroboration in its own evidence trail',
+    (real[0]?.evidence || []).some((t) => /cross-producer:L2-vision/.test(t)), J(real[0]?.evidence));
+
+  const solo = [];
+  await runProducerLanes(g, [], solo, {
+    text: async (m) => { m.push(mkRec('text_rotor', 'L2-ai', [subject])); return { ok: true }; },
+  });
+  ok('G8: agreement between producers can only LIFT a record - never demote one physics already disposed of',
+    real.length === 1 && solo.length === 1 && real[0].confidence >= solo[0].confidence,
+    `corroborated=${real[0]?.confidence?.toFixed(3)} alone=${solo[0]?.confidence?.toFixed(3)}`);
+
+  ok('G8: each lane announces its own merge on the beat wire, and only its own',
+    beats.filter((b) => b.kind === 'lane:merged').length === 2
+    && beats.some((b) => b.kind === 'lane:merged' && b.payload.lane === 'text' && b.payload.origin === 'L2-ai')
+    && beats.some((b) => b.kind === 'lane:merged' && b.payload.lane === 'vision' && b.payload.corroborated === 1),
+    J(beats.map((b) => b.kind)));
+  ok('G8: the category prior rides on the VISION lane\'s result and never on the text lane\'s - that is what keeps them independent',
+    laneRes.lanes.vision?.expectation?.category === 'quadrotor drone'
+    && Array.isArray(laneRes.lanes.vision?.gaps)
+    && laneRes.lanes.text?.expectation == null && laneRes.lanes.text?.gaps == null,
+    J({ vision: laneRes.lanes.vision?.expectation?.category, text: laneRes.lanes.text?.expectation }));
+
+  const seenBy = {};
+  await runProducerLanes(g, [], [], {
+    text: async (m) => {
+      seenBy.textAtStart = m.length;
+      m.push(mkRec('t', 'L2-ai', [subject]));
+      await new Promise((r) => setTimeout(r, 6));
+      seenBy.textAtEnd = m.length;
+      return { ok: true };
+    },
+    vision: async (m) => {
+      seenBy.visionAtStart = m.length;
+      m.push(mkRec('v', 'L2-vision', [other]));
+      await new Promise((r) => setTimeout(r, 1));
+      seenBy.visionAtEnd = m.length;
+      return { ok: true };
+    },
+  });
+  ok('G8: neither lane can see the other\'s writes, so agreement between them is real agreement',
+    seenBy.textAtStart === 0 && seenBy.visionAtStart === 0 && seenBy.textAtEnd === 1 && seenBy.visionAtEnd === 1,
+    J(seenBy));
+
+  const mixed = [];
+  const resMixed = await runProducerLanes(g, [], mixed, {
+    text: async () => { throw new Error('the text provider is not configured'); },
+    vision: async (m) => { m.push(mkRec('vis_rotor', 'L2-vision', [other, third])); return { ok: true }; },
+  });
+  ok('G8: a lane that THROWS does not take the other down - one producer being absent is the normal case',
+    resMixed.lanes.text?.ok === false && /not configured/.test(resMixed.lanes.text?.error || '')
+    && resMixed.lanes.vision?.merged === 1 && mixed.length === 1
+    && resMixed.warnings.some((w) => /the text lane failed/.test(w)),
+    J({ text: resMixed.lanes.text, vision: resMixed.lanes.vision?.merged }));
+
+  const two = [];
+  const resTwo = await runProducerLanes(g, [], two, {
+    text: async (m) => { m.push(mkRec('text_gimbal', 'L2-ai', [subject], 'gimbal')); return { ok: true }; },
+    vision: async (m) => { m.push(mkRec('vis_rotor', 'L2-vision', [other, third])); return { ok: true }; },
+  });
+  ok('G8: disjoint findings from both lanes coexist - independence must not cost a discovery',
+    two.length === 2 && resTwo.added === 2 && resTwo.agreed.length === 0
+    && new Set(resTwo.proposals).size === 2,
+    J(two.map((r) => `${r.id}:${r.type}:${r.status}`)));
+  ok('G8: no manifest to merge into is refused rather than quietly invented',
+    (await runProducerLanes(g, [], null, { text: async () => ({ ok: true }) })).code === 'NO_MANIFEST');
+}
+
+// ---- G9) the category prior aims and checks, and NEVER merges ------------------
+// Asking what kind of machine this is buys two things: it aims the scarce round-2
+// budget at PLACES a machine of that kind keeps its joints, and it supplies a
+// COUNT to falsify. What it must never buy is a joint. The boundary is structural
+// rather than disciplinary - nothing this lane parses has a path to mergeProposals.
+{
+  const surveyFrames = bigPlan.views.filter((v) => v.spec?.kind === 'survey').map((v) => ({
+    id: frameKey(v.id, 'photo'), viewId: v.id, mode: 'photo', spec: v.spec, cam: v.cam,
+    covers: v.covers, dataBase64: PNG, mediaType: 'image/png',
+  }));
+  const noise = [
+    { id: frameKey('v511', 'colorId'), viewId: 'v511', mode: 'colorId', spec: { kind: 'cell' }, dataBase64: PNG },
+    { id: frameKey('g0', 'ghost'), viewId: 'g0', mode: 'ghost', spec: { kind: 'ring' }, dataBase64: PNG },
+  ];
+  const sp = surveyPhotos([...surveyFrames, ...noise]);
+  ok('G9: a category is read from whole-machine PHOTOS only - never from a mask or a ghost',
+    sp.length === surveyFrames.length && sp.every((f) => f.mode === 'photo' && f.spec?.kind === 'survey'),
+    `${sp.length} of ${surveyFrames.length + noise.length} frames offered`);
+  ok('G9: with no survey tier it falls back to any photo, and with none of those it offers nothing',
+    surveyPhotos(noise).length === 0
+    && surveyPhotos([{ ...noise[0], mode: 'photo', spec: { kind: 'cell' } }]).length === 1);
+
+  const ep = buildExpectationPrompt({ frames: [...surveyFrames, ...noise], g, viewport: VIEWPORT });
+  ok('G9: the category turn carries its own mark, so a round\'s two turns cannot be confused by counting calls',
+    isExpectationPrompt(ep.text) && ep.images.length === surveyFrames.length && ep.frames.every((f) => f.attached),
+    `${ep.images.length} attached, ${ep.frames.length} described`);
+  ok('G9: the category prompt says plainly that an expectation is NEVER a discovery',
+    /NEVER a/.test(ep.text) && /nothing you write here becomes a joint/.test(ep.text));
+  ok('G9: the category prompt demands a count, a place, a symmetry, a doubt and an alternative',
+    ['count', 'regionBox', 'symmetry', 'doubts', 'alternatives'].every((k) => ep.text.includes(k)));
+  ok('G9: it maps an inexpressible motion onto the nearest of the three and forbids a fourth kind',
+    /track/.test(ep.text) && /Do not invent a fourth kind/.test(ep.text));
+  ok('G9: with no whole-machine photo there is nothing to ask, and the caller is told rather than left to guess',
+    (() => { const none = buildExpectationPrompt({ frames: noise, g }); return none.text === null && none.images.length === 0 && none.warnings.length > 0; })(),
+    J(buildExpectationPrompt({ frames: noise, g }).warnings));
+  ok('G9: the discovery prompt is NOT a category prompt - the two turns are separable from either side',
+    !isExpectationPrompt(buildVisionPrompt({ manifest: [], frames: surveyFrames, plan: bigPlan, g, viewport: VIEWPORT }).text));
+
+  const box0 = [0.5, 0.5, 0.8, 0.8];
+  const goodReply = J({
+    category: 'quadrotor drone', confidence: 0.86,
+    summary: 'four lifting rotors at the arm tips and one camera cradle at the nose',
+    instances: [
+      { type: 'rotor', count: 4, frameId: surveyFrames[0].id, regionBox: box0, symmetry: '4-fold about the vertical, one per arm tip', note: 'propeller and motor bell' },
+      { type: 'gimbal', count: 1, frameId: surveyFrames[0].id, regionBox: [0.1, 0.2, 0.3, 0.4], symmetry: 'one at the nose', note: 'camera cradle' },
+    ],
+    doubts: ['the arm tips are partly occluded in the top view'],
+    alternatives: ['a fixed-wing VTOL; a visible wing would settle it'],
+  });
+  const sentIds = surveyFrames.map((f) => f.id);
+  const parsed = parseExpectation(goodReply, { frameIds: sentIds });
+  ok('G9: a well-formed prior parses whole - category, confidence, counts, symmetry, doubt and alternative',
+    parsed.expectation.category === 'quadrotor drone' && parsed.expectation.confidence === 0.86
+    && parsed.expectation.instances.length === 2 && parsed.expectation.instances[0].count === 4
+    && /4-fold/.test(parsed.expectation.instances[0].symmetry || '')
+    && parsed.expectation.doubts.length === 1 && parsed.expectation.alternatives.length === 1
+    && parsed.warnings.length === 0, J(parsed.warnings));
+  ok('G9: a fenced reply is still read - being told "JSON only" does not stop a model wrapping it',
+    parseExpectation('```json\n' + goodReply + '\n```', { frameIds: sentIds }).expectation.instances.length === 2);
+
+  const bad = parseExpectation(J({
+    category: 'something', confidence: 2,
+    instances: [
+      { type: 'track', count: 2, frameId: surveyFrames[0].id, regionBox: [0, 0, 1, 1] },
+      { type: 'rotor', count: 4, frameId: 'v999.photo', regionBox: [0, 0, 0.5, 0.5] },
+      { type: 'rotor', count: 4, frameId: surveyFrames[0].id, regionBox: [0.8, 0.8, 0.2, 0.2] },
+      { type: 'gimbal', count: 99, frameId: surveyFrames[0].id, regionBox: [0.1, 0.1, 0.4, 0.4] },
+      'not an object',
+    ],
+  }), { frameIds: sentIds });
+  ok('G9: an instance outside the motion vocabulary is DROPPED with a warning, never mapped by guesswork',
+    !bad.expectation.instances.some((i) => i.type === 'track')
+    && bad.warnings.some((w) => /track/.test(w) && /not rotor\|gimbal\|hinge/.test(w)), J(bad.warnings));
+  ok('G9: an instance naming a frame that was never sent is dropped - it could not be aimed at anyway',
+    bad.warnings.some((w) => /v999\.photo/.test(w) && /was not sent/.test(w)));
+  ok('G9: an inverted or out-of-frame box is dropped rather than repaired into a place nobody indicated',
+    bad.warnings.some((w) => /no usable regionBox/.test(w)));
+  ok('G9: an absurd count is capped and a non-object instance is dropped, each with its own warning',
+    bad.expectation.instances.find((i) => i.type === 'gimbal')?.count === MAX_INSTANCE_COUNT
+    && bad.warnings.some((w) => /capped to/.test(w)) && bad.warnings.some((w) => /was not an object/.test(w)),
+    J(bad.expectation.instances.map((i) => `${i.type}:${i.count}`)));
+  ok('G9: a confidence outside 0..1 is clamped, not believed',
+    bad.expectation.confidence === 1, `conf=${bad.expectation.confidence}`);
+  ok('G9: a reply that is not JSON at all degrades to NO prior, with the reason recorded',
+    (() => { const p = parseExpectation('I think it is probably a drone.', { frameIds: sentIds }); return p.expectation.category === '' && p.expectation.instances.length === 0 && p.warnings.length > 0; })(),
+    J(parseExpectation('I think it is probably a drone.', { frameIds: sentIds }).warnings));
+
+  ok('G9: a low-confidence, nameless or empty prior is NOT usable - and then the campaign behaves exactly as it did before this lane existed',
+    expectationIsUsable(parsed.expectation) === true
+    && expectationIsUsable({ ...parsed.expectation, confidence: 0.2 }) === false
+    && expectationIsUsable({ ...parsed.expectation, category: '' }) === false
+    && expectationIsUsable({ ...parsed.expectation, instances: [] }) === false
+    && expectationIsUsable(null) === false);
+
+  const books = [
+    { type: 'rotor', status: 'needs-verdict' }, { type: 'rotor', status: 'auto-accepted' },
+    { type: 'rotor', status: 'rejected' }, { type: 'gimbal', status: 'needs-verdict' },
+  ];
+  const gaps = expectationGap(parsed.expectation, books);
+  ok('G9: the gap detector compares the count with what the project believes, and a REJECTED record is not a joint',
+    gaps.find((x) => x.type === 'rotor')?.expected === 4 && gaps.find((x) => x.type === 'rotor')?.found === 2
+    && gaps.find((x) => x.type === 'rotor')?.missing === 2 && gaps.find((x) => x.type === 'gimbal')?.missing === 0,
+    J(gaps));
+  ok('G9: grounding MORE than the category expected is reported as a surplus, not quietly absorbed',
+    expectationGap({ instances: [{ type: 'rotor', count: 2 }] },
+      [{ type: 'rotor', status: 'auto-accepted' }, { type: 'rotor', status: 'auto-accepted' }, { type: 'rotor', status: 'needs-verdict' }])[0]?.surplus === 1);
+  ok('G9: no prior, no gaps - the detector never invents an expectation for the project to fail',
+    expectationGap(null, books).length === 0 && expectationGap({ instances: [] }, books).length === 0);
+
+  const groundedBox = { frameId: surveyFrames[0].id, grounding: { box: { x0: box0[0], y0: box0[1], x1: box0[2], y1: box0[3] } } };
+  ok('G9: an instance the discovery turn already pointed at is VERIFIED, so round 2 does not re-ask a settled question',
+    J(verifiedInstances(parsed.expectation, [groundedBox])) === '[0]', J(verifiedInstances(parsed.expectation, [groundedBox])));
+  ok('G9: the same box on a DIFFERENT frame verifies nothing - a place is a place in a view',
+    verifiedInstances(parsed.expectation, [{ ...groundedBox, frameId: surveyFrames[1].id }]).length === 0);
+  ok('G9: a box that barely clips the expectation does not verify it either',
+    verifiedInstances(parsed.expectation, [{ frameId: surveyFrames[0].id, grounding: { box: { x0: 0.9, y0: 0.9, x1: 1, y1: 1 } } }]).length === 0);
+
+  // THE BOUNDARY: a confident, specific prior and a discovery turn that says
+  // NOTHING. If any part of a guess could reach the manifest, this is where it
+  // would show up.
+  const f9 = makeFakes(() => '[]');
+  const turns = [];
+  const savedExp = [];
+  const beats9 = [];
+  const man9 = [];
+  let discoveryPrompt = null;
+  const res9 = await runVisionRound(g, [], man9, {
+    plan: f9.plan, capture: f9.capture,
+    propose: async (text) => {
+      const isExp = isExpectationPrompt(text);
+      turns.push(isExp ? 'category' : 'discovery');
+      if (isExp) return { reply: goodReply, model: 'fake-vlm', ms: 3 };
+      discoveryPrompt = text;
+      return { reply: '[]', model: 'fake-vlm', ms: 4 };
+    },
+    persist: { ...f9.persist, expectation: (e) => savedExp.push(e) },
+    expectation: true, emit: (kind, payload) => beats9.push({ kind, payload }),
+  });
+  ok('G9: a round asks the category turn FIRST and the discovery turn SECOND, over the SAME rendered frames',
+    J(turns) === '["category","discovery"]' && f9.calls.capture > 0, J(turns));
+  ok('G9: THE BOUNDARY - a confident prior plus an empty discovery reply produces NO joint at all',
+    res9.ok === true && res9.added === 0 && man9.length === 0 && res9.proposals.length === 0,
+    J({ ok: res9.ok, added: res9.added, manifest: man9.length }));
+  ok('G9: the prior reaches turn B as a HYPOTHESIS TO FALSIFY, in its own words and with its own counts',
+    /HYPOTHESIS TO FALSIFY/.test(discoveryPrompt || '') && /quadrotor drone/.test(discoveryPrompt || '')
+    && /expects 4 x rotor/.test(discoveryPrompt || '') && /look for the missing 4/.test(discoveryPrompt || ''),
+    (discoveryPrompt || '').split('\n').filter((l) => /HYPOTHESIS|expects |missing/.test(l)).slice(0, 3).join(' | ').slice(0, 150));
+  ok('G9: the prior and its outcome ride on the round result, with gaps recomputed AFTER the merge',
+    res9.expectation?.category === 'quadrotor drone' && res9.expectationUsable === true
+    && res9.gaps?.find((x) => x.type === 'rotor')?.expected === 4 && J(res9.expectationVerified) === '[]',
+    J(res9.gaps));
+  ok('G9: the prior is persisted beside the frames that produced it - prompt, reply, gaps and warnings',
+    savedExp.length === 1 && !!savedExp[0].prompt?.text && savedExp[0].reply === goodReply
+    && savedExp[0].expectation?.category === 'quadrotor drone' && Array.isArray(savedExp[0].gaps),
+    J(Object.keys(savedExp[0] || {})));
+  const b9 = beats9.find((b) => b.kind === 'vision:expect');
+  ok('G9: the beat wire carries the category, the counts, the gaps and the verbatim exchange',
+    !!b9 && b9.payload.usable === true && b9.payload.category === 'quadrotor drone'
+    && b9.payload.instances.length === 2 && b9.payload.instances[0].count === 4
+    && Array.isArray(b9.payload.gaps) && !!b9.payload.prompt && !!b9.payload.reply,
+    J(b9?.payload && { category: b9.payload.category, instances: b9.payload.instances.length, gaps: b9.payload.gaps.length }));
+  ok('G9: the beat order puts the prior between the plan and the discovery question',
+    (() => {
+      const k = beats9.map((b) => b.kind);
+      return k.indexOf('vision:expect') > k.indexOf('vision:plan') && k.indexOf('vision:expect') < k.indexOf('vision:ask')
+        && k.indexOf('vision:ask') < k.indexOf('vision:reply') && k.indexOf('vision:reply') < k.indexOf('vision:verdict');
+    })(), J(beats9.map((b) => b.kind)));
+
+  const f10 = makeFakes(() => '[]');
+  let prompt10 = null;
+  const res10 = await runVisionRound(g, [], [], {
+    plan: f10.plan, capture: f10.capture,
+    propose: async (text) => {
+      if (isExpectationPrompt(text)) {
+        return { reply: J({ category: 'possibly a drone', confidence: 0.1, instances: [{ type: 'rotor', count: 4, frameId: surveyFrames[0].id, regionBox: box0 }] }), model: 'fake-vlm' };
+      }
+      prompt10 = text;
+      return { reply: '[]', model: 'fake-vlm' };
+    },
+    expectation: true,
+  });
+  ok('G9: a low-confidence prior leaves turn B EXACTLY as it was before this lane existed - a guess is never load-bearing',
+    res10.ok === true && res10.expectationUsable === false && res10.expectation?.category === 'possibly a drone'
+    && !/HYPOTHESIS TO FALSIFY/.test(prompt10 || ''),
+    J({ usable: res10.expectationUsable, confidence: res10.expectation?.confidence }));
+
+  const f11 = makeFakes(() => '[]');
+  const res11 = await runVisionRound(g, [], [], {
+    plan: f11.plan, capture: f11.capture,
+    propose: async (text) => { if (isExpectationPrompt(text)) throw new Error('rate limited'); return { reply: '[]', model: 'fake-vlm' }; },
+    expectation: true,
+  });
+  ok('G9: a category turn that FAILS costs nothing - the round carries on with no prior and says why',
+    res11.ok === true && res11.expectation === null && res11.expectationUsable === false && res11.gaps === null
+    && res11.warnings.some((w) => /category turn: the model call failed/.test(w)),
+    J(res11.warnings.filter((w) => /category/.test(w)).slice(0, 1)));
+
+  let turns12 = 0;
+  const f12 = makeFakes(() => '[]');
+  const res12 = await runVisionRound(g, [], [], {
+    plan: f12.plan, capture: f12.capture,
+    propose: async () => { turns12 += 1; return { reply: '[]', model: 'fake-vlm' }; },
+  });
+  ok('G9: a round that did not ask for a prior makes exactly ONE turn, as it always did',
+    turns12 === 1 && res12.expectation === null && res12.gaps === null && res12.expectationVerified === null,
+    `turns=${turns12}`);
+
+  // Round 2's aim list: the prior's UNVERIFIED places, resolved through the same
+  // grounding channel a claim uses, and REPORTED when they cannot be resolved.
+  const sv = bigPlan.views.find((v) => v.spec?.kind === 'survey');
+  const aimName = (sv.sees || []).find((nm) => nameOfMesh.has(nm));
+  const aimRect = rectOf(nodeBox(nameOfMesh.get(aimName)), sv.cam);
+  const aimBox = [aimRect.x0 / sv.cam.w, aimRect.y0 / sv.cam.h, aimRect.x1 / sv.cam.w, aimRect.y1 / sv.cam.h];
+  const frameRefs = bigPlan.views.filter((v) => v.mode !== 'ghost').map((v) => ({ id: frameKey(v.id, 'photo'), viewId: v.id, mode: 'photo' }));
+  const exp = {
+    category: 'quadrotor drone', confidence: 0.9, summary: '', doubts: [], alternatives: [],
+    instances: [
+      { type: 'rotor', count: 4, frameId: frameKey(sv.id, 'photo'), regionBox: aimBox, symmetry: null, note: null },
+      { type: 'gimbal', count: 1, frameId: 'v999.photo', regionBox: [0.1, 0.1, 0.4, 0.4], symmetry: null, note: null },
+    ],
+  };
+  const aim = (over = {}) => regionsFromExpectations(g, exp, {
+    plan: bigPlan, frames: frameRefs, verified: [], gaps: [{ type: 'rotor', expected: 4, found: 1, missing: 3 }], ...over,
+  });
+  const aimed = aim();
+  ok('G9: an expected place resolves through the SAME grounding channel a claim uses',
+    aimed.regions.length === 1 && aimed.regions[0].origin === 'expectation' && aimed.regions[0].type === 'rotor'
+    && aimed.regions[0].names.length > 0 && aimed.regions[0].expectedCount === 4
+    && Number.isFinite(aimed.regions[0].radius) && aimed.regions[0].anchor.every(Number.isFinite),
+    J(aimed.regions.map((r) => ({ id: r.id, names: r.names.length, radius: +r.radius.toFixed(1) }))));
+  ok('G9: it is aimed from a DIFFERENT bearing than the frame it was read from - the same azimuth reproduces the same occlusion',
+    aimed.regions[0].azimuth !== sv.spec.azimuth, `view=${sv.spec.azimuth} region=${aimed.regions[0].azimuth}`);
+  ok('G9: an expectation that cannot be resolved is REPORTED, never approximated into a place to aim',
+    aimed.unresolved.length === 1 && aimed.unresolved[0].origin === 'expectation'
+    && aimed.unresolved[0].type === 'gimbal' && /v999\.photo/.test(aimed.unresolved[0].why || ''),
+    J(aimed.unresolved));
+  ok('G9: a type whose expected count is already met is SKIPPED rather than aimed at',
+    (() => {
+      const r2 = aim({ gaps: [{ type: 'rotor', expected: 4, found: 4, missing: 0 }] });
+      return r2.regions.length === 0 && r2.skipped.some((s) => s.origin === 'expectation' && s.type === 'rotor');
+    })(), J(aim({ gaps: [{ type: 'rotor', expected: 4, found: 4, missing: 0 }] }).skipped));
+  ok('G9: an instance the discovery turn already pointed at is skipped as well',
+    aim({ verified: [0] }).skipped.some((s) => s.index === 0 && s.origin === 'expectation'));
+  ok('G9: NOTHING this module returns is a record - it returns places to look and nothing else',
+    aimed.regions.every((r) => r.op === undefined && r.nodes === undefined && r.confidence === undefined && r.status === undefined)
+    && aimed.unresolved.every((u) => u.op === undefined && u.nodes === undefined));
+  ok('G9: with no parse table or no prior it returns nothing at all, rather than throwing',
+    regionsFromExpectations(null, exp, { plan: bigPlan, frames: frameRefs }).regions.length === 0
+    && regionsFromExpectations(g, null, { plan: bigPlan, frames: frameRefs }).regions.length === 0);
+
+  // Campaign level: round 1 is the only round with a survey tier, so it is the
+  // only round that can name a category.
+  const f13 = makeFakes((loc) => J([{
+    op: 'new', type: 'rotor', frameId: loc.frameId, regionColors: [loc.color], axis: [0, 0, 1],
+    uncertainties: ['blade count unclear'],
+    suggestView: { target: 'the same rotor from below', reason: 'the hub is hidden' },
+  }]));
+  const kinds = [];
+  const res13 = await runVisionCampaign(g, [], [], {
+    plan: f13.plan, capture: f13.capture, rounds: 2, extraViews: 2,
+    propose: async (text, images) => { kinds.push(isExpectationPrompt(text) ? 'category' : 'discovery'); return f13.propose(text, images); },
+  });
+  ok('G9: a campaign asks for the prior in round 1 ONLY - round 2 has no whole-machine frame to read one from',
+    kinds[0] === 'category' && kinds.filter((k) => k === 'category').length === 1 && kinds.length >= 2
+    && res13.roundCount >= 1, J(kinds));
+
+  const f14 = makeFakes(() => '[]');
+  const kinds14 = [];
+  await runVisionCampaign(g, [], [], {
+    plan: f14.plan, capture: f14.capture, rounds: 1, expectation: false,
+    propose: async (text, images) => { kinds14.push(isExpectationPrompt(text) ? 'category' : 'discovery'); return f14.propose(text, images); },
+  });
+  ok('G9: a caller can switch the prior off and get the single-turn round back',
+    J(kinds14) === '["discovery"]', J(kinds14));
+}
+
 // ---- H) every failure path leaves the manifest untouched ----------------------
 {
   const untouched = async (label, effects, expectCode) => {
@@ -841,17 +1677,31 @@ function makeFakes(replyOf) {
 // is the only way to prove the BOUNDS: that the ceiling is hard, that the extra
 // frames really are close-ups of the disputed part, and that a campaign stops
 // when another look would repeat a question.
-function makeCampaignFakes(replyOf) {
-  const state = { plan: 0, capture: 0, propose: 0, prompts: [], asked: [], saved: {} };
+// A CATEGORY PRIOR reply the parser reads as "nothing usable": no category, no
+// instances. The lane then degrades to the single-turn round, which is what every
+// J assertion below was written against — the suggestView edge has to be measured
+// on its own, not through a prior that also aims round 2.
+const NO_PRIOR = '{"category":"","confidence":0,"summary":"","instances":[],"doubts":["cannot tell what this is"],"alternatives":[]}';
+
+// `expectReply` is what the category turn answers with. Round 1 now makes TWO
+// model calls, so a fake that counted calls would report the prior's turn as a
+// round and every round-indexed assertion would measure the wrong round.
+function makeCampaignFakes(replyOf, { expectReply = null } = {}) {
+  const state = {
+    plan: 0, capture: 0, propose: 0, expect: 0,
+    prompts: [], expectPrompts: [], asked: [], saved: {},
+  };
   return {
     state,
     plan: () => { state.plan += 1; return bigPlan; },
-    capture: async (view, mode, focusNodes) => {
+    capture: async (view, mode, focusNodes, round) => {
       state.capture += 1;
-      // `propose` runs once per round AFTER every capture, so its count is the
-      // round index while frames are being drawn.
+      // The campaign passes the round index as the FOURTH argument. Reading it
+      // instead of inferring it from a propose counter is what keeps these
+      // assertions true across a two-turn round.
+      const r = Number.isFinite(round) ? round : state.propose;
       state.asked.push({
-        round: state.propose, viewId: view.id, kind: view.spec?.kind ?? null,
+        round: r, viewId: view.id, kind: view.spec?.kind ?? null,
         mode, focus: focusNodes?.length ?? 0, sees: view.sees || [],
       });
       const colorMap = {};
@@ -863,6 +1713,18 @@ function makeCampaignFakes(replyOf) {
       };
     },
     propose: async (text, images) => {
+      // The two turns of a round are told apart by CONTENT, using the sentinel
+      // expectation.mjs exports for exactly this: a call counter would silently
+      // shift every round index the campaign is keyed on.
+      if (isExpectationPrompt(text)) {
+        const round = state.expect;
+        state.expect += 1;
+        state.expectPrompts.push(text);
+        return {
+          reply: typeof expectReply === 'function' ? expectReply(text, images, round) : (expectReply ?? NO_PRIOR),
+          model: 'fake-vlm', ms: 4, mode: 'live',
+        };
+      }
       const round = state.propose;
       state.propose += 1;
       state.prompts.push(text);
@@ -876,13 +1738,14 @@ function makeCampaignFakes(replyOf) {
     // belongs to round 1 only, and reusing it would write round 2's evidence over
     // the frames a human may already be looking at.
     persist: (r) => {
-      if (!state.saved[r]) state.saved[r] = { plan: 0, frame: 0, reply: null, proposals: null };
+      if (!state.saved[r]) state.saved[r] = { plan: 0, frame: 0, reply: null, proposals: null, expectation: null };
       const b = state.saved[r];
       return {
         plan: () => { b.plan += 1; },
         frame: () => { b.frame += 1; },
         reply: (x) => { b.reply = x; },
         proposals: (x) => { b.proposals = x; },
+        expectation: (x) => { b.expectation = x; },
       };
     },
   };

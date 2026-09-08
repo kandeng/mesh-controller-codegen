@@ -231,14 +231,20 @@ export function claimedNodeSet(manifest) {
 
 // Validated records compressed into one-line pruning facts for the L2 prompt:
 // they actively subtract from the search space instead of just informing it.
+//
+// `confirmedOnly` narrows the list to records a HUMAN disposed of. That is the
+// independence switch for a producer that must not read another producer's
+// conclusions: an auto-accept is a geometry/text guess that physics liked, and
+// handing it over as "claimed" is exactly how one producer's error becomes both
+// producers' error. A human verdict is not a guess, so it stays off-limits.
 const fmt3 = (v) => (v ? `(${v.x.toFixed(1)},${v.y.toFixed(1)},${v.z.toFixed(1)})` : '?');
-export function constraintSummary(manifest) {
+export function constraintSummary(manifest, { confirmedOnly = false } = {}) {
   return (manifest || [])
     // `confirmed` joins `auto-accepted` here, and it has to: a human-confirmed
     // record's nodes are claimed at least as firmly as an auto-accepted one's, so
     // leaving it out would make the act of confirming a joint hand its parts back
     // to the next proposal round as free real estate.
-    .filter((rec) => rec.status === 'auto-accepted' || rec.status === 'confirmed')
+    .filter((rec) => (confirmedOnly ? rec.status === 'confirmed' : rec.status === 'auto-accepted' || rec.status === 'confirmed'))
     .map((rec) => {
       // WHY it is accepted is part of the fact, because it tells the producer what
       // kind of challenge is pointless: nothing it says can outvote a human, while

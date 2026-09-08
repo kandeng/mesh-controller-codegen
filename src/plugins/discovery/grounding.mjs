@@ -19,7 +19,10 @@
 // is evidence, not an error to be averaged away. reconcile() reports the
 // disagreement and groundRegion() carries it into the record's uncertainties, so a
 // wrong grounding is legible to the human instead of silently becoming a joint.
-import { VIEWPORT, makeCamera, namedIndex, rectOf, renderTargets, nodeBox } from './views.mjs';
+import {
+  AZIMUTH_RETRY, REGION_MAX_R, REGION_MIN_R, REGION_PAD, VIEWPORT, makeCamera,
+  modelRadius, namedBoxes, namedIndex, nodeBox, rectOf, renderTargets, slug, unionBoxes,
+} from './views.mjs';
 
 // VLM boxes are the least reliable part of their output: 10% slop is normal and
 // thin parts (blades, arms, gimbal yokes) are worse. Boxes therefore give a COARSE
@@ -78,14 +81,23 @@ export function dilateBox(b, d = BOX_DILATE) {
 }
 
 // The camera a frame was drawn from. Accepts either a plan view ({pose:{eye,
-// target}}) or an already-built camera, so grounding works on a stored frame
+// target, up}}) or an already-built camera, so grounding works on a stored frame
 // entry (which carries `pose`) as well as on a live plan view.
+//
+// `pose.up` is NOT optional detail. The omni survey tier shoots a true top-down and
+// a true bottom-up frame, and at those poses the model's Z-up is the view axis: the
+// basis is decided by whichever up vector the renderer was told to use. Rebuilding
+// the camera with the default here would roll the projection relative to the pixels
+// the model actually looked at, and every regionBox drawn on a pole frame would then
+// resolve to plausible, wrong parts. Absent an `up` (a plan persisted before the
+// field existed) makeCamera falls back to Z-up, which is what those poses were
+// drawn with.
 export function cameraOf(view, viewport = VIEWPORT) {
   if (!view) return null;
   if (view.f && view.r && view.u) return view;                    // already a camera
   const pose = view.pose || view;
   if (!Array.isArray(pose?.eye) || !Array.isArray(pose?.target)) return null;
-  return makeCamera(pose.eye, pose.target, viewport);
+  return makeCamera(pose.eye, pose.target, viewport, pose.up || null);
 }
 
 // ---- channel 1: box -> nodes -------------------------------------------------
@@ -278,4 +290,127 @@ export function groundRegion({
     box: viaBox?.dilated || null,
     uncertainties, warnings,
   };
+}
+
+// ---- a category prior's places, resolved to somewhere a camera can aim --------
+
+// The mirror of views.mjs `regionsFromSuggestViews`, and the reason it lives HERE
+// rather than beside it: that function turns a NAME into a region, this one turns
+// a BOX into one, and box→part is grounding's job. views.mjs already imports this
+// module, so putting it there would close a cycle between the two files that do
+// all the projection maths.
+//
+// It resolves an expectation's instances to regions `planCloseUps` can aim at, and
+// it ADMITS NOTHING. An expectation is a hypothesis about a CATEGORY; the only
+// route into the manifest is a proposal that grounding resolved and the physics
+// battery scored (see expectation.mjs). What this function produces is therefore
+// strictly a place to look, plus an honest report of every place it could not
+// resolve — never an approximation of one, for the same reason
+// `regionsFromSuggestViews` refuses to guess: a close-up aimed at a
+// plausible-looking part spends the round-2 budget producing a confident answer to
+// a question nobody asked.
+//
+// in:  g, exp  { category, instances: [{ type, count, frameId, regionBox }] }
+//      opts   plan, frames  the round that produced the expectation, so a frameId
+//                           resolves to the pose that drew it
+//             verified     INDICES of instances the discovery turn already pointed
+//                          at (expectation.mjs `verifiedInstances`) — not worth a
+//                          second look
+//             gaps         optional `expectationGap` output; an instance whose type
+//                          has no missing count is skipped rather than aimed at
+// out: { regions, unresolved, skipped } — regions shaped exactly like
+//      `regionsFromSuggestViews`' output, so both feed one `planCloseUps` call.
+export function regionsFromExpectations(g, exp, {
+  plan = null, frames = [], verified = null, gaps = null,
+  maxRegions = 3, viewport = VIEWPORT, dilate = BOX_DILATE, minScore = MIN_BOX_SCORE,
+  maxResults = MAX_CANDIDATES,
+} = {}) {
+  const unresolved = [];
+  const skipped = [];
+  const regions = [];
+  const instances = Array.isArray(exp?.instances) ? exp.instances : [];
+  if (!instances.length || !g?.nodes?.length) return { regions, unresolved, skipped };
+
+  const verifiedSet = new Set((verified || []).map((v) => String(v)));
+  const gapOf = new Map((gaps || []).filter((x) => x?.type).map((x) => [x.type, x]));
+
+  // A frame reference may be the FRAME id (`v4.photo`) or the VIEW id (`v4`),
+  // exactly as in regionsFromSuggestViews, so index both.
+  const viewById = new Map((plan?.views || []).map((v) => [String(v.id), v]));
+  const frameToView = new Map();
+  for (const f of frames || []) {
+    const v = viewById.get(String(f?.viewId ?? '')) || viewById.get(String(f?.id ?? ''));
+    if (!v) continue;
+    if (f.id != null) frameToView.set(String(f.id), v);
+    if (f.viewId != null) frameToView.set(String(f.viewId), v);
+  }
+  const lookup = (ref) => (ref == null || ref === '' ? null
+    : viewById.get(String(ref)) || frameToView.get(String(ref)) || null);
+
+  const named = namedIndex(g);
+  const boxes = namedBoxes(g, renderTargets(g), (n) => named.get(n.i));
+  const R = modelRadius(g);
+  const clampR = (r) => Math.max(REGION_MIN_R * R, Math.min(REGION_MAX_R * R, r));
+  const category = exp?.category ? `"${exp.category}"` : 'the category prior';
+
+  instances.forEach((ins, i) => {
+    const why = (msg) => unresolved.push({
+      index: i, type: ins?.type ?? null, frameId: ins?.frameId ?? null,
+      origin: 'expectation', why: msg,
+    });
+    if (!ins || typeof ins !== 'object') return why('the expectation instance was not an object');
+    if (verifiedSet.has(String(i))) {
+      skipped.push({ index: i, type: ins.type, origin: 'expectation', why: 'the discovery turn already pointed at this place' });
+      return;
+    }
+    const gap = gapOf.get(ins.type);
+    if (gap && !(gap.missing > 0)) {
+      skipped.push({ index: i, type: ins.type, origin: 'expectation', why: `${gap.found} of ${gap.expected} ${ins.type}(s) are already grounded — nothing missing to aim at` });
+      return;
+    }
+    const view = lookup(ins.frameId);
+    if (!view) {
+      return why(`frame "${ins.frameId ?? '(none)'}" is not among the frames that round shot`);
+    }
+    // The SAME channel a proposal is grounded through, at the same settings: an
+    // expectation resolved by a looser rule than a claim would aim round 2 at a
+    // place no claim could ever be grounded to.
+    const gr = groundRegion({ box: ins.regionBox, view, g, viewport, dilate, minScore, maxResults });
+    const names = [...new Set((gr.names || []).filter((nm) => boxes.has(nm)))].sort();
+    if (!names.length) return why('the expected place grounded to no part of the model');
+    const box = unionBoxes(names.map((nm) => boxes.get(nm)));
+    if (!box || !box.c.every(Number.isFinite)) return why('the expected place resolved to parts with no finite centre');
+
+    regions.push({
+      id: `ex${i}_${slug(ins.type)}`,
+      index: i,
+      type: ins.type,
+      expectedCount: ins.count,
+      names,
+      anchor: box.c.slice(),
+      radius: clampR(Math.hypot(...box.h) * REGION_PAD),
+      // A different bearing than the survey frame the expectation was read from,
+      // for the reason AZIMUTH_RETRY exists: the same azimuth reproduces the same
+      // occlusion, and therefore the same ambiguity.
+      azimuth: Number.isFinite(view.spec?.azimuth) ? (view.spec.azimuth + AZIMUTH_RETRY) % 360 : 0,
+      reason: `${category} expects ${ins.count} ${ins.type}${ins.symmetry ? ` (${ins.symmetry})` : ''}; ${names.length} part(s) sit where one should be`,
+      origin: 'expectation',
+      frameId: ins.frameId ?? null,
+      grounding: { source: gr.source, candidates: gr.candidates.length, kept: names.length },
+    });
+  });
+
+  // Two instances that ground to the same parts are one place; buying both would
+  // spend the budget on the same close-up from two nearby bearings.
+  const byKey = new Map();
+  for (const r of regions) {
+    const key = r.names.join('|');
+    const prev = byKey.get(key);
+    if (prev) { skipped.push({ ...r, why: `same parts as ${prev.id}` }); continue; }
+    byKey.set(key, r);
+  }
+  const deduped = [...byKey.values()];
+  const cap = Math.max(1, maxRegions | 0);
+  for (const r of deduped.slice(cap)) skipped.push({ ...r, why: `over the ${cap}-region cap` });
+  return { regions: deduped.slice(0, cap), unresolved, skipped };
 }

@@ -25,7 +25,7 @@
 // the deterministic battery lifts a record (see loop.mjs).
 import { VIEWPORT, namedIndex, nodeBox, renderTargets } from './views.mjs';
 import { BOX_DILATE, MAX_CANDIDATES, MIN_BOX_SCORE, groundRegion } from './grounding.mjs';
-import { createProposalGate, parseReply, vec3 } from './propose-core.mjs';
+import { createProposalGate, parseReply, vec3, TYPES } from './propose-core.mjs';
 
 export const L2_VISION_BASE_CONFIDENCE = 0.7;
 
@@ -41,6 +41,16 @@ export const MAX_BOX_NODES = 8;
 // rather than an arbitrary perpendicular. Above it the cloud is blobby and the
 // "axis" would be noise presented as geometry — refuse instead.
 export const AXIS_FLATNESS = 0.15;
+
+// The axis convention geometry discovery already commits to (see geometry.mjs):
+// these meshes are Z-up, a rotor spins about the vertical, a camera cradle tilts
+// about the lateral X. Used as a LAST RESORT and only for a converted confirm —
+// a reply that was never asked for an axis, because the prompt asks for one only
+// of op:"new". Refusing such a record for a missing field we never requested
+// would discard the only evidence about a mesh whose node names are numeric and
+// whose rotors therefore arrive exclusively as confirms. The assumption is
+// written into the record's doubts, so a human sees exactly what was assumed.
+const CONVENTIONAL_AXIS = { rotor: [0, 0, 1], gimbal: [1, 0, 0] };
 
 // name -> placed world box, unioned over the mesh nodes that name resolves to.
 // Union rather than first-match: a named part is often several mesh nodes (a
@@ -301,9 +311,14 @@ function suggestFor(p, grounding, names) {
 // Validate a vision reply.
 //
 // in:  { reply, g, manifest, frames, plan, viewport, dilate, minScore, maxResults,
-//        maxBoxNodes }
+//        maxBoxNodes, independent }
 //      `frames` entries must carry `pose` and, for masks, a RESOLVED `colorMap`
 //      object (loadColorMap, not the stored filename).
+//      `independent` marks a lane that must not inherit another producer's
+//      conclusions: the gate keeps the whole manifest for identity (ids, dedupe,
+//      confirm targets) but only a HUMAN-confirmed record still blocks a proposal
+//      for the same parts. Two producers that agree then become one reconciled
+//      record with corroboration instead of one dropped proposal.
 // out: { records, confirms, warnings, grounded, admitted, suggestViews }
 //      `grounded` is one entry per proposal — including the dropped ones — so the
 //      UI can show why a claim did or did not become a record, and `admitted`
@@ -311,7 +326,7 @@ function suggestFor(p, grounding, names) {
 export function visionPropose({
   reply, g, manifest, frames = [], plan = null,
   viewport = VIEWPORT, dilate = BOX_DILATE, minScore = MIN_BOX_SCORE,
-  maxResults = MAX_CANDIDATES, maxBoxNodes = MAX_BOX_NODES,
+  maxResults = MAX_CANDIDATES, maxBoxNodes = MAX_BOX_NODES, independent = false,
 } = {}) {
   const gate = createProposalGate({
     g,
@@ -321,6 +336,7 @@ export function visionPropose({
     evidenceTag: 'l2-vision',
     baseConfidence: L2_VISION_BASE_CONFIDENCE,
     origin: 'L2-vision',
+    independent,
   });
   const opts = { viewport, dilate, minScore, maxResults };
   const byFrame = frameIndex(frames, plan);
@@ -339,17 +355,34 @@ export function visionPropose({
       gate.warnings.push(`proposal[${idx}] names unknown frameId "${frameId}" (sent: ${[...byFrame.keys()].slice(0, 8).join(', ') || 'none'})`);
     }
 
+    // A confirm whose target is NOT on the books is still an OBSERVATION: the
+    // model is pointing at a part the manifest has no record for — typically a
+    // mesh the geometry heuristics found nothing in, where every rotor arrives
+    // as a "confirm" of an id the model invented from the naming convention.
+    // Dropping those would throw away the only evidence we have; re-routing them
+    // to `new` keeps the trust boundary exactly where it always was — grounding
+    // resolves the nodes, the battery disposes the confidence, a human holds the
+    // verdict. A confirm of a KNOWN id stays a confirm and changes nothing here.
+    let item = p;
+    let convertedFrom = null;
+    if (p && typeof p === 'object' && p.op === 'confirm' && p.targetId && !gate.has(p.targetId)
+      && TYPES.has(p.type) && (p.regionBox || p.regionColors || p.regionColour || p.colors || p.nodeIds)) {
+      convertedFrom = String(p.targetId);
+      item = { ...p, op: 'new' };
+    }
+
     // suggestView is collected BEFORE validation and regardless of outcome: a
     // proposal dropped for bad grounding is the strongest possible argument for
     // spending another frame on that region.
-    const resolved = resolveNodes(p, frame, g, opts, maxBoxNodes);
+    const resolved = resolveNodes(item, frame, g, opts, maxBoxNodes);
     gate.warnings.push(...resolved.warnings);
 
-    const sv = suggestFor(p, resolved.grounding, resolved.names);
+    const sv = suggestFor(item, resolved.grounding, resolved.names);
     if (sv) suggestViews.push({ index: idx, frameId, ...sv });
 
     const uncertainties = [
       ...resolved.uncertainties,
+      ...(convertedFrom ? [`reported as op:"confirm" of "${convertedFrom}", which is not in the current joint map — treated as a NEW proposal and grounded from its region`] : []),
       ...(Array.isArray(p?.uncertainties) ? p.uncertainties.map((u) => String(u).slice(0, 240)) : []),
     ];
 
@@ -386,6 +419,11 @@ export function visionPropose({
           uncertainties.push('spin axis was derived from the shape of the grounded part cloud, not reported by the model');
         }
       }
+      if (!axis && convertedFrom && CONVENTIONAL_AXIS[item.type]) {
+        axis = CONVENTIONAL_AXIS[item.type].slice();
+        axisSource = 'convention';
+        uncertainties.push(`no axis was reported (a "confirm" is never asked for one) and the grounded cloud is too blobby to derive one — assumed the ${item.type} convention [${axis.join(', ')}] that geometry discovery uses; the spin direction needs a human check`);
+      }
     }
     if (!anchor) uncertainties.push('no anchor: the model gave none and grounding produced no parts to centroid');
     if (!axis) uncertainties.push('no axis: the model gave none and the part cloud is not flat enough to derive one');
@@ -405,10 +443,11 @@ export function visionPropose({
       evidence: [
         frameId ? `frame:${frameId}` : null,
         resolved.grounding ? `grounded-by:${resolved.grounding.source}` : null,
+        convertedFrom ? `confirm-converted:${convertedFrom}` : null,
       ].filter(Boolean),
     };
 
-    const verdict = gate.admit({ ...p, anchor, axis }, idx, { names: resolved.names, extra });
+    const verdict = gate.admit({ ...item, anchor, axis }, idx, { names: resolved.names, extra });
     // Which proposals survived, by index. Recovering this from the record ids
     // would mean parsing an id format, so it is reported directly instead — the
     // complement is the audit trail of what we refused and why.

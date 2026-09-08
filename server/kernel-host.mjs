@@ -12,14 +12,14 @@ import {
   discoverJoints, validateController, generateController, repairWithNotes,
   loadThree, toViewerUrl, refreshView, finalizeRun,
 } from '../src/pipeline.mjs';
-import { reopenFromRigidity, runDiscoveryLoop, runL2Round, runVisionCampaign, runMotionRound, applyJointVerdict, amortizeVerdict, MAX_EXTRA_VIEWS, MAX_VISION_ROUNDS, MOTION_ANGLES } from '../src/plugins/discovery/loop.mjs';
+import { reopenFromRigidity, runDiscoveryLoop, runL2Round, runProducerLanes, runVisionCampaign, runMotionRound, applyJointVerdict, amortizeVerdict, MAX_EXTRA_VIEWS, MAX_VISION_ROUNDS, MOTION_ANGLES } from '../src/plugins/discovery/loop.mjs';
 import { saveManifest, saveRevision, listRevisions, loadRevision, latestRevision, diffManifests } from '../src/plugins/discovery/manifest.mjs';
 import { rigidityGate } from '../src/plugins/discovery/tests.mjs';
 import { focusFromManifest, modelRadius, modelTarget, planViews, VIEWPORT } from '../src/plugins/discovery/views.mjs';
 import { AMORTIZABLE, peersOf, symmetryGroups } from '../src/plugins/discovery/symmetry.mjs';
 import {
   MAX_FRAMES_PER_ROUND, framePath, listRounds, loadColorMap, loadRound,
-  saveMotion, savePlan, saveProposals, saveReply,
+  saveExpectation, saveMotion, savePlan, saveProposals, saveReply,
 } from '../src/plugins/discovery/observations.mjs';
 import { createVisionProvider } from '../src/plugins/discovery/vision-provider.mjs';
 import { createSessionStore } from './session-store.mjs';
@@ -88,6 +88,22 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
   // The browser render farm, attached the same way and for the same reason: the
   // server has no WebGL context by design, so a vision round borrows a tab's.
   let farm = null;
+  // Single-flight guard for the chained (auto) refinement: a load must not stack
+  // a second pair of producer lanes on top of one still looking.
+  let autoRunning = false;
+  // Load generation. A vision campaign plans, captures and merges against ONE
+  // project; a reload swaps current.joints/current.manifest for fresh arrays,
+  // so a campaign still in flight would merge into ORPHANED arrays and its save
+  // would then persist the new project's manifest while reporting the old
+  // campaign's additions — a success message about nothing. Every load bumps
+  // this before its first await, and every long-running op compares against the
+  // value it started with.
+  let loadGen = 0;
+  // Server-originated WS push. The events socket decorates the Fastify app with
+  // broadcast(), but the kernel must not reach into the app, so index.mjs hands
+  // the decorated function down the same way it hands down the render farm.
+  let broadcastFn = () => {};
+  const broadcast = (obj) => { try { broadcastFn(obj); } catch { /* a dead socket must never kill a round */ } };
 
   const kernel = {
     host,
@@ -105,6 +121,9 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
 
     // Discover joints for a GLB; caches the parsed mesh for later validate/generate.
     async discover(glbPath) {
+      // Bump BEFORE any await: a campaign in flight must notice the new load the
+      // moment it starts, not after it has already merged and saved.
+      loadGen += 1;
       const d = await discoverJoints(host, glbPath);
       current.glbPath = d.glbPath;
       current.glb = d.stats;
@@ -130,6 +149,7 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
 
     attachAgent(a) { agent = a; },
     attachFarm(f) { farm = f; },
+    attachBroadcast(f) { if (typeof f === 'function') broadcastFn = f; },
 
     // Phase 2: ONE L2 AI-proposal round over the current manifest. Resume
     // semantics — the manifest is not rebuilt, so reopen state and history
@@ -167,6 +187,18 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
       const refuse = (code, error, extra = {}) => ({
         ok: false, added: 0, code, error, manifestUntouched: true, ...extra,
       });
+      const gen = loadGen;
+
+      // A LANE CALL. The orchestrator (autoRefine) runs this method against a
+      // CLONE of the manifest, because two producers that share one array are two
+      // producers that read each other's conclusions — and it owns the ONE save +
+      // revision that follows both lanes. So a lane call writes where it is told
+      // and defers the commit; a direct call (the button, the HTTP route) behaves
+      // exactly as it always did.
+      const lane = opts.lane || null;
+      const defer = !!lane;
+      const manifest = Array.isArray(lane?.manifest) ? lane.manifest : current.manifest;
+      const joints = Array.isArray(lane?.joints) ? lane.joints : current.joints;
 
       // Collect EVERY unmet precondition instead of returning on the first one.
       // Two reasons, and the second is the one that forces it: fixing one thing,
@@ -175,8 +207,24 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
       // headless probe could never prove that half of the wiring is checked at
       // all. Reporting both means one probe proves both.
       const unmet = [];
-      if (!current.glb || !current.manifest) {
+      // A failed geometry pass leaves `current.manifest` null. That is a reason the
+      // TEXT lane has nothing to refine and NO reason for the vision lane to
+      // refuse: an observer that looks at the mesh rather than at another
+      // producer's conclusions has everything it needs, and a mesh whose geometry
+      // pass threw is precisely the mesh that most needs a second opinion. So the
+      // only project precondition is a parsed mesh to render; with no manifest we
+      // adopt an empty one and look anyway.
+      let adoptedEmptyManifest = false;
+      if (!current.glb) {
         unmet.push({ code: 'NO_PROJECT', error: 'no project loaded; POST /api/project first' });
+      } else if (!Array.isArray(current.manifest)) {
+        current.manifest = [];
+        if (!Array.isArray(current.joints)) current.joints = [];
+        adoptedEmptyManifest = true;
+        host.diagnostics.note('vision refine ran with no geometry baseline', {
+          glbPath: current.glbPath,
+          reason: 'the discovery loop left no manifest, so the vision lane started from an empty one',
+        });
       }
       const provider = createVisionProvider(host.config, agent);
       if (!provider.available()) {
@@ -220,7 +268,20 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
       // and a human can see exactly what the second look was bought for.
       const rounds = whole(opts.rounds, 1, MAX_VISION_ROUNDS) ?? MAX_VISION_ROUNDS;
       const extraViews = whole(opts.extraViews, 0, MAX_EXTRA_VIEWS) ?? MAX_EXTRA_VIEWS;
-      const mode = opts.mode === 'all' || opts.mode === 'none' ? opts.mode : 'frontier';
+      // INDEPENDENT LANE. The other producer's conclusions are withheld from the
+      // prompt and stop blocking proposals at the gate (see vision-prompt.mjs and
+      // propose-core.mjs), so this lane reports what it SEES rather than what the
+      // project already believes. Off by default: the manual "refine what is
+      // doubtful" button is a follow-up look and legitimately stands on what is
+      // already known.
+      const independent = opts.independent === true;
+      const askedMode = opts.mode === 'all' || opts.mode === 'none' ? opts.mode : null;
+      // An independent lane plans against the WHOLE model unless told otherwise:
+      // 'frontier' aims the survey at the parts the OTHER producer is unsure
+      // about, and "where should I look" is itself a conclusion this lane must not
+      // inherit. An explicit opts.mode still wins — a caller that asks for both
+      // gets what it asked for rather than a silent override.
+      const mode = askedMode || (independent ? 'none' : 'frontier');
       const viewport = opts.viewport?.w ? opts.viewport : VIEWPORT;
       // An explicit focus list wins (the UI can aim a round at one joint the user
       // is arguing with); otherwise focus is derived from what discovery already
@@ -228,7 +289,7 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
       // "what did we miss entirely" question.
       const focusNames = Array.isArray(opts.focus) && opts.focus.length
         ? new Set(opts.focus.map(String))
-        : (mode !== 'none' ? focusFromManifest(current.glb, current.manifest, current.joints, { mode }) : null);
+        : (mode !== 'none' ? focusFromManifest(current.glb, manifest, joints, { mode }) : null);
 
       const planSpec = {
         maxViews: whole(opts.maxViews, 1, 64) ?? 12,
@@ -246,7 +307,7 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
       // and the observation browser groups by them.
       const drawn = [];
 
-      const res = await runVisionCampaign(current.glb, current.joints, current.manifest, {
+      const res = await runVisionCampaign(current.glb, joints, manifest, {
         plan: () => planViews(current.glb, planSpec),
 
         // The campaign passes its own round index as the fourth argument; that is
@@ -270,6 +331,16 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
             id: entry.id, mode: entry.mode, round: rnd, viewId: entry.viewId ?? view.id,
             url: toViewerUrl(host, runDir, file),
           });
+          // Live beat for the 3D theater: the frame is on disk and URL-addressable
+          // NOW, so the browser can show the exact pixels the model is about to be
+          // handed, at the pose they were drawn from. Emit-only.
+          try {
+            broadcast({
+              kind: 'vision:frame', round: rnd, id: entry.id, mode: entry.mode,
+              viewId: entry.viewId ?? view.id, url: drawn[drawn.length - 1].url,
+              eye: view?.pose?.eye || null, target: view?.pose?.target || null,
+            });
+          } catch { /* a dead socket must never kill a capture */ }
           return {
             ...entry,
             dataBase64: readFileSync(file).toString('base64'),
@@ -278,6 +349,18 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
         },
 
         propose: (text, images) => provider.send(text, images),
+
+        // LIVE progress tap: every observable beat of the campaign is broadcast
+        // over the events WS so the 3D view can animate the look-around as it
+        // happens. Emit-only — the kernel's decisions are unchanged by it.
+        emit: (kind, payload) => { broadcast({ kind, round, ...payload }); },
+
+        // Cancellation, not decoration: a reload mid-campaign orphans the arrays
+        // the merge writes into, so the loop stops spending frames the moment the
+        // project it was aimed at is gone.
+        abort: () => gen !== loadGen,
+
+        independent,
 
         viewport,
         maxFrames: whole(opts.maxFrames, 1, MAX_FRAMES_PER_ROUND),
@@ -318,24 +401,40 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
             frame: () => {},
             reply: (r) => saveReply(runDir, rnd, r),
             proposals: (p) => saveProposals(runDir, rnd, p),
+            // The category prior and its outcome, beside the frames that produced
+            // it: a guess is only auditable if the guess is on the record too.
+            expectation: (x) => saveExpectation(runDir, rnd, x),
           };
         },
       });
 
+      // The merge wrote into the arrays this campaign was handed. If a load
+      // swapped current.* underneath it, those arrays are no longer the served
+      // state: saving now would persist the NEW project's manifest while the
+      // response claims the OLD campaign's additions. Refuse, and let the new
+      // project's own geometry result stand untouched.
+      if (gen !== loadGen) {
+        return refuse('PROJECT_RELOADED', 'the mesh was reloaded while the vision campaign was running; nothing was merged', {
+          rounds: (res.rounds || []).map((x) => ({ round: x.round, ok: x.ok, added: x.added || 0 })),
+        });
+      }
+
       // Only a campaign that actually merged something may write the manifest: a
       // refused round must leave the on-disk record byte-identical, so a human
-      // can trust that a failed button press changed nothing.
-      if (res.ok && res.manifestUntouched === false) {
-        saveManifest(runDir, current.manifest);
+      // can trust that a failed button press changed nothing. A LANE call writes
+      // nothing at all here — the orchestrator commits once, after both lanes.
+      if (!defer && res.ok && res.manifestUntouched === false) {
+        saveManifest(runDir, manifest);
         commitRevision(`vision campaign (${res.roundCount ?? 1} round(s), +${res.added ?? 0} record(s))`);
       }
-      if (res.added) {
+      if (!defer && res.added) {
         sessionStore.setWork({ joints: current.joints.map((j) => ({ id: j.id, label: j.label, type: j.type, nodeCount: (j.nodes || []).length })) });
       }
       host.diagnostics.note('vision refine campaign', {
         round, rounds: res.roundCount, ok: res.ok, code: res.code || null, added: res.added,
         extraViews: res.extraViews, stop: res.stop || null,
         frames: res.frames ?? 0, views: res.views ?? 0, warnings: res.warnings?.length || 0,
+        independent, category: res.expectation?.category || null,
       });
 
       const frameUrls = drawn;
@@ -350,6 +449,7 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
         return {
           ...res, rounds: roundSummary, error: res.reason || res.error || 'the vision round failed',
           round, rendererId, provider: provider.kind, frameUrls, farm: farm.status(),
+          independent, noGeometryBaseline: adoptedEmptyManifest,
         };
       }
       return {
@@ -361,7 +461,181 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
         model: res.model || provider.model(),
         frameUrls,
         farm: farm.status(),
+        independent,
+        // Reported rather than hidden: a run with no geometry baseline produced
+        // every record it has from pixels alone, which is what a human reading the
+        // joint list needs to know before judging one.
+        noGeometryBaseline: adoptedEmptyManifest,
       };
+    },
+
+    // Chained refinement: geometry discovers, then TWO producers look — the JSON
+    // semantic lane and the vision lane — CONCURRENTLY, and neither reads the
+    // other's conclusions. Called fire-and-forget right after a successful load.
+    // It NEVER fails the load: every unmet precondition becomes a skip broadcast
+    // for the lane it belongs to, and the geometry result stands.
+    //
+    // Why one method rather than two fire-and-forget calls: there is exactly ONE
+    // writer of the manifest, ONE save and ONE revision. Two producers merging
+    // concurrently would interleave the physics battery, the node-set dedupe and
+    // the id allocation — all three stateful across a whole batch — and would
+    // leave two revisions describing one change of belief. runProducerLanes hands
+    // each lane a CLONE and applies the deltas serially through mergeProposals;
+    // this method owns the commit that follows.
+    //
+    // The agent boots LAZILY (mode flips stub->live inside its first start()), so
+    // gating on provider.available() up front would always skip on a cold server.
+    // Both lanes therefore await the SAME single boot. The bounded RENDERER wait
+    // gates the VISION lane only, and runs concurrently with that boot: with no
+    // browser tab connected the text lane still runs and still reports, which is
+    // the difference between "vision is unavailable" and "refinement is
+    // unavailable". A boot failure (missing binary, bad patch, quota at handshake)
+    // is a skip carrying the true reason, never a silent no-op.
+    async autoRefine(opts = {}) {
+      if (autoRunning) return { ok: false, code: 'ALREADY_RUNNING' };
+      autoRunning = true;
+      const gen = loadGen;
+      const skip = (code, error) => {
+        broadcast({ kind: 'refine:skip', code, error });
+        return { ok: false, code, error };
+      };
+      try {
+        if (!current.glb) return skip('NO_PROJECT', 'no project loaded; POST /api/project first');
+        // A failed geometry pass leaves the manifest null. That is a reason the
+        // TEXT lane has nothing to refine and no reason to stop LOOKING: both
+        // lanes get an empty baseline and everything they find arrives as a
+        // proposal from pixels or from the node dump alone.
+        if (!Array.isArray(current.manifest)) current.manifest = [];
+        if (!Array.isArray(current.joints)) current.joints = [];
+
+        const bootMs = Number.isFinite(opts.bootMs) ? opts.bootMs : 35000;
+        const waitMs = Number.isFinite(opts.waitMs) ? opts.waitMs : 20000;
+        // ONE boot, awaited by both lanes. Racing it against a deadline keeps a
+        // hung handshake from parking the refinement forever.
+        const boot = Promise.race([
+          (async () => { try { if (agent?.ensureSession) await agent.ensureSession(); } catch (e) { return e; } return null; })(),
+          new Promise((r) => setTimeout(() => r(new Error(`the assistant host did not boot within ${Math.round(bootMs / 1000)}s`)), bootMs)),
+        ]);
+        // Awaited ONLY by the vision lane, so the text lane is never held up by a
+        // browser tab that is slow to announce itself (or never will).
+        const renderer = (async () => {
+          if (!farm) return false;
+          const deadline = Date.now() + waitMs;
+          while (!farm.status()?.ready && Date.now() < deadline) await new Promise((r) => setTimeout(r, 500));
+          return !!farm.status()?.ready;
+        })();
+
+        const wantText = opts.text !== false;
+        const wantVision = opts.vision !== false;
+        const emit = (kind, payload) => { broadcast({ kind, ...payload }); };
+        emit('refine:start', { auto: true, lanes: { text: wantText, vision: wantVision } });
+
+        const res = await runProducerLanes(current.glb, current.joints, current.manifest, {
+          emit,
+          text: wantText ? async (manifest, joints) => {
+            const bootErr = await boot;
+            if (gen !== loadGen) {
+              return { ok: false, code: 'PROJECT_RELOADED', reason: 'the mesh was reloaded while the text lane was starting up', added: 0 };
+            }
+            if (!agent || agent.mode !== 'live') {
+              const error = bootErr?.message || 'the assistant host is not live, so there is no model to ask';
+              emit('text:skip', { code: 'NO_TEXT_AGENT', error });
+              return { ok: false, code: 'NO_TEXT_AGENT', reason: error, added: 0 };
+            }
+            emit('text:start', {});
+            const r = await runL2Round(current.glb, joints, manifest, async (p) => (await agent.send(p)).reply, { emit });
+            emit('text:end', { ok: !r.reason || (r.added ?? 0) > 0, added: r.added ?? 0, reason: r.reason || null });
+            return { ...r, ok: true };
+          } : null,
+          vision: wantVision ? async (manifest, joints) => {
+            const [bootErr, ready] = await Promise.all([boot, renderer]);
+            if (gen !== loadGen) {
+              return { ok: false, code: 'PROJECT_RELOADED', reason: 'the mesh was reloaded while the vision lane was starting up', added: 0 };
+            }
+            if (!ready) {
+              const error = !farm
+                ? 'the render farm is not available on this server'
+                : 'no browser renderer with a loaded model connected in time — open the viewer tab and load the mesh';
+              emit('vision:skip', { code: 'NO_RENDERER', error });
+              return { ok: false, code: 'NO_RENDERER', reason: error, added: 0 };
+            }
+            const provider = createVisionProvider(host.config, agent);
+            if (!provider.available()) {
+              const error = bootErr?.message || provider.reason() || 'no live multimodal model is available';
+              emit('vision:skip', { code: 'NO_VISION_AGENT', error });
+              return { ok: false, code: 'NO_VISION_AGENT', reason: error, added: 0 };
+            }
+            emit('vision:start', { auto: true, independent: true });
+            // LANE MODE: writes into the clone it was handed and defers the save,
+            // because the ONE commit belongs to this method. INDEPENDENT: the
+            // prompt withholds the text lane's conclusions and the gate stops
+            // treating them as a claim on the parts, so agreement between the two
+            // becomes corroboration at reconciliation instead of an echo.
+            return kernel.visionRefine({ rounds: 1, ...opts, lane: { manifest, joints }, independent: true });
+          } : null,
+        });
+
+        // Both lanes merged into CLONES; runProducerLanes applied their deltas to
+        // the real arrays serially. If a load swapped current.* underneath that,
+        // those writes landed in orphaned arrays and saving now would persist the
+        // NEW project's manifest while this response claims the OLD run's
+        // additions — a success message about nothing.
+        if (gen !== loadGen) {
+          emit('refine:end', {
+            ok: false, code: 'PROJECT_RELOADED', added: 0, agreed: 0,
+            text: { added: 0, ok: false }, vision: { added: 0, ok: false },
+          });
+          return {
+            ...res, ok: false, code: 'PROJECT_RELOADED',
+            error: 'the mesh was reloaded while the producers were running; nothing was merged',
+          };
+        }
+
+        const text = res.lanes?.text || null;
+        const vision = res.lanes?.vision || null;
+        // ONE save and ONE revision after BOTH lanes: the change of belief is a
+        // single event, so the history must read as one entry naming both
+        // contributions and how much they agreed.
+        if (!res.manifestUntouched) {
+          saveManifest(runDir, current.manifest);
+          commitRevision(`parallel producers: text +${text?.merged ?? 0}, vision +${vision?.merged ?? 0}, agreed ${res.agreed.length}`);
+          sessionStore.setWork({ joints: current.joints.map((j) => ({ id: j.id, label: j.label, type: j.type, nodeCount: (j.nodes || []).length })) });
+        }
+        host.diagnostics.note('parallel refine', {
+          ok: res.ok, added: res.added, agreed: res.agreed.length,
+          text: text ? { ok: text.ok, added: text.added, merged: text.merged, code: text.code } : null,
+          vision: vision ? { ok: vision.ok, added: vision.added, merged: vision.merged, code: vision.code, frames: vision.frames } : null,
+          category: vision?.expectation?.category || null,
+          warnings: res.warnings?.length || 0,
+        });
+        emit('refine:end', {
+          ok: !!res.ok, added: res.added, agreed: res.agreed.length,
+          text: { added: text?.merged ?? 0, ok: text?.ok ?? false, code: text?.code || null },
+          vision: { added: vision?.merged ?? 0, ok: vision?.ok ?? false, code: vision?.code || null },
+          category: vision?.expectation?.category || null,
+          gaps: vision?.gaps || null,
+        });
+        // The category prior and its outcome ride on the response body: it is the
+        // vision lane's internal business (the text lane never sees it, which is
+        // what keeps the two independent), but a caller pressing the button
+        // deserves to know what the machine was guessed to be and how many of the
+        // expected parts were actually grounded.
+        return {
+          ...res,
+          expectation: vision?.expectation ?? null,
+          expectationUsable: vision?.expectation ? true : false,
+          gaps: vision?.gaps ?? null,
+        };
+      } catch (e) {
+        broadcast({
+          kind: 'refine:end',
+          ok: false, added: 0, agreed: 0, code: 'REFINE_FAILED', reason: e.message,
+          text: { added: 0, ok: false }, vision: { added: 0, ok: false },
+        });
+        return { ok: false, code: 'REFINE_FAILED', error: e.message };
+      } finally {
+        autoRunning = false;
+      }
     },
 
     // Phase 3 task 17: the symmetry peers of one joint, i.e. the joints a verdict

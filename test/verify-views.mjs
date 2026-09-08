@@ -2,7 +2,9 @@
 // set that sees every dynamic-relevant part, headless, in the fewest views?"
 // Four legs, exit 0 only if all of them hold:
 //   A) projection math is a real pinhole camera (centre, orthonormal basis,
-//      behind-camera rejection, frame clipping)
+//      behind-camera rejection, frame clipping) — including the POLES, where a
+//      +Z up hint is parallel to the view direction and the basis would
+//      otherwise degenerate to NaN
 //   B) the coverage unit is the MESH node, not the named container — projecting
 //      named containers lands bboxes in empty space and stalls coverage near 63%
 //   C) greedy set cover converges: high coverage, few views, monotone
@@ -21,7 +23,7 @@ import {
   candidateSpecs, coverageOf, fitDistance, focusFromManifest, kdCells,
   makeCamera, modelRadius, modelTarget, namedIndex, nodeBox, planCloseUps,
   planViews, poseFromSpec, project, projectNode, regionsFromSuggestViews,
-  renderTargets, unfitDistance,
+  renderTargets, surveySpecs, unfitDistance,
 } from '../src/plugins/discovery/views.mjs';
 
 const GLB = 'samples/drone_dji_inspire3.glb';
@@ -63,6 +65,44 @@ const named = namedIndex(g);
   ok('A: rects are clipped inside the frame',
     rect.x0 >= 0 && rect.y0 >= 0 && rect.x1 <= VIEWPORT.w + 1e-9 && rect.y1 <= VIEWPORT.h + 1e-9,
     `${rect.x0.toFixed(0)},${rect.y0.toFixed(0)} \u2192 ${rect.x1.toFixed(0)},${rect.y1.toFixed(0)}`);
+
+  // The omni survey tier needs a TRUE top-down and bottom-up look. At the poles
+  // the conventional up hint (+Z) is parallel to the view direction, so
+  // right = normalize(cross(f, up)) is 0/0 — NaN in every basis vector, and every
+  // regionBox a model draws on that frame would ground to the wrong parts
+  // confidently. The hint is swapped for a horizontal one, and BOTH poles keep
+  // screen-right = +X so a pole frame is not mirrored against the ring frames.
+  const finite = (a) => Array.isArray(a) && a.every(Number.isFinite);
+  const ortho = (cm) => Math.abs(len(cm.f) - 1) < 1e-9 && Math.abs(len(cm.r) - 1) < 1e-9 && Math.abs(len(cm.u) - 1) < 1e-9
+    && Math.abs(dot(cm.f, cm.r)) < 1e-9 && Math.abs(dot(cm.r, cm.u)) < 1e-9 && Math.abs(dot(cm.f, cm.u)) < 1e-9;
+  const R = modelRadius(g);
+  const d = fitDistance(R);
+  const poseAt = (el) => poseFromSpec({ kind: 'survey', azimuth: 0, elevation: el, distance: d }, g);
+  const camAt = (el) => { const p = poseAt(el); return makeCamera(p.eye, p.target, VIEWPORT, p.up); };
+  const topCam = camAt(90);
+  const botCam = camAt(-90);
+  ok('A: a TRUE top-down and bottom-up basis is finite and orthonormal - the pole never degenerates to NaN',
+    finite(topCam.f) && finite(topCam.r) && finite(topCam.u) && ortho(topCam)
+    && finite(botCam.f) && finite(botCam.r) && finite(botCam.u) && ortho(botCam),
+    `top f=${topCam.f.map((v) => v.toFixed(2))} r=${topCam.r.map((v) => v.toFixed(2))}`);
+  ok('A: both poles keep screen-right = +X, so a pole frame is not mirrored against the ring frames',
+    Math.abs(topCam.r[0] - 1) < 1e-9 && Math.abs(botCam.r[0] - 1) < 1e-9
+    && Math.abs(topCam.f[2] + 1) < 1e-9 && Math.abs(botCam.f[2] - 1) < 1e-9
+    && topCam.up.join() === '0,1,0' && botCam.up.join() === '0,-1,0',
+    `top up=${topCam.up} bottom up=${botCam.up}`);
+  ok('A: the up hint is HONOURED off the pole, and swapped only when it is parallel to the look',
+    ortho(camAt(25)) && camAt(25).up.join() === '0,0,1'
+    && makeCamera(poseAt(25).eye, poseAt(25).target, VIEWPORT, [0, 1, 0]).up.join() === '0,1,0');
+  ok('A: a pole frame really looks AT the machine, it does not stare past it',
+    coverageOf(topCam, targets).size > 0 && coverageOf(botCam, targets).size > 0,
+    `top sees ${coverageOf(topCam, targets).size}, bottom ${coverageOf(botCam, targets).size} of ${targets.length}`);
+  ok('A: surveySpecs is truncated from the POLES first, so a short survey is still evenly spread',
+    surveySpecs(g, { count: 6 }).length === 6
+    && surveySpecs(g, { count: 6 }).filter((s) => Math.abs(s.elevation) === 90).length === 2
+    && surveySpecs(g, { count: 3 }).length === 3
+    && surveySpecs(g, { count: 3 }).every((s) => s.kind === 'survey' && Math.abs(s.elevation) !== 90)
+    && surveySpecs(g, { count: 0 }).length === 0,
+    surveySpecs(g, { count: 6 }).map((s) => `${s.azimuth}/${s.elevation}`).join(' '));
 }
 
 // ---- B) mesh nodes, placed by their true world box --------------------------
@@ -111,10 +151,25 @@ const photos = budget.views.filter((v) => v.mode === 'photo');
     `${ms}ms for ${candidateSpecs({ g, targets }).length} candidate poses over ${targets.length} meshes → ${plan.views.length} frames`);
   ok('C: a bounded opaque budget covers most of the model', budget.coverage >= 0.6,
     `${(budget.coverage * 100).toFixed(1)}% — ${budget.covered}/${budget.targets} named nodes in ${photos.length} views`);
-  const marg = photos.map((v) => v.marginal);
-  ok('C: marginal gain never increases (submodular greedy)',
-    marg.every((m, i) => i === 0 || m <= marg[i - 1]), marg.join(' → '));
-  ok('C: every view earns its frame', marg.every((m) => m > 0), `min marginal ${Math.min(...marg)}`);
+  // The plan is now TWO tiers. The survey tier is FORCED — bought because a machine
+  // of unknown type has to be seen from all six sides, not because it maximises
+  // marginal gain — so its marginals are honestly reported and honestly not
+  // monotone. Submodularity is a property of the GREEDY tier, and it is still
+  // asserted there, against the coverage the survey tier had already seeded.
+  const forced = photos.filter((v) => v.spec.kind === 'survey');
+  const greedy = photos.filter((v) => v.spec.kind !== 'survey');
+  const greedyMarg = greedy.map((v) => v.marginal);
+  ok('C: marginal gain never increases within the greedy tier (submodular greedy)',
+    greedyMarg.every((m, i) => i === 0 || m <= greedyMarg[i - 1]),
+    `forced survey ${forced.map((v) => v.marginal).join(' → ')} | greedy ${greedyMarg.join(' → ')}`);
+  ok('C: the survey tier is forced, not chosen — it comes first and stays inside maxViews',
+    forced.length > 0 && photos.slice(0, forced.length).every((v) => v.spec.kind === 'survey')
+    && budget.views.length <= 14,
+    `${forced.length} forced survey pose(s) of ${photos.length} photos`);
+  ok('C: every greedy view earns its frame', greedyMarg.every((m) => m > 0), `min marginal ${Math.min(...greedyMarg)}`);
+  ok('C: a forced survey pose reports what it really added, even when that is little',
+    forced.every((v) => Number.isFinite(v.marginal) && v.marginal >= 0),
+    forced.map((v) => `${v.spec.azimuth}/${v.spec.elevation}:${v.marginal}`).join(' '));
   ok('C: no duplicate poses are selected', new Set(saturated.views.map((v) => v.id)).size === saturated.views.length);
   ok('C: pose distance matches the spec',
     saturated.views.every((v) => Math.abs(Math.hypot(
@@ -365,7 +420,12 @@ const photos = budget.views.filter((v) => v.mode === 'photo');
 // REAL round-1 plan.
 {
   const R = modelRadius(g);
-  const plan1 = planViews(g, { maxViews: 6 });
+  // `survey: 0` on purpose. This section is about turning round 1's DOUBTS back into
+  // round 2 poses, so it needs a round-1 plan made of the greedy cell/ring basis;
+  // with the omni survey tier forced into a 6-view budget every photo is a survey
+  // frame and the only cell left to probe would be a ghost, which is not the frame a
+  // suggestView is ever resolved against.
+  const plan1 = planViews(g, { maxViews: 6, survey: 0 });
   const cell = plan1.views.find((v) => v.spec.kind === 'cell');
   const ring = plan1.views.find((v) => v.spec.kind === 'ring');
   const part = cell.sees[0];

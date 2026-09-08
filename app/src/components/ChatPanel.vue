@@ -145,7 +145,6 @@ onBeforeUnmount(() => { removeEventListener('keydown', onKeydown); });
   <div class="chat">
     <div class="head">
       <span>AI assistant</span>
-      <span class="mode" :title="`agent mode: ${state.agent.mode}`">{{ state.agent.mode }}</span>
     </div>
     <div ref="scroller" class="log" @paste="onPaste">
       <div v-if="!state.transcript.length" class="empty">
@@ -201,7 +200,6 @@ onBeforeUnmount(() => { removeEventListener('keydown', onKeydown); });
 <style scoped>
 .chat { display: flex; flex-direction: column; height: 100%; min-height: 0; }
 .head { display: flex; justify-content: space-between; align-items: center; color: var(--good); font-family: ui-monospace, monospace; font-size: 12px; padding-bottom: 6px; border-bottom: 1px solid var(--border); margin-bottom: 8px; }
-.mode { color: var(--faint); border: 1px solid var(--border-2); border-radius: 5px; padding: 1px 6px; }
 .log { flex: 1; overflow-y: auto; min-height: 0; padding-right: 4px; }
 .empty { color: var(--faint); font-style: italic; font-size: 12px; padding: 8px 2px; }
 .msg { display: flex; margin: 6px 0; }

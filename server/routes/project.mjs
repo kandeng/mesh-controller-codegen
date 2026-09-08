@@ -43,6 +43,14 @@ export function projectRoutes(app, kernel) {
     if (!glb) return reply.code(400).send({ error: 'body.glb required (repo-relative or absolute path)' });
     try {
       const d = await kernel.discover(glb);
+      // Chained refinement: the geometry pass answers in milliseconds, then TWO
+      // producers look at the result CONCURRENTLY and independently — the JSON
+      // semantic lane (the node dump) and the vision lane (rendered frames) —
+      // streaming their progress over the events WS and reconciled into ONE
+      // revision. Fire-and-forget and self-guarding: a load never waits on it, and
+      // a lane with no model or no renderer broadcasts its own skip while the
+      // other lane carries on, so the geometry result always stands.
+      if (kernel.autoRefine) setImmediate(() => { kernel.autoRefine().catch(() => {}); });
       return {
         ok: true,
         glb: d.glbPath,

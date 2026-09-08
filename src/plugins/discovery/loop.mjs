@@ -22,6 +22,11 @@ import { buildProposalPrompt } from './context.mjs';
 import { aiPropose } from './ai-propose.mjs';
 import { MAX_VISION_FRAMES, buildVisionPrompt } from './vision-prompt.mjs';
 import { visionPropose } from './vision-propose.mjs';
+import {
+  buildExpectationPrompt, expectationBrief, expectationGap, expectationIsUsable,
+  parseExpectation, verifiedInstances,
+} from './expectation.mjs';
+import { regionsFromExpectations } from './grounding.mjs';
 import { buildMotionPrompt, MAX_MOTION_FRAMES } from './motion-prompt.mjs';
 import { motionAssess } from './motion-propose.mjs';
 import { VIEWPORT, modelRadius, modelTarget, namedIndex, nodeBox, planCloseUps, regionsFromSuggestViews, renderTargets } from './views.mjs';
@@ -79,8 +84,19 @@ function mergeProposals(g, joints, manifest, { records, confirms, confirmTag = '
   for (const c of confirms || []) {
     const t = manifest.find((r) => r.id === c.targetId);
     if (!t) continue;
-    t.evidence.push(confirmTag);
-    t.confidence = Math.min(AUTO_ACCEPT_CONFIDENCE - 0.01, t.confidence + 0.05);
+    // A confirm may name its OWN tag, because corroboration has a provenance a
+    // reader needs: 'l2-vision-confirm' says the vision producer agreed with the
+    // project, 'cross-producer:L2-vision' says it agreed with the TEXT producer.
+    // Both go through this one path, so both are capped identically.
+    t.evidence.push(c.tag || confirmTag);
+    // A corroboration may only ever LIFT. The cap keeps confirms below the
+    // auto-accept threshold (physics alone crosses it), but applying min() to a
+    // record physics already lifted would DEMOTE an auto-accepted joint to
+    // needs-verdict — the model saying "yes, that one is real" must never cost
+    // the record the status the battery earned it.
+    if (t.confidence < AUTO_ACCEPT_CONFIDENCE) {
+      t.confidence = Math.min(AUTO_ACCEPT_CONFIDENCE - 0.01, t.confidence + 0.05);
+    }
     t.status = deriveStatus(t);
   }
 
@@ -121,7 +137,13 @@ function mergeProposals(g, joints, manifest, { records, confirms, confirmTag = '
 // (kernel wires the DSH supervisor; tests inject canned replies). Proposals
 // merge as candidates; only deterministic corroboration lifts a proposal to
 // auto-accept (0.80, zero warnings) — never the model's own say-so.
-export async function runL2Round(g, joints, manifest, l2) {
+//
+// `emit` is the same live tap the vision round has: `text:ask` carries the prompt
+// verbatim and `text:reply` the answer verbatim, so this lane narrates itself in
+// the chat exactly the way the vision lane does. Emit-only — it can watch the
+// round but never alter it.
+export async function runL2Round(g, joints, manifest, l2, { emit = null } = {}) {
+  const say = typeof emit === 'function' ? emit : () => {};
   const warnings = [];
   const uncertain = manifest.filter((r) => r.status === 'needs-verdict');
   if (!uncertain.length) return { added: 0, reason: 'frontier empty', warnings };
@@ -130,16 +152,198 @@ export async function runL2Round(g, joints, manifest, l2) {
   try {
     const focusIds = new Set(uncertain.flatMap((r) => r.nodes));
     const prompt = buildProposalPrompt({ g, manifest, focusIds });
-    parsed = aiPropose({ reply: await l2(prompt), g, manifest });
+    say('text:ask', { frontier: uncertain.length, prompt });
+    const reply = await l2(prompt);
+    say('text:reply', { reply: reply ?? null });
+    parsed = aiPropose({ reply, g, manifest });
   } catch (e) {
     return { added: 0, warnings: [`L2 round failed (manifest untouched): ${e.message}`] };
   }
   warnings.push(...parsed.warnings);
+  say('text:propose', {
+    entries: (parsed.records || []).map((r) => ({ id: r.id, type: r.type, nodes: (r.nodes || []).slice(0, 12) })),
+  });
 
   const merged = mergeProposals(g, joints, manifest, {
     records: parsed.records, confirms: parsed.confirms,
   });
-  return { added: merged.added, proposals: merged.proposals, warnings };
+  say('text:verdict', { added: merged.added ?? 0, proposals: merged.proposals || [] });
+  return {
+    added: merged.added, proposals: merged.proposals, confirms: parsed.confirms.length,
+    manifestUntouched: false, warnings,
+  };
+}
+
+// ---- parallel producer lanes -------------------------------------------------
+//
+// Two producers that do not read each other's conclusions, and ONE writer. Both
+// halves matter and they pull in opposite directions:
+//
+//   INDEPENDENCE  a producer shown the other's output agrees with it. That is how
+//                 the air3 round produced four `confirm`s of ids another pass had
+//                 invented and one observation of its own: the prompt told the
+//                 model those ids existed and were accepted, so it spent its
+//                 proposal budget nodding. Two producers that can see each other
+//                 are one producer with an echo.
+//   ONE WRITER    two lanes merging into one array concurrently would interleave
+//                 the battery, the node-set dedupe and the id allocation — all
+//                 three of which are stateful across a whole batch.
+//
+// So each lane runs against a CLONE and the clones are diffed afterwards; the
+// deltas are applied to the real arrays SERIALLY, through mergeProposals, which
+// stays the only code in the system that writes a record. Both lanes are I/O bound
+// (one text turn against a render plus two vision turns), so they overlap; only
+// the merge is serial, and the merge is milliseconds.
+//
+// What a delta can express, and why that is enough:
+//   - a record the clone has and the baseline does not  → add it
+//   - a confirm tag the clone added to a PRE-EXISTING record → re-apply it through
+//     the confirm path, so the only-ever-LIFTS rule stays in one place
+//   - a split: the target's nodes shrank in the clone, but the split RECORD that
+//     caused it carries `splitFrom`, so re-applying the record reproduces the
+//     subtraction exactly once against the real target
+// Everything else (confidence, status, tests) is deliberately NOT carried over:
+// mergeProposals re-runs the battery on the real merged state, and `isolation` is
+// a cross-joint test — a score computed inside one lane's private copy would be
+// about a world that no longer exists.
+function laneDelta(base, after) {
+  const baseById = new Map((base || []).map((r) => [r.id, r]));
+  const records = [];
+  const confirms = [];
+  const ignored = [];
+  for (const rec of after || []) {
+    const b = baseById.get(rec?.id);
+    if (!b) { if (rec) records.push(rec); continue; }
+    const had = new Set(b.evidence || []);
+    for (const tag of (rec.evidence || []).filter((t) => !had.has(t))) {
+      if (/confirm/.test(String(tag))) confirms.push({ targetId: rec.id, tag: String(tag) });
+      else ignored.push(`${rec.id}: evidence "${tag}" was not carried across lanes`);
+    }
+  }
+  return { records, confirms, ignored };
+}
+
+// Reconcile ONE lane's delta against what the manifest says NOW — which, for the
+// second lane, includes what the first lane just added.
+//
+// Identity is the NODE SET, not the id and not the type: two producers that found
+// the same part are two producers that found the same part, however they named it
+// and whichever motion they guessed for it. Admitting both would leave two records
+// over one node set, and `isolation` would then fail both forever — a permanent
+// amber pair no human can dispose of without deleting one by hand.
+//
+// So the second claim becomes CORROBORATION of the first, routed through the
+// confirm path with a `cross-producer:` tag. That path only ever LIFTS confidence
+// and can never cross the auto-accept threshold on its own, which is the whole
+// point: agreement between two producers is evidence, and physics plus a human
+// still decide.
+export function reconcileLanes(manifest, delta, { origin = null, tag = null } = {}) {
+  const key = (nodes) => [...(nodes || [])].sort().join('|');
+  const bySet = new Map();
+  for (const r of manifest || []) if (r?.id) bySet.set(key(r.nodes), r);
+  const records = [];
+  const confirms = [...(delta?.confirms || [])];
+  const agreed = [];
+  for (const rec of delta?.records || []) {
+    if (!rec?.nodes?.length) continue;
+    const hit = bySet.get(key(rec.nodes));
+    if (hit) {
+      confirms.push({
+        targetId: hit.id,
+        tag: tag || `cross-producer:${origin || 'unknown'}`,
+      });
+      agreed.push({
+        id: hit.id, nodes: (rec.nodes || []).length, from: origin || null,
+        discardedId: rec.id,
+        // Reported, never reconciled away: a type disagreement between producers
+        // is exactly the kind of thing a human should see, and picking one
+        // silently would be a third producer with no evidence.
+        typeMismatch: hit.type !== rec.type ? { kept: hit.type, lane: rec.type } : null,
+      });
+      continue;
+    }
+    records.push(rec);
+    bySet.set(key(rec.nodes), rec);
+  }
+  return { records, confirms, agreed };
+}
+
+// Run both lanes. `text` and `vision` are async callables handed the CLONES they
+// may write into — `(manifest, joints) => result` — and either may be omitted, so
+// a server with no renderer connected still runs the text lane and reports.
+//
+// A lane that THROWS does not take the other down with it (Promise.allSettled):
+// one producer being unavailable is the normal case, not an error, and the whole
+// design premise is that each stands alone.
+export async function runProducerLanes(g, joints, manifest, { text = null, vision = null, emit = null } = {}) {
+  const say = typeof emit === 'function' ? emit : () => {};
+  const warnings = [];
+  const lanes = [
+    { name: 'text', origin: 'L2-ai', run: text },
+    { name: 'vision', origin: 'L2-vision', run: vision },
+  ].filter((l) => typeof l.run === 'function');
+  if (!Array.isArray(manifest)) return { ok: false, code: 'NO_MANIFEST', error: 'no manifest to merge into', lanes: {}, added: 0, agreed: [] };
+
+  const snapshot = () => ({
+    manifest: structuredClone(manifest),
+    joints: structuredClone(Array.isArray(joints) ? joints : []),
+  });
+  // The baseline every delta is measured against. Taken ONCE, before any lane
+  // runs: a lane must be diffed against the state it was handed, not against the
+  // state the other lane left behind.
+  const base = snapshot();
+
+  const settled = await Promise.allSettled(lanes.map(async (lane) => {
+    const copy = snapshot();
+    const res = await lane.run(copy.manifest, copy.joints);
+    return { lane, res, copy };
+  }));
+
+  const perLane = {};
+  const agreed = [];
+  let added = 0;
+  settled.forEach((s, i) => {
+    const lane = lanes[i];
+    if (s.status !== 'fulfilled') {
+      perLane[lane.name] = { ok: false, added: 0, error: s.reason?.message || String(s.reason) };
+      warnings.push(`the ${lane.name} lane failed: ${perLane[lane.name].error}`);
+      return;
+    }
+    const res = s.value?.res ?? null;
+    const delta = laneDelta(base.manifest, s.value.copy.manifest);
+    warnings.push(...delta.ignored.map((w) => `${lane.name} lane: ${w}`));
+    // Applied SERIALLY, in lane order, against the real arrays — so the second
+    // lane is reconciled against what the first one actually added.
+    const recon = reconcileLanes(manifest, delta, { origin: lane.origin });
+    const merged = mergeProposals(g, joints, manifest, {
+      records: recon.records, confirms: recon.confirms,
+    });
+    agreed.push(...recon.agreed);
+    added += merged.added || 0;
+    perLane[lane.name] = {
+      ok: res?.ok !== false,
+      added: (delta.records?.length || 0),
+      merged: merged.added || 0,
+      corroborated: recon.agreed.length,
+      confirms: (delta.confirms?.length || 0) + recon.agreed.length,
+      code: res?.code || null,
+      reason: res?.reason || null,
+      frames: res?.frames ?? null,
+      expectation: res?.expectation ?? null,
+      gaps: res?.gaps ?? null,
+    };
+    say('lane:merged', { lane: lane.name, origin: lane.origin, ...perLane[lane.name] });
+  });
+
+  return {
+    ok: added > 0 || agreed.length > 0 || Object.values(perLane).some((l) => l.ok),
+    added,
+    agreed,
+    lanes: perLane,
+    proposals: (manifest || []).slice(base.manifest.length).map((r) => r.id),
+    manifestUntouched: added === 0 && agreed.length === 0,
+    warnings,
+  };
 }
 
 // Reopen edge, controller stage: map each failing declared motion set to the
@@ -176,42 +380,59 @@ export function reopenFromRigidity(manifest, rigidity) {
 // many of them were new). Only `sees` is a list, so it is what a focused frame is
 // aimed with.
 //
-// Four allocations, in order of what a frame is worth:
+// Five allocations, in order of what a frame is worth:
 //
-//  1. ORIENTATION — whole-model photos first. A cropped region is uninterpretable
-//     without one; the model has to know where in the machine it is looking.
-//  2. MASK PAIRS on the TIGHTEST views. A colorId mask is the only channel that
-//     grounds EXACTLY, so it earns half the budget — but only where it is usable:
-//     a cell view frames ~12-20 parts, so its legend is readable and every colour
-//     resolves. A whole-model ring would paint all ~345 named parts and the legend
-//     would be noise. Tightest-first, because readability is what makes the exact
-//     channel actually exact in practice.
+//  1. SURVEY — the omni tier the planner FORCED (front/right/back/left at 25°,
+//     plus a true top-down and a true bottom-up). It goes first and it is
+//     guaranteed inside the cap, because it is the only allocation that answers
+//     "what machine is this" rather than "which node have we not seen yet": the
+//     category turn reads exactly these frames, and a machine nobody has looked at
+//     from underneath has not been surveyed whatever its coverage number says.
+//  2. ORIENTATION — further whole-model photos. A cropped region is
+//     uninterpretable without one; the model has to know where in the machine it is
+//     looking. The survey tier usually satisfies this already, so whatever the cap
+//     has left is what this buys.
+//  3. MASK PAIRS on the TIGHTEST views. A colorId mask is the only channel that
+//     grounds EXACTLY, so it earns a share of the budget — but only where it is
+//     usable: a cell view frames ~12-20 parts, so its legend is readable and every
+//     colour resolves. A whole-model survey would paint all ~345 named parts and
+//     the legend would be noise. Tightest-first, because readability is what makes
+//     the exact channel actually exact in practice.
 //     THE PAIRING IS THE POINT: the mask and the photo share ONE pose, because
 //     reconcile() compares the box a model draws against the colours it reads, and
 //     that comparison means nothing across two different cameras.
-//  3. GHOSTS — the only route to interior-only parts, which no opaque pose can
+//  4. GHOSTS — the only route to interior-only parts, which no opaque pose can
 //     ever show. A ghost with no focus list draws everything opaque, which is an
 //     ordinary photo and not a ghost at all, so `sees` is mandatory here and a
 //     ghost that sees nothing is skipped rather than shot.
-//  4. FILL — whatever budget remains buys plain photos in the planner's own
+//  5. FILL — whatever budget remains buys plain photos in the planner's own
 //     marginal-gain order, skipping poses already shot.
-export const SHOT_BUDGET = { maskPairs: 3, ghostFrames: 2, orientation: 2 };
+//
+// The budget is over-allocated by design (6 + 2x2 + 1 + 2 = 13 against a 12-frame
+// cap) and the cap resolves it from the bottom: the survey tier is never what gets
+// dropped, the second orientation frame is. Trading mask pairs 3→2 and ghosts 2→1
+// for a coherent whole-machine view set is the deliberate part of that bargain —
+// exact-colour grounding loses a little coverage and the round gains a machine it
+// can actually recognise.
+export const SHOT_BUDGET = { survey: 6, maskPairs: 2, ghostFrames: 1, orientation: 2 };
 
 // A pose fitted to a PART-SIZED region rather than to the whole model: the kd cell
 // pass of round 1, and the close-ups round 2 aims at a suggestView. Only these can
 // carry a mask, because only these frame few enough parts for a legend to be
 // readable — and readability is what makes the exact channel actually exact.
+// 'survey' is deliberately NOT here: a whole-machine mask legend is unreadable.
 const TIGHT_KINDS = new Set(['cell', 'close-up']);
 
 export function selectShots(views, {
   maxFrames = MAX_VISION_FRAMES, ...budget
 } = {}) {
-  const { maskPairs, ghostFrames, orientation } = { ...SHOT_BUDGET, ...budget };
+  const { survey, maskPairs, ghostFrames, orientation } = { ...SHOT_BUDGET, ...budget };
   const all = (views || []).filter((v) => v && Array.isArray(v.pose?.eye));
   const ghosts = all.filter((v) => v.mode === 'ghost');
   const photos = all.filter((v) => v.mode !== 'ghost');
   const cells = photos.filter((v) => TIGHT_KINDS.has(v.spec?.kind));
-  const rings = photos.filter((v) => !TIGHT_KINDS.has(v.spec?.kind));
+  const surveys = photos.filter((v) => v.spec?.kind === 'survey');
+  const rings = photos.filter((v) => v.spec?.kind !== 'survey' && !TIGHT_KINDS.has(v.spec?.kind));
   const cap = Math.max(1, maxFrames | 0);
   const sees = (v) => (Array.isArray(v.sees) && v.sees.length ? v.sees.map(String) : null);
 
@@ -227,6 +448,7 @@ export function selectShots(views, {
     return true;
   };
 
+  for (const v of surveys.slice(0, Math.max(0, survey | 0))) push(v, 'photo', null);
   for (const v of rings.slice(0, Math.max(0, orientation | 0))) push(v, 'photo', null);
 
   // Tightest first; ties keep the planner's marginal-gain order.
@@ -276,6 +498,7 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
     plan: planEffect = null, capture = null, propose = null,
     frames: preset = null, persist = null,
     maxFrames = MAX_VISION_FRAMES, viewport = VIEWPORT,
+    survey = SHOT_BUDGET.survey,
     maskPairs = SHOT_BUDGET.maskPairs, ghostFrames = SHOT_BUDGET.ghostFrames,
     orientation = SHOT_BUDGET.orientation,
     // The ABSOLUTE round directory this round's frames were written to. Stamped
@@ -284,7 +507,28 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
     // r<N>/ holds the pixels behind a claim. Null (the default) leaves the
     // records unstamped and the browser falls back to a scan.
     evidenceRound = null,
+    // Optional LIVE progress tap: emit(kind, payload) at each observable beat
+    // (plan / frame / ask / reply / propose / verdict). Emit-only — it can watch
+    // the round but never alter it, so a caller that streams progress to a browser
+    // and a caller that runs headless exercise identical logic.
+    emit = null,
+    // Optional cancellation predicate. A vision round plans and captures against
+    // ONE project; if the caller's project changed underneath it (a reload),
+    // every further frame and every merge would be about a mesh nobody asked
+    // about. Checked at each phase boundary, never mid-await.
+    abort = null,
+    // Ask WHAT KIND OF MACHINE this is before asking what moves on it, over the
+    // same frames (see expectation.mjs). Off by default so a single manual round
+    // stays one turn; the campaign switches it on for round 1, which is the only
+    // round with a survey tier to read a category from.
+    expectation: wantExpectation = false,
+    // Run this lane as an INDEPENDENT observer: the prompt withholds the other
+    // producer's conclusions and the gate stops treating a geometry or text guess
+    // as a claim on the parts. Two producers agreeing then reconciles into one
+    // record instead of one dropped proposal.
+    independent = false,
   } = effects || {};
+  const say = typeof emit === 'function' ? emit : () => {};
 
   // One shape for every failure, always carrying the reason and always stating
   // that nothing was mutated — the caller must never have to guess.
@@ -294,6 +538,7 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
 
   if (!g?.nodes?.length) return bail('no parse table to ground against', 'NO_PROJECT');
   if (!Array.isArray(manifest)) return bail('no manifest to merge into', 'NO_MANIFEST');
+  if (typeof abort === 'function' && abort()) return bail('the project changed while this round was starting', 'PROJECT_RELOADED');
 
   // 1. PLAN ---------------------------------------------------------------
   let plan = null;
@@ -308,9 +553,14 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
     return bail('no views planned', 'NO_VIEWS');
   }
   persist?.plan?.(plan);
+  say('vision:plan', {
+    views: (plan.views || []).map((v) => ({
+      id: v.id, mode: v.mode || null, eye: v.pose?.eye || null, target: v.pose?.target || null,
+    })),
+  });
 
   // 2. CAPTURE ------------------------------------------------------------
-  const shots = selectShots(plan.views, { maxFrames, maskPairs, ghostFrames, orientation });
+  const shots = selectShots(plan.views, { maxFrames, survey, maskPairs, ghostFrames, orientation });
   let captured = [];
   if (Array.isArray(preset) && preset.length) {
     captured = preset.filter((f) => f?.dataBase64);
@@ -323,6 +573,7 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
       return bail('no capture effect is wired — a browser renderer must be connected', 'NO_RENDERER');
     }
     for (const shot of shots) {
+      if (typeof abort === 'function' && abort()) return bail('the project changed while this round was capturing', 'PROJECT_RELOADED');
       let f = null;
       try {
         f = await capture(shot.view, shot.mode, shot.focusNodes);
@@ -343,11 +594,104 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
     }
   }
   if (!captured.length) return bail('no frames were captured', 'NO_FRAMES');
+  if (typeof abort === 'function' && abort()) return bail('the project changed before the model was asked', 'PROJECT_RELOADED');
 
-  // 3. PROMPT + TURN ------------------------------------------------------
+  // 3. CATEGORY PRIOR — turn A ---------------------------------------------
+  //
+  // Two turns, one round, ONE set of frames: the prior is read from the survey
+  // photos the discovery turn is about to be shown, so nothing extra is rendered
+  // for it. This turn asks what kind of machine this is and what a machine of
+  // that kind usually moves; the next asks for the joints themselves, with this
+  // answer attached as a hypothesis to FALSIFY.
+  //
+  // It may fail, and when it does the round carries on exactly as it did before
+  // this lane existed — no hypothesis block, no expectation-aimed round 2. A
+  // prior is an optimisation, never a dependency: bailing out here would make a
+  // guess load-bearing, which is the one thing this module is designed not to be.
+  //
+  // The boundary is structural, not disciplinary. Nothing parsed here is ever
+  // handed to mergeProposals; it reaches turn B as TEXT and round 2 as a PLACE
+  // TO AIM, and that is all.
+  let expectation = null;
+  let gapsAtAsk = [];
+  if (wantExpectation) {
+    if (typeof propose !== 'function') {
+      warnings.push('category turn: asked for, but no vision provider is wired — the round carries on with no prior');
+    } else {
+      const ep = buildExpectationPrompt({ frames: captured, g, viewport });
+      const expWarnings = ep.warnings.map((w) => `category turn: ${w}`);
+      let expReply = null;
+      let expModel = null;
+      if (!ep.text) {
+        expWarnings.push('category turn: no whole-machine photo to read a category from, so no prior was asked for');
+      } else {
+        const e0 = Date.now();
+        try {
+          const et = await propose(ep.text, ep.images);
+          expReply = et?.reply ?? null;
+          expModel = et?.model ?? null;
+          const parsedExp = parseExpectation(expReply, { frameIds: (ep.frames || []).map((f) => f.id) });
+          expWarnings.push(...parsedExp.warnings.map((w) => `category turn: ${w}`));
+          expectation = parsedExp.expectation;
+          // parseExpectation hands back an empty sentinel for a reply it could not
+          // read at all. Reported as null rather than as a blank object, so a
+          // caller cannot mistake "the model said nothing usable" for "the model
+          // described a machine with no moving parts".
+          if (!expectation.category && !(expectation.instances || []).length) expectation = null;
+          // Gaps AT ASK TIME: the prior against what the project already believes
+          // BEFORE this round adds anything. That is the comparison turn B can act
+          // on ("3 of the 4 rotors it expects are already on the books — find the
+          // missing one"), and it is deliberately not the number reported at the
+          // end of the round.
+          gapsAtAsk = expectationGap(expectation, manifest);
+        } catch (err) {
+          expectation = null;
+          gapsAtAsk = [];
+          expWarnings.push(`category turn: the model call failed (${err.message}) — the round carries on with no prior`);
+        }
+        // Persisted even when it failed or was refused: "we guessed X and the
+        // guess was unusable" is part of the audit trail, and a round whose prior
+        // left no file is indistinguishable from a round that never asked.
+        persist?.expectation?.({
+          prompt: { text: ep.text, frames: ep.frames, images: ep.images.length },
+          reply: expReply, expectation, gaps: gapsAtAsk,
+          model: expModel, ms: Date.now() - e0, warnings: expWarnings,
+        });
+      }
+      warnings.push(...expWarnings);
+      say('vision:expect', {
+        usable: expectationIsUsable(expectation),
+        category: expectation?.category || null,
+        confidence: expectation?.confidence ?? null,
+        summary: expectation?.summary || null,
+        instances: (expectation?.instances || []).map((ins) => ({
+          type: ins.type, count: ins.count, frameId: ins.frameId,
+          regionBox: ins.regionBox, symmetry: ins.symmetry || null, note: ins.note || null,
+        })),
+        gaps: gapsAtAsk,
+        doubts: expectation?.doubts || [],
+        alternatives: expectation?.alternatives || [],
+        // The verbatim exchange rides along so the chat can narrate this turn the
+        // way it narrates the discovery one: a guess the loop is about to test is
+        // only auditable if a human can read what was asked and what came back.
+        prompt: ep.text, reply: expReply, model: expModel,
+        warnings: expWarnings,
+      });
+    }
+  }
+
+  // 4. PROMPT + TURN — turn B, the discovery turn ---------------------------
   const t0 = Date.now();
-  const prompt = buildVisionPrompt({ manifest, frames: captured, plan, maxFrames });
+  const prompt = buildVisionPrompt({
+    manifest, frames: captured, plan, maxFrames, g, viewport,
+    // The prior as TEXT to falsify, never as records to agree with. Empty when
+    // the category turn did not run, failed, or was not usable — which leaves the
+    // prompt exactly as this round built it before the lane existed.
+    hypothesis: expectationBrief(expectation, gapsAtAsk),
+    independent,
+  });
   warnings.push(...prompt.warnings);
+  say('vision:ask', { frames: captured.length, prompt: prompt.text });
 
   if (typeof propose !== 'function') {
     warnings.push('no propose effect was supplied, so no model was asked; the kernel must wire a live vision provider');
@@ -377,21 +721,33 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
     warnings,
   };
   persist?.reply?.(replyRecord);
+  say('vision:reply', { model: turn?.model ?? null, reply: turn?.reply ?? null });
 
-  // 4. GROUND + VALIDATE --------------------------------------------------
+  // 5. GROUND + VALIDATE --------------------------------------------------
   const parsed = visionPropose({
-    reply: turn?.reply || '', g, manifest, frames: captured, plan, viewport,
+    reply: turn?.reply || '', g, manifest, frames: captured, plan, viewport, independent,
   });
   warnings.push(...parsed.warnings);
+  say('vision:propose', {
+    entries: (parsed.records || []).map((r) => ({
+      id: r.id, label: r.label || null, anchor: r.anchor || null, axis: r.axis || null,
+      nodes: (r.nodes || []).slice(0, 12),
+    })),
+  });
 
   const survivors = new Set(parsed.admitted.map((a) => a.index));
   const rejected = parsed.grounded
     .filter((e) => !survivors.has(e.index))
     .map((e) => ({ index: e.index, frameId: e.frameId, names: e.names, grounding: e.grounding, uncertainties: e.uncertainties }));
 
-  // 5. MERGE + BATTERY ----------------------------------------------------
+  // 6. MERGE + BATTERY ----------------------------------------------------
   const merged = mergeProposals(g, joints, manifest, {
     records: parsed.records, confirms: parsed.confirms, confirmTag: 'l2-vision-confirm',
+  });
+  say('vision:verdict', {
+    added: merged.added ?? 0,
+    proposals: merged.proposals || [],
+    rejected: rejected.map((r) => ({ index: r.index, names: r.names })),
   });
 
   // Stamp the evidence round onto exactly the records this round added. Written
@@ -432,6 +788,17 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
     // What round 2 should aim at. Persisted as well, so the active loop can be
     // resumed from disk with no model and no browser attached.
     suggestViews: parsed.suggestViews,
+    // The category prior and what came of it. `gaps` is recomputed AFTER the
+    // merge, so it compares the guess against what the project now believes —
+    // including anything geometry found before vision ever looked — while
+    // `gapsAtAsk` (the beat, the persisted file) is what turn B was shown.
+    // `expectationVerified` lists the instances the discovery turn already
+    // pointed at, so round 2 does not spend a close-up re-answering a settled
+    // question.
+    expectation,
+    expectationUsable: expectationIsUsable(expectation),
+    gaps: expectation ? expectationGap(expectation, manifest) : null,
+    expectationVerified: expectation ? verifiedInstances(expectation, parsed.grounded) : null,
     model: turn?.model ?? null,
     ms: Date.now() - t0,
     manifestUntouched: false,
@@ -478,6 +845,7 @@ const declaredDoubts = (round) => [
 export async function runVisionCampaign(g, joints, manifest, effects = {}) {
   const e = effects || {};
   const warnings = [];
+  const say = typeof e.emit === 'function' ? e.emit : () => {};
 
   const askedRounds = Number.isFinite(e.rounds) ? Math.max(1, Math.floor(e.rounds)) : MAX_VISION_ROUNDS;
   const maxRounds = Math.min(MAX_VISION_ROUNDS, askedRounds);
@@ -522,9 +890,24 @@ export async function runVisionCampaign(g, joints, manifest, effects = {}) {
   let prev = null;
   let prevPlan = null;
   let prevFrames = [];
+  // Round 1's category prior, kept for round 2's aim list only. It is NOT part of
+  // `prev` because `prev` is a round result and this is a hypothesis about a
+  // category: the two have different lifetimes and different consumers.
+  let prevExpectation = null;
   let stop = null;
+  let aborted = false;
 
   for (let r = 0; r < maxRounds; r += 1) {
+    // A campaign is about ONE project. If the mesh was reloaded while it ran,
+    // stop spending frames immediately: the merge at the end would write into
+    // arrays that are no longer the served state, and the save would then
+    // persist the NEW project's manifest while reporting the OLD campaign's
+    // additions — a success message about nothing.
+    if (typeof e.abort === 'function' && e.abort()) {
+      stop = 'the project was reloaded while the campaign was running';
+      aborted = true;
+      break;
+    }
     let resolution = null;
     let basePlan = e.plan;
     const room = extraBudget - extraSpent;
@@ -540,6 +923,44 @@ export async function runVisionCampaign(g, joints, manifest, effects = {}) {
       });
       for (const u of resolution.unresolved) warnings.push(`round ${r + 1}: could not aim at "${u.target}" — ${u.why}`);
       for (const s of resolution.skipped) warnings.push(`round ${r + 1}: ${s.id} not aimed at — ${s.why}`);
+
+      // THE OTHER HALF OF THE AIM LIST. The prior's UNVERIFIED places join the
+      // suggestView regions, and they are added second so a place the model itself
+      // asked to see again always wins the budget over a place a category says
+      // should exist. Both are resolved by the same grounding channel, deduped by
+      // the PARTS they resolved to rather than by box: two regions over the same
+      // nodes are one close-up, and buying both would photograph the same
+      // ambiguity from two nearby bearings.
+      if (prevExpectation?.expectation) {
+        const room2 = maxRegions - resolution.regions.length;
+        if (room2 > 0) {
+          const ex = regionsFromExpectations(g, prevExpectation.expectation, {
+            plan: prevPlan, frames: prevFrames,
+            verified: prevExpectation.verified, gaps: prevExpectation.gaps,
+            maxRegions: room2, viewport,
+          });
+          for (const u of ex.unresolved) {
+            warnings.push(`round ${r + 1}: could not aim at the ${u.type ?? 'expected'} place the category prior named — ${u.why}`);
+          }
+          for (const s of ex.skipped) {
+            warnings.push(`round ${r + 1}: category prior region ${s.index ?? '?'} (${s.type ?? '?'}) not aimed at — ${s.why}`);
+          }
+          const have = new Set(resolution.regions.map((rg) => [...(rg.names || [])].sort().join('|')));
+          for (const rg of ex.regions) {
+            const key = [...(rg.names || [])].sort().join('|');
+            if (have.has(key)) {
+              warnings.push(`round ${r + 1}: the category prior pointed at the same parts as "${rg.id}" — one close-up covers both`);
+              continue;
+            }
+            if (resolution.regions.length >= maxRegions) {
+              warnings.push(`round ${r + 1}: ${rg.id} not aimed at — the ${maxRegions}-region cap was already full`);
+              break;
+            }
+            have.add(key);
+            resolution.regions.push(rg);
+          }
+        }
+      }
       if (!resolution.regions.length) { stop = 'nothing round 1 asked for resolved to a place to look'; break; }
       basePlan = () => planCloseUps(g, resolution.regions, { perRegion, maxViews: room, allowGhost, viewport });
     }
@@ -571,10 +992,13 @@ export async function runVisionCampaign(g, joints, manifest, effects = {}) {
       }
       : e.capture;
 
+    say('vision:round', { round: r, maxRounds });
     const res = await runVisionRound(g, joints, manifest, {
       plan: planEffect,
       capture,
       propose: e.propose || null,
+      emit: e.emit || null,
+      abort: e.abort || null,
       frames: replay,
       persist: persistFor(r),
       // Resolved per round for the same reason `persist` is a factory: the caller
@@ -586,8 +1010,19 @@ export async function runVisionCampaign(g, joints, manifest, effects = {}) {
       // orient against.
       maxFrames: r === 0 ? e.maxFrames : Math.min(e.maxFrames ?? MAX_VISION_FRAMES, room),
       viewport,
+      // Round 2 aims at REGIONS, so it has no survey tier and no orientation
+      // frames: every view in a close-up plan is fitted to a part, and there is no
+      // whole-model pose to survey or to orient against.
+      survey: r === 0 ? e.survey : 0,
       maskPairs: e.maskPairs, ghostFrames: e.ghostFrames,
       orientation: r === 0 ? e.orientation : 0,
+      // Round 1 only: the prior is read from the survey tier, and round 2 has no
+      // survey tier — every view in a close-up plan is fitted to one part, so
+      // there is no whole-machine frame left to name a category from. `e.expectation`
+      // defaults ON because a campaign is the automatic lane, where aiming is the
+      // whole point; a caller may switch it off to get the single-turn round.
+      expectation: r === 0 ? e.expectation !== false : false,
+      independent: e.independent === true,
     });
 
     prevPlan = planObj;
@@ -613,6 +1048,13 @@ export async function runVisionCampaign(g, joints, manifest, effects = {}) {
     if (!(res.suggestViews || []).length) { stop = 'the round asked for nothing further'; break; }
     if (!fresh.length) { stop = 'the round declared no NEW uncertainty, so another look would repeat the question'; break; }
     prev = res;
+    // Only a USABLE prior aims round 2. A low-confidence or malformed guess is
+    // reported and then ignored, which is what "the campaign behaves exactly as it
+    // did before this lane existed" has to mean in practice: aiming a scarce
+    // close-up budget at a coin flip is worse than leaving coverage to decide.
+    prevExpectation = res.expectationUsable
+      ? { expectation: res.expectation, verified: res.expectationVerified, gaps: res.gaps }
+      : null;
   }
 
   const okRounds = rounds.filter((x) => x.ok);
@@ -648,10 +1090,18 @@ export async function runVisionCampaign(g, joints, manifest, effects = {}) {
     // What a hypothetical round 3 would aim at. Reported, never acted on — the
     // ceiling is two rounds and that is not a knob the model can turn.
     suggestViews: last?.suggestViews || [],
+    // The category prior from round 1 and what became of it. `gaps` is recomputed
+    // here, after EVERY round merged, so the readout compares the guess against
+    // the project's final belief rather than against its belief mid-campaign —
+    // which is the only comparison a human can act on. Null when the lane was off,
+    // the model declined to answer, or the campaign never reached round 1.
+    expectation: rounds[0]?.expectation ?? null,
+    expectationUsable: rounds[0]?.expectationUsable ?? false,
+    gaps: rounds[0]?.expectation ? expectationGap(rounds[0].expectation, manifest) : null,
     model: last?.model ?? null,
     ms: sum('ms'),
     reason: added || confirms ? null : (stop || last?.reason || 'the model proposed nothing'),
-    code: failed?.code ?? null,
+    code: aborted ? 'PROJECT_RELOADED' : (failed?.code ?? null),
     manifestUntouched: !rounds.some((x) => x.manifestUntouched === false),
     warnings: [...warnings, ...rounds.flatMap((x) => (x.warnings || []).map((w) => `round ${x.round + 1}: ${w}`))],
   };

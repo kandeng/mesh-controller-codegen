@@ -5,6 +5,8 @@
 //   3) aiPropose: valid/malformed/isolation-violating/duplicate canned replies
 //   4) runL2Round with a fake producer: gimbal split merges, battery re-runs
 //   5) reopen state SURVIVES a subsequent refine round (resume semantics)
+//   6) lane mode: each producer writes into a DEEP CLONE, and the caller's
+//      manifest moves only at reconciliation — through the one writer
 //
 // Usage: node test/verify-manifest.mjs
 import { parseGlb } from '../src/lib/gltf.mjs';
@@ -14,7 +16,7 @@ import {
 } from '../src/plugins/discovery/manifest.mjs';
 import { buildProposalPrompt } from '../src/plugins/discovery/context.mjs';
 import { aiPropose } from '../src/plugins/discovery/ai-propose.mjs';
-import { runDiscoveryLoop, runL2Round } from '../src/plugins/discovery/loop.mjs';
+import { runDiscoveryLoop, runL2Round, runProducerLanes } from '../src/plugins/discovery/loop.mjs';
 
 const GLB = 'samples/drone_dji_inspire3.glb';
 
@@ -121,6 +123,65 @@ const freeNames = g.nodes.filter((n) => !claimed.has(n.name) && n.wext).slice(0,
   ok('reopened record stays needs-verdict with its history', reopened.status === 'needs-verdict'
     && reopened.history.some((h) => h.event === 'reopened')
     && reopened.tests.some((t) => t.name === 'rigidity-gate' && !t.pass));
+}
+
+// ---- 6) lane mode: the caller's manifest is untouched until reconciliation ------
+// Independence and a single writer pull in opposite directions: a producer shown
+// the other's output agrees with it, and two lanes merging into one array at once
+// would interleave the battery, the node-set dedupe and the id allocation. So each
+// lane is handed a DEEP CLONE, the clones are diffed, and only the deltas reach the
+// caller's arrays — serially, through mergeProposals.
+{
+  const callerManifest = buildManifest(joints);
+  for (const r of callerManifest) r.status = deriveStatus(r);
+  const callerJoints = structuredClone(joints);
+  const n0 = callerManifest.length;
+  const j0 = callerJoints.length;
+  const conf0 = callerManifest[0].confidence;
+  const laneAnchor = g.nodes.find((n) => n.name === freeNames[0]).wp;
+  const laneReply = JSON.stringify([{
+    op: 'new', nodeIds: freeNames, type: 'hinge', axis: [0, 0, 1],
+    anchor: [laneAnchor[0], laneAnchor[1], laneAnchor[2]], rationale: 'lane isolation unit test',
+  }]);
+
+  const during = [];
+  const resLanes = await runProducerLanes(g, callerJoints, callerManifest, {
+    text: async (m, j) => {
+      const r = await runL2Round(g, j, m, async () => laneReply);
+      m[0].confidence = 0.01; // a lane scribbling on a record it was merely SHOWN
+      during.push({ lane: 'text', caller: callerManifest.length, clone: m.length, added: r.added });
+      return { ...r, ok: true };
+    },
+    vision: async (m, j) => {
+      const r = await runL2Round(g, j, m, async () => laneReply);
+      during.push({ lane: 'vision', caller: callerManifest.length, clone: m.length, added: r.added });
+      return { ...r, ok: true };
+    },
+  });
+
+  ok('lane mode: neither lane ever saw the caller\'s manifest move, and each wrote into its own clone',
+    during.length === 2 && during.every((d) => d.caller === n0 && d.clone === n0 + 1 && d.added === 1),
+    JSON.stringify(during));
+  ok('lane mode: the clone is a DEEP copy - a lane scribbling on a record cannot reach the caller\'s',
+    callerManifest[0].confidence === conf0, `caller kept ${callerManifest[0].confidence}, the lane had set 0.01`);
+  ok('lane mode: the same part found by BOTH lanes lands as ONE record, corroborated - never twice',
+    callerManifest.length === n0 + 1 && callerJoints.length === j0 + 1
+    && resLanes.added === 1 && resLanes.agreed.length === 1
+    && resLanes.lanes.text?.merged === 1 && resLanes.lanes.vision?.merged === 0,
+    JSON.stringify({ manifest: callerManifest.length - n0, joints: callerJoints.length - j0, agreed: resLanes.agreed.length }));
+  const survivor = callerManifest.find((r) => (r.evidence || []).some((t) => /cross-producer:/.test(t)));
+  ok('lane mode: the survivor names the OTHER producer in its own evidence trail',
+    !!survivor && /cross-producer:L2-vision/.test((survivor.evidence || []).join(' ')),
+    JSON.stringify(survivor?.evidence));
+
+  const quiet = buildManifest(joints);
+  const resQuiet = await runProducerLanes(g, structuredClone(joints), quiet, {
+    text: async () => { throw new Error('the text provider is not configured'); },
+  });
+  ok('lane mode: a lane that FAILS leaves the caller\'s manifest provably untouched, and says why',
+    quiet.length === n0 && resQuiet.added === 0 && resQuiet.manifestUntouched === true
+    && resQuiet.warnings.some((w) => /the text lane failed/.test(w)),
+    JSON.stringify({ len: quiet.length, added: resQuiet.added, untouched: resQuiet.manifestUntouched }));
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

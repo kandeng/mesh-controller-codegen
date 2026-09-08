@@ -19,12 +19,90 @@
 //
 // Pure: builds strings and an image list. The provider (vision-provider.mjs) does
 // the transport, so this is testable headless with no agent and no model.
+//
+// It deliberately imports NOTHING from views.mjs. views.mjs imports MAX_LEGEND
+// from here, so a reverse import would close a cycle; and this module is a
+// formatter, so every fact it prints is handed to it — `g` for the model's own
+// size, a planned view's `cam` for the camera it was drawn with.
 import { constraintSummary } from './manifest.mjs';
 
 export const MAX_VISION_FRAMES = 12;
 // A colour legend beyond this stops being readable and starts costing more tokens
 // than the grounding it saves; the model can still report a hex it sees.
 export const MAX_LEGEND = 40;
+
+// ---- the annotations that remove the model's guesswork -----------------------
+//
+// A regionBox is a fraction of an image, so it is meaningless unless the model
+// knows the image's geometry: how wide the frustum was, how big the machine is
+// relative to the numbers in "eye distance", and — the one whose absence
+// produced the dominant doubt in a real air3 reply, "left/right labelling in
+// this near-top view assumes screen-right is +X" — which way the world axes run
+// across the screen. Telling it removes a guess it would otherwise have to
+// declare, and a declared guess costs a round-2 frame to settle.
+
+// How aligned a basis vector must be with a world axis before we NAME it.
+// cos(30°): past that the axis is a description of the frame rather than an
+// approximation of it, and below it we print the vector instead of lying.
+export const AXIS_ALIGN = 0.866;
+const WORLD_AXES = [['+X', [1, 0, 0]], ['-X', [-1, 0, 0]], ['+Y', [0, 1, 0]], ['-Y', [0, -1, 0]], ['+Z', [0, 0, 1]], ['-Z', [0, 0, -1]]];
+
+function axisName(v) {
+  if (!Array.isArray(v) || v.length !== 3) return null;
+  let best = null; let bd = AXIS_ALIGN;
+  for (const [name, a] of WORLD_AXES) {
+    const d = v[0] * a[0] + v[1] * a[1] + v[2] * a[2];
+    if (d > bd) { bd = d; best = name; }
+  }
+  return best;
+}
+
+// "screen-right = +X, screen-up = +Z" — the mapping a regionBox is drawn in.
+// Derived from the SAME basis grounding projects with (views.mjs makeCamera), so
+// the sentence is a fact about the frame rather than a description of a
+// convention we hope the renderer followed.
+export function screenAxes(cam) {
+  if (!cam?.r || !cam?.u) return null;
+  const fmt = (v) => axisName(v) || `(${v.map((x) => Number(x).toFixed(2)).join(',')})`;
+  return `screen-right = ${fmt(cam.r)}, screen-up = ${fmt(cam.u)}`;
+}
+
+// The facts every frame shares. Radius falls back the way views.mjs modelRadius
+// does (placed-bbox circumradius, else the spread of node origins) — copied
+// rather than imported, see the note at the top of this file.
+export function sceneFacts(g = null, viewport = null, frames = []) {
+  const cam = (frames || []).map((f) => f?.cam).find((c) => c && Number.isFinite(c.fov)) || null;
+  const vp = viewport && Number.isFinite(viewport.fov)
+    ? { w: viewport.w, h: viewport.h, fov: viewport.fov }
+    : (cam ? { w: cam.w, h: cam.h, fov: cam.fov } : null);
+  const radius = Number(g?.wradius) || Number(g?.radius) || null;
+  const b = g?.bounds;
+  const extent = b && Array.isArray(b.min) && Array.isArray(b.max)
+    ? [b.max[0] - b.min[0], b.max[1] - b.min[1], b.max[2] - b.min[2]]
+    : null;
+  return { vp, radius, extent, nodes: Number(g?.nodes?.length) || null };
+}
+
+export function sceneHeader(facts, { unknownMachine = true } = {}) {
+  const lines = [];
+  const { vp, radius, extent } = facts || {};
+  if (!vp && !radius) return lines;
+  lines.push('SCENE (every frame shares these facts):');
+  if (vp) {
+    lines.push(`  frame ${vp.w}x${vp.h} px, fov ${Math.round(vp.fov)}\u00b0 vertical, pinhole — a regionBox is a FRACTION of that frame`);
+  }
+  if (radius) {
+    lines.push(`  the whole machine fits a sphere of radius ${radius.toFixed(1)} world units${extent ? `, bounding box ${extent.map((x) => x.toFixed(1)).join(' x ')} (X x Y x Z)` : ''}`);
+    lines.push('  so an "eye distance" below is in those units: 2.0 means two machine-radii away, 0.2 means a close-up');
+  }
+  lines.push('  the scene is Z-UP; "anchor" and "axis" are in these same world units');
+  if (unknownMachine) {
+    lines.push('  WE DO NOT KNOW WHAT MACHINE THIS IS. It may be an aircraft, a ground vehicle, an arm,');
+    lines.push('  a fixture — anything. Report every part that MOVES relative to the rest, and do not let');
+    lines.push('  a plausible category talk you out of a part you can actually see.');
+  }
+  return lines;
+}
 
 const MODE_EXPLAINS = {
   photo: 'an ordinary opaque render — what a photograph of the assembly would show',
@@ -44,7 +122,16 @@ export function frameLine(frame, i) {
   if (Number.isFinite(s.azimuth)) bits.push(`azimuth ${Math.round(s.azimuth)}\u00b0`);
   if (Number.isFinite(s.elevation)) bits.push(`elevation ${Math.round(s.elevation)}\u00b0`);
   if (Number.isFinite(s.distance)) bits.push(`eye distance ${Number(s.distance).toFixed(1)} units`);
-  if (s.kind === 'cell') bits.push(`zoomed into one region of ${s.members ?? '?'} parts`);
+  // The survey tier is FOUR OBLIQUE looks plus one true pole each way, and only
+  // `spec.pole` tells them apart. Calling an oblique 25° frame "top-down" is not a
+  // cosmetic slip: the model reasons about which side of the machine a regionBox
+  // is on from the words we print here, and a wrong one is believed — it is the
+  // same class of error the screen-axis annotation below exists to remove.
+  if (s.kind === 'survey') {
+    bits.push(s.pole === 'bottom' ? 'true bottom-up whole-machine view'
+      : s.pole === 'top' ? 'true top-down whole-machine view'
+        : 'oblique whole-machine survey view');
+  } else if (s.kind === 'cell') bits.push(`zoomed into one region of ${s.members ?? '?'} parts`);
   else if (s.kind === 'close-up') bits.push('close-up of one region');
   else bits.push('whole-model view');
   // `covers` is a NAME LIST on a plan view and a COUNT on a stored frame entry.
@@ -52,6 +139,16 @@ export function frameLine(frame, i) {
   const n = Array.isArray(frame.covers) ? frame.covers.length : frame.covers;
   if (Number.isFinite(n)) bits.push(`shows ~${n} parts`);
   if (Array.isArray(frame.focus) && frame.focus.length) bits.push(`focused on: ${frame.focus.slice(0, 6).join(', ')}`);
+  // The camera it was actually drawn with. Absent on a frame replayed from disk
+  // with no plan beside it, in which case the annotation is omitted rather than
+  // guessed — a wrong axis mapping is worse than none, because it is believed.
+  const cam = frame.cam || null;
+  if (cam) {
+    if (Number.isFinite(cam.fov)) bits.push(`fov ${Math.round(cam.fov)}\u00b0`);
+    if (Number.isFinite(cam.w) && Number.isFinite(cam.h)) bits.push(`${cam.w}x${cam.h}px`);
+    const axes = screenAxes(cam);
+    if (axes) bits.push(axes);
+  }
   return bits.join(', ');
 }
 
@@ -79,6 +176,18 @@ function legendLine(frame) {
 //                asked for them.
 export function buildVisionPrompt({
   manifest = null, frames = [], plan = null, maxFrames = MAX_VISION_FRAMES, question = null,
+  // The parse table, for the SCENE header only: this module never projects
+  // anything, it just says how big the machine is so "eye distance 212.5 units"
+  // means something to the reader.
+  g = null, viewport = null,
+  // A CATEGORY PRIOR to falsify (see expectation.mjs). Lines, already formatted;
+  // null or empty leaves the prompt exactly as it was before that lane existed.
+  hypothesis = null,
+  // INDEPENDENT OBSERVER mode. The other producer's conclusions are withheld and
+  // only human-confirmed records are listed as off-limits, so a geometry guess
+  // cannot steer this one. Off by default: the manual "refine what is doubtful"
+  // mode is a follow-up look and legitimately stands on what is already known.
+  independent = false,
 } = {}) {
   const warnings = [];
   const wanted = Array.isArray(frames) ? frames : [];
@@ -89,6 +198,10 @@ export function buildVisionPrompt({
   // say how many parts the planner expected to be visible. That number is what
   // makes a hallucination detectable later: a part named from a frame whose pose
   // cannot show it is not a discovery, it is an invention.
+  //
+  // `cam` rides along for the same reason: it is the basis grounding will project
+  // the reply's regionBox through, so the screen-axis mapping printed below is
+  // the one the frame was really drawn in, not a convention we assume.
   const viewById = new Map((plan?.views || []).map((v) => [v.id, v]));
   const enriched = used.map((f) => {
     const v = viewById.get(f.viewId || f.id) || null;
@@ -97,10 +210,11 @@ export function buildVisionPrompt({
       covers: f.covers ?? v?.covers ?? null,
       sees: f.sees ?? v?.sees ?? null,
       spec: f.spec ?? v?.spec ?? null,
+      cam: f.cam ?? v?.cam ?? null,
     };
   });
 
-  const constraints = constraintSummary(manifest);
+  const constraints = constraintSummary(manifest, { confirmedOnly: !!independent });
   const lines = [];
   lines.push('You are the VISION producer in a rigged-mesh joint-discovery loop.');
   lines.push('You are looking at RENDERED FRAMES of one 3D CAD assembly (a machine with moving');
@@ -108,6 +222,16 @@ export function buildVisionPrompt({
   lines.push('lighting realism, no branding, and some frames are deliberately altered — each');
   lines.push('frame below says exactly how.');
   lines.push('');
+  const scene = sceneHeader(sceneFacts(g, viewport, enriched));
+  if (scene.length) { lines.push(...scene); lines.push(''); }
+  if (independent) {
+    lines.push('You are an INDEPENDENT OBSERVER. Another producer has already looked at this mesh and');
+    lines.push('its conclusions are deliberately WITHHELD from you, because agreeing with a wrong guess');
+    lines.push('is worse than contradicting it. Report every part you can see that moves, wherever it');
+    lines.push('is; only the HUMAN-CONFIRMED records listed below are off-limits, and they are listed');
+    lines.push('because a person has already disposed of them.');
+    lines.push('');
+  }
   lines.push(question || 'TASK: identify the parts of this machine that MOVE RELATIVE to the rest,');
   lines.push('and say what kind of motion each has.');
   lines.push('  rotor  - spins continuously about one axis (propeller, fan, motor, gimbal roll)');
@@ -145,7 +269,7 @@ export function buildVisionPrompt({
   lines.push('- anchor is the point the part rotates ABOUT (a rotor hub, not a blade tip).');
   lines.push('- Report the MOVING GROUP, not one fastener: all blades of one propeller belong');
   lines.push('  to one rotor. Use several regionColors or a box around the whole hub.');
-  lines.push('- Parts listed in VALIDATED CONSTRAINTS are already claimed. Do not re-propose');
+  lines.push('- Parts listed below are already claimed. Do not re-propose');
   lines.push('  them, except via op:"split" naming the claiming joint in targetId.');
   lines.push('- op:"confirm" means "your existing joint X is right, I can see it" - use it.');
   lines.push('- Prefer FEW well-supported proposals over many speculative ones. An empty array');
@@ -158,7 +282,22 @@ export function buildVisionPrompt({
   lines.push('- Never describe the render itself (transparency, colours, grid, background).');
   lines.push('  Describe the MACHINE.');
   lines.push('');
-  lines.push(constraints.length ? 'VALIDATED CONSTRAINTS (already claimed - subtract from your search):' : 'VALIDATED CONSTRAINTS: (none yet - nothing is claimed)');
+  // The hypothesis goes AFTER the rules and BEFORE the constraints, so it reads as
+  // a claim to test rather than as context to agree with.
+  const hyp = Array.isArray(hypothesis) ? hypothesis.filter((x) => x && String(x).trim()) : [];
+  if (hyp.length) {
+    lines.push('HYPOTHESIS TO FALSIFY (a first look at these same frames produced it — it is NOT evidence):');
+    lines.push(...hyp.map((h) => `  ${String(h).trim()}`));
+    lines.push('Verify or refute EACH of these against what you can actually see, and give a locator for');
+    lines.push('every one you keep. Then report anything it MISSED: a hypothesis that named four rotors');
+    lines.push('does not make a fifth invisible. An expectation is never a discovery — only what you can');
+    lines.push('point at is.');
+    lines.push('');
+  }
+  const cTitle = constraints.length
+    ? (independent ? 'HUMAN-CONFIRMED CONSTRAINTS (a person settled these — do not re-propose them):' : 'VALIDATED CONSTRAINTS (already claimed - subtract from your search):')
+    : 'VALIDATED CONSTRAINTS: (none yet - nothing is claimed)';
+  lines.push(cTitle);
   lines.push(...constraints);
   lines.push('');
   lines.push(`FRAMES (${enriched.length} attached, in order):`);

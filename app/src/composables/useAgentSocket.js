@@ -15,10 +15,23 @@ import { useKernelApi } from './useKernelApi.js';
 let ws = null;
 let streaming = false; // an assistant bubble is being built from deltas
 let lastSeq = 0;       // highest persisted-transcript seq applied (dedupe key)
+let lastMode = null;   // last announced agent mode (transition detection)
 
 export function useAgentSocket() {
-  const { state } = useProjectStore();
+  const { state, notify } = useProjectStore();
   const api = useKernelApi();
+
+  // The shell carries no status chip: a mode CHANGE is news, a mode is not.
+  // Booting into stub is the normal cold state (the host boots on first use), so
+  // only transitions are worth a sentence in the chat.
+  function noteMode(mode) {
+    if (!mode || mode === lastMode) { state.agent = { mode: mode || lastMode || 'stub' }; return; }
+    const prev = lastMode;
+    lastMode = mode;
+    state.agent = { mode };
+    if (mode === 'live' && prev === 'stub') notify('the assistant host booted — answers now come from the live model');
+    if (mode === 'stub' && prev === 'live') notify('the assistant host went away — answers degrade to placeholders until it boots again');
+  }
 
   function finalizeStream() {
     if (!streaming) return;
@@ -34,7 +47,7 @@ export function useAgentSocket() {
     ws.onmessage = (m) => {
       let msg; try { msg = JSON.parse(m.data); } catch { return; }
       if (msg.type === 'ready') {
-        state.agent = { mode: msg.mode };
+        noteMode(msg.mode);
       } else if (msg.type === 'turn-start') {
         state.busy = true;
       } else if (msg.type === 'delta') {
@@ -61,7 +74,7 @@ export function useAgentSocket() {
         state.notice = msg.text;
       } else if (msg.type === 'turn-end') {
         finalizeStream();
-        if (msg.mode) state.agent = { mode: msg.mode };
+        noteMode(msg.mode);
         state.busy = (msg.queued || 0) > 0; // queue keeps the composer live
         if (!state.busy) state.notice = '';
       } else if (msg.type === 'clear') {

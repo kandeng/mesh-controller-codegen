@@ -56,17 +56,31 @@ export function parseReply(reply) {
 //   baseConfidence   the confidence EVERY admitted record starts at
 //   origin           'L2-ai' | 'L2-vision'
 //   allowOps         which ops this producer may use (merge is refused by both)
+//   independent      this lane must NOT read another producer's conclusions.
+//                    Narrows ONLY the claimed-node set to human-confirmed
+//                    records, so a geometry or text guess stops blocking a
+//                    proposal for the same parts. Ids, node-set dedupe and
+//                    `confirm` targets still see the WHOLE manifest: those are
+//                    facts about identity, not opinions about a joint, and
+//                    narrowing them would mint colliding ids, re-admit an
+//                    existing joint under a new name, and turn every `confirm`
+//                    of a real record into an orphan.
 export function createProposalGate({
   g, manifest, idTag = 'l2', label = (t) => `${t} (AI proposal)`,
   evidenceTag = 'l2-batch', baseConfidence = 0.7, origin = 'L2-ai',
-  allowOps = ['new', 'split', 'confirm'],
+  allowOps = ['new', 'split', 'confirm'], independent = false,
 } = {}) {
   const records = [];
   const confirms = [];
   const warnings = [];
 
   const nodeNames = new Set((g?.nodes || []).map((n) => n.name));
-  const claimed = claimedNodeSet(manifest);
+  // The one place independence bites. A record a PERSON confirmed is off-limits
+  // in every mode; a record another producer guessed is off-limits only when the
+  // two producers are allowed to read each other's work.
+  const claimed = claimedNodeSet(independent
+    ? (manifest || []).filter((r) => r?.status === 'confirmed')
+    : manifest);
   const byId = new Map((manifest || []).map((r) => [r.id, r]));
   const taken = new Set(byId.keys());
   const setKey = (ids) => [...ids].sort().join('');
@@ -113,7 +127,33 @@ export function createProposalGate({
     if (unknown.length) return drop(idx, `unknown nodes: ${unknown.join(', ')}`);
 
     const key = setKey(nodes);
-    if (seen.has(key)) return drop(idx, 'duplicate of an existing record (same node set)');
+    if (seen.has(key)) {
+      // An INDEPENDENT lane that lands on a node set the project already holds is
+      // not a duplicate to discard — it is CORROBORATION from a producer that was
+      // never shown the record it agrees with. Two producers pointing at the same
+      // parts is the strongest cheap evidence this system ever gets, so it goes
+      // down the confirm path (which only ever LIFTS, and can never cross the
+      // auto-accept threshold by itself) instead of into a warning nobody reads.
+      // The one-record-per-node-set invariant is what stays: no second record is
+      // minted, so `isolation` is not handed a pair it can never pass.
+      //
+      // Only for a record ALREADY IN THE MANIFEST. A set reserved earlier in this
+      // same batch (`seen` grows as records are admitted) is a genuine duplicate
+      // from the same producer, and stays dropped.
+      if (independent) {
+        const hit = (manifest || []).find((r) => Array.isArray(r?.nodes) && setKey(r.nodes) === key);
+        if (hit?.id) {
+          confirms.push({
+            targetId: hit.id,
+            tag: `cross-producer:${origin}`,
+            rationale: String(p.reasoning || p.rationale || '').slice(0, 240),
+          });
+          warnings.push(`proposal[${idx}] landed on the same parts as ${hit.id} — recorded as corroboration from this lane, not as a second record`);
+          return 'confirm';
+        }
+      }
+      return drop(idx, 'duplicate of an existing record (same node set)');
+    }
 
     if (!vec3(p.axis)) return drop(idx, 'axis must be [x,y,z] of finite numbers');
     if (!vec3(p.anchor)) return drop(idx, 'anchor must be [x,y,z] of finite numbers');

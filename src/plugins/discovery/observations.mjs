@@ -238,6 +238,40 @@ export function saveReply(runDir, round, { prompt = null, reply = null, model = 
 
 export function loadReply(runDir, round) { return readJson(resolve(roundDir(runDir, round), 'reply.json')); }
 
+// The CATEGORY PRIOR turn, kept beside the frames that produced it.
+//
+// A prior is not evidence and it never becomes a manifest record, which is
+// exactly why it has its own file rather than a line in proposals.json: the
+// question a human asks of it is different. proposals.json answers "what did the
+// model claim"; expectation.json answers "what did we GUESS the machine was
+// before we asked, and was the guess wrong". A round whose discovery turn found
+// three rotors is only auditable if the four the prior expected is on the record
+// too — including the prompt that asked for it and the gaps computed afterwards.
+//
+// `expectation` is the PARSED prior (see expectation.mjs parseExpectation) and
+// `gaps` the expected-vs-grounded comparison after the round merged. Both may be
+// null: a round that ran without the prior, or a prior the model declined to
+// give, is recorded as such rather than as an absent file.
+export function saveExpectation(runDir, round, {
+  prompt = null, reply = null, expectation = null, gaps = null,
+  model = null, ms = null, warnings = null,
+} = {}) {
+  if (!runDir) return null;
+  const dir = ensure(roundDir(runDir, round));
+  const file = resolve(dir, 'expectation.json');
+  writeJson(file, {
+    ts: new Date().toISOString(), model, ms, warnings, prompt, reply, expectation, gaps,
+    counts: {
+      instances: Array.isArray(expectation?.instances) ? expectation.instances.length : 0,
+      gaps: Array.isArray(gaps) ? gaps.length : 0,
+      warnings: Array.isArray(warnings) ? warnings.length : 0,
+    },
+  });
+  return file;
+}
+
+export function loadExpectation(runDir, round) { return readJson(resolve(roundDir(runDir, round), 'expectation.json')); }
+
 // What the validator made of that reply: accepted records, confirms, and the
 // reasons anything was dropped. Dropping is recorded because "the model said X
 // and we refused it because Y" is the audit trail a human gate needs.
@@ -288,6 +322,7 @@ export function listRounds(runDir) {
         frames: frames.length,
         bytes: frames.reduce((a, f) => a + (f.bytes || 0), 0),
         hasPlan: existsSync(resolve(dir, 'plan.json')),
+        hasExpectation: existsSync(resolve(dir, 'expectation.json')),
         hasReply: existsSync(resolve(dir, 'reply.json')),
         hasProposals: existsSync(resolve(dir, 'proposals.json')),
         hasMotion: existsSync(resolve(dir, 'motion.json')),
@@ -306,6 +341,7 @@ export function loadRound(runDir, round) {
     dir,
     plan: loadPlan(runDir, round),
     frames: readIndex(dir),
+    expectation: loadExpectation(runDir, round),
     reply: loadReply(runDir, round),
     proposals: loadProposals(runDir, round),
     motion: loadMotion(runDir, round),

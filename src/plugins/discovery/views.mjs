@@ -88,9 +88,25 @@ export function namedIndex(g) {
   return name;
 }
 
-// Orthonormal view basis. Up is +Z (the model is Z-up); elevation is clamped by
-// the caller so `forward` never aligns with `up` and the cross product vanishes.
-export function makeCamera(eye, target, vp = VIEWPORT) {
+// How close `forward . up` may get to ±1 before the two are considered parallel.
+// At a TRUE top-down or bottom-up look the world +Z that the default up hint is
+// made of IS the view axis, so `cross(f, up)` vanishes and `right` becomes NaN —
+// every projection from that pose would be NaN with it.
+export const POLE_PARALLEL = 0.999;
+
+// Orthonormal view basis. Up is +Z (the model is Z-up) except at the poles, where
+// the caller may pass an explicit `up` and a parallel hint is replaced by a
+// horizontal one: +Y looking down, -Y looking up. Both keep screen-right = +X, so
+// a pole frame is not mirrored relative to the ring frames.
+//
+// The choice is NOT free, and that is why it lives here rather than in the
+// renderer: the browser draws the pose with `camera.up = pose.up` and three.js
+// builds its basis the same way (right = up x backward, up = backward x right), so
+// the basis this function returns is pixel-for-pixel the basis the frame was drawn
+// in. Were the two allowed to differ by a roll — three.js nudges a degenerate
+// lookAt by an arbitrary 0.0001 — every regionBox a model draws on a pole frame
+// would ground to the wrong parts, confidently.
+export function makeCamera(eye, target, vp = VIEWPORT, up = null) {
   const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
   const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
   const cross = (a, b) => [
@@ -98,10 +114,12 @@ export function makeCamera(eye, target, vp = VIEWPORT) {
   ];
   const norm = (a) => { const l = Math.hypot(a[0], a[1], a[2]) || 1; return [a[0] / l, a[1] / l, a[2] / l]; };
   const f = norm(sub(target, eye));
-  const r = norm(cross(f, [0, 0, 1]));
+  const hinted = Array.isArray(up) && up.length === 3 && up.every(Number.isFinite) ? norm(up) : [0, 0, 1];
+  const u0 = Math.abs(dot(f, hinted)) > POLE_PARALLEL ? (f[2] > 0 ? [0, -1, 0] : [0, 1, 0]) : hinted;
+  const r = norm(cross(f, u0));
   const u = cross(r, f);
   return {
-    eye, target, f, r, u,
+    eye, target, f, r, u, up: u0,
     fov: vp.fov, aspect: vp.w / vp.h, w: vp.w, h: vp.h,
     tanHalfY: Math.tan((vp.fov * Math.PI / 180) / 2),
     _dot: dot,
@@ -219,11 +237,29 @@ export function modelTarget(g) {
 // only, which under-frames a model whose geometry sits far from its origins.
 export const modelRadius = (g) => Math.max(1e-6, Number(g.wradius) || Number(g.radius) || 1);
 
-// Spherical pose -> absolute world eye/target. Distance is in WORLD units (use
+// The up vector a spec will be drawn with. +Z everywhere except at the poles,
+// where it has to be horizontal or the view basis degenerates (see makeCamera).
+// An explicit `spec.up` always wins: a caller that wants a rolled frame may ask
+// for one, and the pose carries the answer either way so neither the renderer nor
+// the prompt builder has to re-derive it.
+export function poseUp(spec, elRad) {
+  const up = spec?.up;
+  if (Array.isArray(up) && up.length === 3 && up.every(Number.isFinite)) return up.map(Number);
+  const s = Math.sin(elRad);
+  if (Math.abs(s) > POLE_PARALLEL) return s > 0 ? [0, 1, 0] : [0, -1, 0];
+  return [0, 0, 1];
+}
+
+// Spherical pose -> absolute world eye/target/up. Distance is in WORLD units (use
 // multiples of modelRadius(g) so framing scales with the model).
 export function poseFromSpec(spec, g) {
   const R = modelRadius(g);
-  const el = Math.max(-80, Math.min(80, Number(spec.elevation ?? 20))) * Math.PI / 180;
+  // ±90, not ±80. The omni survey tier needs a TRUE top-down and bottom-up look:
+  // the underside of a machine is where its landing gear, its payload bay and its
+  // belly turret live, and a clamp at 80° turns "look underneath" into "look at
+  // the flank from slightly below" — the one question a ground vehicle cannot
+  // answer from any oblique frame.
+  const el = Math.max(-90, Math.min(90, Number(spec.elevation ?? 20))) * Math.PI / 180;
   const az = (Number(spec.azimuth ?? 0) * Math.PI) / 180;
   const d = Math.max(1e-3, Number(spec.distance ?? 2.5 * R));
   const target = Array.isArray(spec.target) && spec.target.length === 3
@@ -233,6 +269,7 @@ export function poseFromSpec(spec, g) {
   return {
     eye: [target[0] + d * ce * Math.cos(az), target[1] + d * ce * Math.sin(az), target[2] + d * Math.sin(el)],
     target,
+    up: poseUp(spec, el),
   };
 }
 
@@ -256,6 +293,42 @@ function ringSpecs(g, { azimuths, elevations, distances }) {
     }
   }
   return specs.map((s) => ({ ...s, distance: s.distance * R }));
+}
+
+// The omni survey tier: whole-machine looks that are NOT chosen by coverage.
+// Four oblique views 90° apart plus a true top-down and a true bottom-up — the
+// six frames a person would take before saying anything about an object whose
+// type nobody knows yet (drone? tank? robot arm?).
+//
+// Greedy coverage will happily spend a whole round on whichever flank carries the
+// most parts and never look underneath, because marginal gain is a statement about
+// OUR node table, not about understanding the machine. Forcing this tier costs
+// frames the greedy pass would have spent on resolution, and buys a coherent set
+// the model can reason about as a whole — which is also the only view set a
+// category expectation can honestly be read from.
+export const SURVEY_ELEVATION = 25;
+export const SURVEY_MAX = 6;
+
+export function surveySpecs(g, {
+  count = SURVEY_MAX, elevation = SURVEY_ELEVATION, viewport = VIEWPORT, margin = 1.0,
+} = {}) {
+  const n = Math.max(0, Math.min(SURVEY_MAX, count | 0));
+  if (!n) return [];
+  // Fitted to the model's own bounding radius, so the whole machine is in frame at
+  // any scale — the same framing the ring tier's widest zoom uses (R/sin 22.5°).
+  const d = fitDistance(modelRadius(g), viewport, margin);
+  // A truncated survey is still a SURVEY: the ring azimuths stay evenly spread and
+  // the poles are dropped first, so asking for three buys three looks 120° apart
+  // rather than three looks at one flank.
+  const ring = Math.min(4, n);
+  const poles = n - ring;
+  const specs = [];
+  for (let a = 0; a < ring; a += 1) {
+    specs.push({ kind: 'survey', azimuth: (a * 360) / ring, elevation, distance: d });
+  }
+  if (poles >= 1) specs.push({ kind: 'survey', pole: 'top', azimuth: 0, elevation: 90, distance: d });
+  if (poles >= 2) specs.push({ kind: 'survey', pole: 'bottom', azimuth: 0, elevation: -90, distance: d });
+  return specs;
 }
 
 // Adaptive spatial subdivision: split the target set by its longest axis at the
@@ -361,9 +434,14 @@ export function reachOf(spec, g, maxTargetRadius) {
 // Greedy set-cover selection. Coverage is a submodular function of the chosen
 // view set, so greedy is within (1 - 1/e) of optimal — the right algorithm, not
 // a compromise. Shared by the opaque and the ghost pass.
-function greedySelect(cand, total, { maxViews, minCoverage }) {
-  const covered = new Set();
-  const used = new Set();
+//
+// `covered`/`used` are injectable so a caller can FORCE a tier first and let greedy
+// continue from what that tier already saw: the forced views then genuinely reduce
+// the residual instead of being paid for twice, and greedy's own marginals stay
+// monotone because they are measured against the seeded set.
+function greedySelect(cand, total, {
+  maxViews, minCoverage, covered = new Set(), used = new Set(),
+}) {
   const views = [];
   while (views.length < maxViews && covered.size / Math.max(1, total) < minCoverage) {
     let best = null;
@@ -392,10 +470,15 @@ function greedySelect(cand, total, { maxViews, minCoverage }) {
 // `focusNames` restricts the target set — pass the manifest frontier plus the
 // unclaimed nodes to spend views only where uncertainty lives, instead of
 // covering static geometry nobody will ask about.
+//
+// `survey` force-includes the omni survey tier (see surveySpecs) BEFORE greedy
+// runs: those frames are bought because a machine of unknown type has to be seen
+// from all six sides at least once, not because they maximise marginal gain. Pass
+// `survey: 0` for a plan that is purely coverage-driven.
 export function planViews(g, {
   maxViews = 12, minCoverage = 0.99, viewport = VIEWPORT, specs = null, minArea = MIN_AREA,
   focusNames = null, maxMembers = 10, maxDepth = 8, cellMargin = 1.15,
-  allowGhost = true, ghostViews = 4,
+  allowGhost = true, ghostViews = 4, survey = SURVEY_MAX,
 } = {}) {
   const named = namedIndex(g);
   const allTargets = renderTargets(g);
@@ -409,21 +492,51 @@ export function planViews(g, {
   const total = want.size;
   const maxRad = targets.reduce((m, n) => Math.max(m, Math.max(...nodeBox(n).h)), 0);
 
-  const cand = (specs || candidateSpecs({
+  // The survey tier is PREPENDED, so its candidate ids stay in the `v<N>` family
+  // the ghost pass derives `baseId` from — a ghost of a survey pose must still read
+  // as `v3g`/`v3`, or the audit trail points at a candidate that does not exist.
+  const surveyCount = Math.max(0, Math.min(SURVEY_MAX, Math.min(maxViews, survey | 0)));
+  const surveyList = surveyCount ? surveySpecs(g, { count: surveyCount, viewport }) : [];
+  const cand = [...surveyList, ...(specs || candidateSpecs({
     g, targets, viewport, maxMembers, maxDepth, cellMargin,
-  })).map((spec, i) => {
+  }))].map((spec, i) => {
     const pose = poseFromSpec(spec, g);
     return {
       id: `v${i}`, spec, pose,
-      cam: makeCamera(pose.eye, pose.target, viewport),
+      cam: makeCamera(pose.eye, pose.target, viewport, pose.up),
       reach: reachOf(spec, g, maxRad),
     };
   });
   for (const c of cand) c.covers = coverageOf(c.cam, targets, { minArea, label, reach: c.reach });
 
-  const first = greedySelect(cand, total, { maxViews, minCoverage });
-  const views = first.views.map((v) => ({ ...v, mode: 'photo' }));
-  const covered = new Set(first.covered);
+  // Tier 0 — FORCED. Deduped by POSE rather than by id, because a survey spec can
+  // coincide with a ring spec and buying the same camera twice is not a survey.
+  const poseKey = (p) => [...p.eye, ...p.target].map((v) => Number(v).toFixed(3)).join(',');
+  const covered = new Set();
+  const used = new Set();
+  const usedPoses = new Set();
+  const forced = [];
+  for (const c of cand) {
+    if (forced.length >= surveyCount || c.spec.kind !== 'survey') continue;
+    const key = poseKey(c.pose);
+    if (usedPoses.has(key)) continue;
+    usedPoses.add(key);
+    used.add(c.id);
+    let gain = 0;
+    for (const nm of c.covers) if (!covered.has(nm)) gain += 1;
+    for (const nm of c.covers) covered.add(nm);
+    forced.push({ ...c, marginal: gain });
+  }
+
+  // Tier 1 — greedy over what is left, seeded with the survey's own coverage and
+  // excluding any pose the survey already took.
+  const rest = cand.filter((c) => !used.has(c.id)
+    && c.spec.kind !== 'survey'
+    && !usedPoses.has(poseKey(c.pose)));
+  const first = greedySelect(rest, total, {
+    maxViews: Math.max(0, maxViews - forced.length), minCoverage, covered, used,
+  });
+  const views = [...forced, ...first.views].map((v) => ({ ...v, mode: 'photo' }));
 
   // Pass 2: ghost frames for the unreachable residual, scored only against that
   // residual so a ghost pose is never bought for something an opaque pose shows.
@@ -448,6 +561,15 @@ export function planViews(g, {
   return {
     views: views.map((v) => ({
       id: v.id, mode: v.mode, spec: v.spec, pose: v.pose, marginal: v.marginal, covers: v.covers.size,
+      // The basis this pose was drawn with, carried through to the prompt. A
+      // regionBox is a fraction of an image, so "screen-right = +X" is the one
+      // annotation that turns a box into a statement about the MACHINE rather
+      // than about an assumed convention — and it can only be printed from the
+      // basis grounding itself projects with. Dropping it here would leave
+      // frameLine's camera block permanently silent, which is exactly how the
+      // air3 round came to declare "left/right labelling assumes screen-right is
+      // +X" as a doubt instead of being told it as a fact.
+      cam: v.cam,
       // The planner's own PREDICTION of what this pose shows, capped so plan.json
       // stays readable. Grounding reconciles the model's answer against this:
       // a part the planner says is visible but the model does not name is a
@@ -516,7 +638,7 @@ function boxDist(b, p) {
 
 // Grow one box to the union of many. Used both to merge the mesh nodes that
 // share a name and to size a round-2 region around the parts it is about.
-function unionBoxes(bs) {
+export function unionBoxes(bs) {
   let out = null;
   for (const b of bs) {
     if (!b) continue;
@@ -534,7 +656,7 @@ function unionBoxes(bs) {
 // Union the boxes of every mesh node that shares a name. Several mesh nodes map
 // to one named ancestor, and a region test against any single one of them would
 // miss the rest of the part.
-function namedBoxes(g, targets, label) {
+export function namedBoxes(g, targets, label) {
   const out = new Map();
   const acc = new Map();
   for (const n of targets) {
@@ -648,7 +770,7 @@ export function planCloseUps(g, regions, {
         target: reg.anchor,
       };
       const pose = poseFromSpec(spec, { wradius: frameRadius });
-      const cam = makeCamera(pose.eye, pose.target, viewport);
+      const cam = makeCamera(pose.eye, pose.target, viewport, pose.up);
       // A ghost is scored against the REGION's own parts with occlusion off: it is
       // bought to show what the hull hides, so counting the hull would let one
       // ghost be spent on something an opaque pose already frames.
@@ -656,7 +778,7 @@ export function planCloseUps(g, regions, {
       const covers = coverageOf(cam, pool, {
         minArea, label, reach: reachOf(spec, g, maxRad), occlude: !ghost,
       });
-      return { spec, pose, covers, frameRadius };
+      return { spec, pose, covers, frameRadius, cam };
     };
 
     // Tighten until the predicted legend fits. A mask whose legend overflows
@@ -679,7 +801,7 @@ export function planCloseUps(g, regions, {
     }
     if (!chosen || !chosen.covers.size) return null;
 
-    const { spec, pose, covers } = chosen;
+    const { spec, pose, covers, cam } = chosen;
     let marginal = 0;
     for (const nm of covers) if (!seenSoFar.has(nm)) marginal += 1;
     for (const nm of covers) seenSoFar.add(nm);
@@ -691,6 +813,11 @@ export function planCloseUps(g, regions, {
       ...(reg.reason ? { reason: reg.reason } : {}),
       ...(ghost ? { baseId: `cu${i}_${k}` } : {}),
       spec, pose, marginal, covers: covers.size, sees: ordered(covers, reg.anchor),
+      // Same reason planViews carries it: the close-up prompt annotates each
+      // frame with the screen-axis mapping it was really drawn in, and a
+      // tightened frame is a DIFFERENT camera than the region's first guess, so
+      // the basis has to be the one that survived the tightening loop.
+      cam,
       // Recorded because it is the difference between "we aimed at the region" and
       // "we aimed at the region and had to zoom in twice to make it readable".
       ...(chosen.frameRadius !== reg.radius ? { tightened: +(chosen.frameRadius / reg.radius).toFixed(3) } : {}),
@@ -752,7 +879,7 @@ export const AZIMUTH_RETRY = 90;
 const MIN_NAME_TOKEN = 3;
 
 const normText = (s) => String(s ?? '').toLowerCase().replace(/[_\-.:/\\]+/g, ' ').replace(/\s+/g, ' ').trim();
-const slug = (s) => (String(s ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 24) || 'aim');
+export const slug = (s) => (String(s ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 24) || 'aim');
 
 // The model reports whichever name it saw in the prompt, and we cannot ask it to
 // distinguish a part from the container holding it. So a name resolves to itself

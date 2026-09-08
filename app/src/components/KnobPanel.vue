@@ -22,13 +22,18 @@ const hasKnobs = computed(() => knobEntries.value.length > 0);
     <div v-if="!activeJoint" class="empty">Select a joint to see its controls.</div>
 
     <template v-else>
-      <component
-        v-for="(k, i) in knobEntries"
-        :key="`${k.render}-${k.axis || k.source || i}`"
-        :is="k.component"
-        :knob="k"
-      />
-      <div v-if="!hasKnobs" class="empty">This joint exposes no controls yet.</div>
+      <!-- While a discovery/vision op is in flight the knobs are locked: driving a
+           joint mid-campaign would move the very mesh the render farm is drawing. -->
+      <div class="knobs" :class="{ locked: state.discovering }">
+        <component
+          v-for="(k, i) in knobEntries"
+          :key="`${k.render}-${k.axis || k.source || i}`"
+          :is="k.component"
+          :knob="k"
+        />
+        <div v-if="!hasKnobs" class="empty">This joint exposes no controls yet.</div>
+      </div>
+      <div v-if="state.discovering" class="locknote">controls locked while the AI is discovering</div>
     </template>
 
     <div v-if="state.validation" class="verdict" :class="state.validation.pass ? 'pass' : 'fail'">
@@ -43,6 +48,8 @@ const hasKnobs = computed(() => knobEntries.value.length > 0);
 .title { color: var(--good); font-family: ui-monospace, monospace; margin-bottom: 8px; display: flex; gap: 8px; align-items: baseline; }
 .joint { color: var(--value); font-size: 12px; }
 .empty { color: var(--faint); font-style: italic; padding: 6px 2px; }
+.knobs.locked { pointer-events: none; opacity: .55; }
+.locknote { color: #b58900; font-size: 11px; font-family: ui-monospace, monospace; margin-top: 6px; }
 .verdict { margin-top: 12px; font-family: ui-monospace, monospace; font-size: 12px; padding: 6px 8px; border-radius: 6px; }
 .verdict.pass { color: var(--good); background: var(--pass-bg); border: 1px solid var(--pass-border); }
 .verdict.fail { color: var(--bad); background: var(--fail-bg); border: 1px solid var(--fail-border); }

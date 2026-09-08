@@ -63,6 +63,9 @@ export async function startServer({ configPath = null, port = 0, verbose = false
   kernel.attachFarm(farm);
 
   const disposeEvents = registerEventsSocket(app, kernel, farm);
+  // registerEventsSocket decorates app.broadcast; hand it to the kernel so the
+  // chained vision campaign can narrate itself over the same socket the UI reads.
+  kernel.attachBroadcast((o) => app.broadcast(o));
   projectRoutes(app, kernel);
   jointRoutes(app, kernel);
   fsRoutes(app, kernel);

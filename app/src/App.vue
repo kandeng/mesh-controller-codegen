@@ -140,7 +140,7 @@ onBeforeUnmount(() => {
 .panes { flex: 1; min-height: 0; display: flex; }
 .pane { min-width: 0; min-height: 0; overflow: hidden; }
 
-.viewer-pane { flex: 1 1 auto; background: var(--bg); }
+.viewer-pane { flex: 1 1 auto; background: var(--bg); position: relative; }
 .side-pane { flex: 0 0 auto; display: flex; flex-direction: column; background: var(--panel); }
 .chat-pane { flex: 0 0 auto; padding: 12px; background: var(--panel); }
 

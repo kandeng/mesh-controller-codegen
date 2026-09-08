@@ -80,7 +80,11 @@ console.log('\nProving vision grounding\n');
 
 // ---- B/C) box grounding against real geometry --------------------------------
 const g = await parseGlb(GLB);
-const plan = planViews(g, { maxViews: 4 });
+// `survey: 0`: this suite grounds boxes against a pose, and the omni survey tier is
+// forced whole-machine framing — its own behaviour is pinned in verify-views.mjs.
+// Keeping it off here means the probe runs against the greedy basis it was written
+// for, rather than against whichever flank the survey happened to look at first.
+const plan = planViews(g, { maxViews: 4, survey: 0 });
 const named = namedIndex(g);
 const targets = renderTargets(g);
 const nameOfMesh = new Map();
