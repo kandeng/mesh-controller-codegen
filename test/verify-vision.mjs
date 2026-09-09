@@ -1170,6 +1170,31 @@ function makeFakes(replyOf) {
       const r = reconcileLanes(held, { records: [mkRec('vis_rotor', 'L2-vision', [other, third])] }, { origin: 'L2-vision' });
       return r.records.length === 1 && r.records[0].id === 'vis_rotor' && r.confirms.length === 0 && r.agreed.length === 0;
     })());
+  ok('G8: an OVERLAPPING claim is the same part seen twice - it corroborates, never duplicates',
+    (() => {
+      // the geometry lane held the whole rigid cluster; the vision lane grounded a
+      // subset of it (as it does in the wild: 8 of a rotor's 15 nodes)
+      const big = [mkRec('rotor_big', 'L1-geometry', [subject, other, third, 'bolt_x', 'bolt_y'])];
+      const r = reconcileLanes(big, { records: [mkRec('vis_sub', 'L2-vision', [subject, other, third])] }, { origin: 'L2-vision' });
+      return r.records.length === 0 && r.agreed.length === 1 && r.agreed[0].id === 'rotor_big'
+        && r.agreed[0].match === 'overlap' && r.agreed[0].containment === 1
+        && r.confirms.length === 1 && r.confirms[0].tag === 'cross-producer:L2-vision';
+    })(), J(reconcileLanes([mkRec('rotor_big', 'L1-geometry', [subject, other, third])],
+      { records: [mkRec('vis_sub', 'L2-vision', [subject, other])] }, { origin: 'L2-vision' }).agreed));
+  ok('G8: a partial overlap below the floor is NOT merged - a brush is not an agreement',
+    (() => {
+      // 2 of 4 shared = 0.5 containment of the smaller claim -> merged; 1 of 4 = 0.25 -> not
+      const arm = [mkRec('arm_a', 'L1-geometry', [subject, other, third, 'bolt_z'])];
+      const brushed = reconcileLanes(arm, { records: [mkRec('vis_arm', 'L2-vision', [subject, 'p', 'q', 'r'])] }, { origin: 'L2-vision' });
+      return brushed.records.length === 1 && brushed.records[0].id === 'vis_arm' && brushed.agreed.length === 0;
+    })());
+  ok('G8: the lane-only nodes of an overlap merge are reported, and the kept set is unchanged',
+    (() => {
+      const big = [mkRec('rotor_big', 'L1-geometry', [subject, other, third])];
+      const r = reconcileLanes(big, { records: [mkRec('vis_off', 'L2-vision', [subject, other, 'extra_node'])] }, { origin: 'L2-vision' });
+      return r.records.length === 0 && r.agreed[0].laneOnly.length === 1 && r.agreed[0].laneOnly[0] === 'extra_node'
+        && big[0].nodes.length === 3 && big[0].nodes.includes('extra_node') === false;
+    })());
   ok('G8: a TYPE disagreement between producers is reported, never silently resolved',
     (() => {
       const r = reconcileLanes([mkRec('gim_x', 'L1-geometry', [subject], 'gimbal')],

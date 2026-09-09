@@ -254,27 +254,53 @@ function laneDelta(base, after) {
 // Reconcile ONE lane's delta against what the manifest says NOW — which, for the
 // second lane, includes what the first lane just added.
 //
-// Identity is the NODE SET, not the id and not the type: two producers that found
-// the same part are two producers that found the same part, however they named it
-// and whichever motion they guessed for it. Admitting both would leave two records
-// over one node set, and `isolation` would then fail both forever — a permanent
+// Identity is the NODE SET up to substantial OVERLAP, not the id and not the type.
+// Exact-set alone was too strict for the commonest kind of agreement: the geometry
+// lane clusters the whole rigid unit (blade + hub + mount — 15 nodes on the air3)
+// while the vision lane grounds only what its frames resolve (8 of those 15). Those
+// are one part seen twice, but exact identity admitted them as TWO records — and
+// because the sets share nodes, `isolation` then failed both forever: a permanent
 // amber pair no human can dispose of without deleting one by hand.
 //
-// So the second claim becomes CORROBORATION of the first, routed through the
-// confirm path with a `cross-producer:` tag. That path only ever LIFTS confidence
-// and can never cross the auto-accept threshold on its own, which is the whole
-// point: agreement between two producers is evidence, and physics plus a human
-// still decide.
-export function reconcileLanes(manifest, delta, { origin = null, tag = null } = {}) {
+// So a claim whose nodes are (mostly) inside an existing record's nodes is the SAME
+// part: containment = shared / min(|a|,|b|), i.e. 1.0 when one claim contains the
+// other. At or above OVERLAP_MERGE it becomes CORROBORATION of the best-matching
+// record, routed through the confirm path with a `cross-producer:` tag; that path
+// only ever LIFTS confidence and can never cross the auto-accept threshold on its
+// own. Below the floor the claims merely brush (a shared mount bolt) and stay
+// separate for a human to adjudicate. The kept record's node set is left UNCHANGED
+// — it is the physics-validated rigid unit — and the nodes only the lane claimed are
+// reported on the agreed entry, never silently absorbed.
+export const OVERLAP_MERGE = 0.5;
+
+function overlapWith(recordNodes, nodes) {
+  const have = new Set(recordNodes || []);
+  let shared = 0;
+  for (const n of nodes || []) if (have.has(n)) shared += 1;
+  const min = Math.min((recordNodes || []).length, (nodes || []).length);
+  return { shared, containment: min ? shared / min : 0 };
+}
+
+export function reconcileLanes(manifest, delta, { origin = null, tag = null, overlap = OVERLAP_MERGE } = {}) {
   const key = (nodes) => [...(nodes || [])].sort().join('|');
   const bySet = new Map();
-  for (const r of manifest || []) if (r?.id) bySet.set(key(r.nodes), r);
+  const live = [];
+  for (const r of manifest || []) if (r?.id) { bySet.set(key(r.nodes), r); live.push(r); }
   const records = [];
   const confirms = [...(delta?.confirms || [])];
   const agreed = [];
   for (const rec of delta?.records || []) {
     if (!rec?.nodes?.length) continue;
-    const hit = bySet.get(key(rec.nodes));
+    const exact = bySet.get(key(rec.nodes));
+    let hit = exact || null;
+    let stats = exact ? { shared: rec.nodes.length, containment: 1 } : null;
+    if (!hit) {
+      let best = 0;
+      for (const r of live) {
+        const s = overlapWith(r.nodes, rec.nodes);
+        if (s.shared > 0 && s.containment >= overlap && s.containment > best) { hit = r; best = s.containment; stats = s; }
+      }
+    }
     if (hit) {
       confirms.push({
         targetId: hit.id,
@@ -287,11 +313,20 @@ export function reconcileLanes(manifest, delta, { origin = null, tag = null } = 
         // is exactly the kind of thing a human should see, and picking one
         // silently would be a third producer with no evidence.
         typeMismatch: hit.type !== rec.type ? { kept: hit.type, lane: rec.type } : null,
+        // HOW the two claims matched, so a reader can tell a perfect agreement from
+        // a near-one: 'exact' = identical node sets, 'overlap' = one claim is
+        // (mostly) inside the other, with the shared count and the nodes only the
+        // lane claimed carried alongside for transparency.
+        match: exact ? 'exact' : 'overlap',
+        shared: stats.shared,
+        containment: Number(stats.containment.toFixed(2)),
+        laneOnly: exact ? [] : (rec.nodes || []).filter((n) => !(hit.nodes || []).includes(n)),
       });
       continue;
     }
     records.push(rec);
     bySet.set(key(rec.nodes), rec);
+    live.push(rec);
   }
   return { records, confirms, agreed };
 }
