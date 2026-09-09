@@ -29,6 +29,10 @@ export function useKernelApi() {
     slots: (id) => get(`/api/joints/${encodeURIComponent(id)}/slots`),
     joints: () => get('/api/joints'),
     refine: () => post('/api/manifest/refine'),
+    // Human-in-the-loop: steer (`text`) or stop (`stop`) the in-flight parallel
+    // refinement. postRaw — a 409 means nothing is running, so there is nowhere to
+    // intervene, and the composer needs to know that rather than swallow it.
+    intervene: (body) => postRaw('/api/refine/intervene', body || {}),
     // Phase 3: ONE vision round. postRaw, not post — a refusal is a 400/409/502/
     // 503 whose body carries `unmet`, the list of every precondition missing.
     // Throwing that away would leave the UI able to say only "it failed".

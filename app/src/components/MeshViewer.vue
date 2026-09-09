@@ -930,9 +930,12 @@ function onClick(ev) {
 // The vision round is the part of discovery where the AI physically goes and
 // looks: the NBV planner picks a handful of poses, a browser tab draws them, and
 // the model reads the frames. That camera path is persisted with the round
-// (plan.views[].pose), so the 3D view can REPLAY the tour: a polyline through the
-// eye positions, a glyph travelling stop to stop, and a filmstrip of the exact
-// frames the model was handed, highlighted in sync. Post-hoc rather than live on
+// (plan.views[].pose), so the 3D view can REPLAY the tour: a glyph travelling
+// stop to stop, and a filmstrip of the exact frames the model was handed,
+// highlighted in sync. The camera PATH itself is deliberately NOT drawn — a
+// polyline through the eye positions reads as visual noise over the machine and
+// says nothing a filmstrip cannot, so only the moving glyph marks where the
+// camera was. Post-hoc rather than live on
 // purpose — a round's poses and frames are only complete once it finishes, and a
 // replay of what actually happened is honest in a way a live guess-animation is not.
 let tourGroup = null;
@@ -958,7 +961,7 @@ function buildTour(rec) {
   const urlFor = (vid) => (frames.find((f) => f.id === vid || f.id?.startsWith(`${vid}~`) || f.id?.includes(vid))?.url || null);
   tourGroup = new THREE.Group();
   const pts = views.map((v) => new THREE.Vector3(v.pose.eye[0] - center.x, v.pose.eye[1] - center.y, v.pose.eye[2] - center.z));
-  tourGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color: 0x7aa5c9 })));
+  // No trajectory polyline here on purpose (see the header note): only the glyph.
   tourGlyph = new THREE.Mesh(new THREE.ConeGeometry(radius * 0.03, radius * 0.09, 12), new THREE.MeshBasicMaterial({ color: 0x7aa5c9 }));
   tourGroup.add(tourGlyph);
   scene.add(tourGroup);
@@ -1048,9 +1051,9 @@ function livePlan(views) {
     liveStops.set(v.id, { eyeV, targetV });
     pts.push(eyeV);
   }
-  if (pts.length > 1) {
-    liveGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color: 0x7aa5c9 })));
-  }
+  // Only the travelling glyph is drawn, never the connecting polyline: the camera
+  // trajectory over the machine reads as clutter and the filmstrip already shows
+  // where each stop looked.
   liveGlyph = new THREE.Mesh(new THREE.ConeGeometry(radius * 0.03, radius * 0.09, 12), new THREE.MeshBasicMaterial({ color: 0x7aa5c9 }));
   liveGroup.add(liveGlyph);
   if (pts.length) liveGlyph.position.copy(pts[0]);

@@ -4,7 +4,7 @@
 // clipboard (Ctrl+V in the composer) or upload a local image file; thumbnails
 // queue above the composer and ride along with the next message. The transcript
 // (text, images, tool activity lines) is restored from the session store on load.
-import { ref, nextTick, watch, onMounted, onBeforeUnmount } from 'vue';
+import { ref, computed, nextTick, watch, onMounted, onBeforeUnmount } from 'vue';
 import { useProjectStore } from '../composables/useProjectStore.js';
 import { useAgentSocket } from '../composables/useAgentSocket.js';
 import { useKernelApi } from '../composables/useKernelApi.js';
@@ -23,6 +23,54 @@ const uploading = ref(0);
 const lightbox = ref(null);   // { url, name } of the image shown full-size
 const taRef = ref(null);      // composer textarea
 const userH = ref(null);      // manual composer height in px; null = auto-grow
+
+// ---- folding: screenshot stacks + over-long messages -------------------------
+// A vision campaign posts one assistant message PER rendered frame, so a round
+// lands as a vertical run of near-identical thumbnails. Those runs are grouped
+// into a STACK that shows only its first frame until opened; and any message
+// longer than LONG_LINES lines is clipped to a readable block. Both are pure
+// presentation — the transcript itself is untouched, so nothing is lost.
+const LONG_LINES = 10;
+const openStacks = ref(new Set());   // stack keys currently expanded
+const openLong = ref(new Set());     // message keys currently expanded
+
+// Group the transcript into render rows: a maximal run of consecutive assistant
+// messages carrying screenshots becomes one `stack` row; everything else stays a
+// plain `msg` row. Keys are the transcript index of the row's first message, so
+// they are stable as the transcript grows.
+const rows = computed(() => {
+  const out = [];
+  let stack = null;
+  state.transcript.forEach((m, i) => {
+    const isShot = m.role === 'assistant' && (m.attachments || []).length > 0;
+    if (isShot) {
+      if (!stack) { stack = { type: 'stack', key: `s${i}`, items: [] }; out.push(stack); }
+      stack.items.push({ m, i });
+    } else {
+      stack = null;
+      out.push({ type: 'msg', m, i, key: `m${i}` });
+    }
+  });
+  return out;
+});
+
+const lineCount = (m) => (m.text ? String(m.text).split('\n').length : 0);
+const isLong = (m) => lineCount(m) > LONG_LINES;
+
+function toggleIn(set, key) {
+  if (set.has(key)) set.delete(key); else set.add(key);
+}
+function toggleStack(key) { toggleIn(openStacks.value, key); }
+function toggleLong(key) { toggleIn(openLong.value, key); }
+function maybeToggleLong(m, key) { if (isLong(m)) toggleLong(key); }
+
+const visibleShots = (row) => (openStacks.value.has(row.key) ? row.items : row.items.slice(0, 1));
+
+// Click semantics for a stacked frame: EVERY thumbnail (first, middle, last alike)
+// zooms to the lightbox — a picture is for looking at. Folding / expanding the
+// stack is owned by the panel's empty region (the bubble outside the thumbnails)
+// and by the explicit toggle button, never by a thumbnail, so zooming can never
+// accidentally collapse the sequence.
 
 const readAsBase64 = (file) => new Promise((res, rej) => {
   const fr = new FileReader();
@@ -136,6 +184,7 @@ async function scrollDown() {
 }
 watch(() => state.transcript.length, scrollDown);
 watch(() => state.transcript[state.transcript.length - 1]?.text, scrollDown); // streaming deltas
+watch(() => state.statusLine, scrollDown); // the live "please wait" line appears/updates at the end
 
 onMounted(async () => { connect(); await resume(); scrollDown(); nextTick(autoGrow); addEventListener('keydown', onKeydown); });
 onBeforeUnmount(() => { removeEventListener('keydown', onKeydown); });
@@ -151,21 +200,37 @@ onBeforeUnmount(() => { removeEventListener('keydown', onKeydown); });
         Ask the assistant to recommend joints, or load a mesh and pick one to begin.
         Tip: paste (Ctrl+V) or upload a viewer screenshot to report a visual bug.
       </div>
-      <template v-for="(m, i) in state.transcript" :key="i">
-        <div v-if="m.role === 'tool'" class="tool-line" :title="m.text">⚙ {{ m.text }}</div>
-        <div v-else class="msg" :class="[m.role, { streaming: m.streaming, cmd: m.command }]">
+      <template v-for="row in rows" :key="row.key">
+        <div v-if="row.type === 'msg' && row.m.role === 'tool'" class="tool-line" :title="row.m.text">⚙ {{ row.m.text }}</div>
+        <div v-else-if="row.type === 'msg'" class="msg" :class="[row.m.role, { streaming: row.m.streaming, cmd: row.m.command }]">
           <div class="bubble">
-            <div v-if="m.attachments?.length" class="shots">
-              <img v-for="a in m.attachments" :key="a.id || a.url" class="zoomable" :src="a.url" :alt="a.name || 'screenshot'" loading="lazy" @click="openLightbox(a.url, a.name)" />
+            <div v-if="row.m.attachments?.length" class="shots">
+              <img v-for="a in row.m.attachments" :key="a.id || a.url" class="zoomable" :src="a.url" :alt="a.name || 'screenshot'" loading="lazy" @click="openLightbox(a.url, a.name)" />
             </div>
-            <template v-if="m.text">{{ m.text }}</template>
-            <div v-if="m.tools?.length && !m.streaming" class="tools">
-              <div v-for="(t, k) in m.tools" :key="k" class="tool-line">⚙ {{ t }}</div>
+            <div v-if="row.m.text" class="txt" :class="{ foldable: isLong(row.m) }" @click="maybeToggleLong(row.m, row.key)"><span class="txtbody" :class="{ clamped: isLong(row.m) && !openLong.has(row.key) }">{{ row.m.text }}</span><span v-if="isLong(row.m)" class="foldhint">{{ openLong.has(row.key) ? '⌃ collapse' : `⌄ show all ${lineCount(row.m)} lines` }}</span></div>
+            <div v-if="row.m.tools?.length && !row.m.streaming" class="tools">
+              <div v-for="(t, k) in row.m.tools" :key="k" class="tool-line">⚙ {{ t }}</div>
             </div>
+          </div>
+        </div>
+        <!-- a run of consecutive assistant screenshots, stacked to one frame -->
+        <div v-else class="msg assistant">
+          <div class="bubble stackb" :class="{ open: openStacks.has(row.key) }" @click="toggleStack(row.key)">
+            <div v-for="it in visibleShots(row)" :key="it.i" class="shot">
+              <div class="shotimg">
+                <img v-for="a in it.m.attachments" :key="a.id || a.url" class="zoomable" :src="a.url" :alt="a.name || 'screenshot'" loading="lazy" @click.stop="openLightbox(a.url, a.name)" />
+                <span v-if="!openStacks.has(row.key) && row.items.length > 1" class="stackbadge" :title="`${row.items.length} screenshots stacked — click a frame to zoom, the panel to expand`">{{ row.items.length }}</span>
+              </div>
+              <div v-if="it.m.text" class="txt shotnote">{{ it.m.text }}</div>
+            </div>
+            <button v-if="row.items.length > 1" type="button" class="stacktoggle" @click.stop="toggleStack(row.key)">
+              {{ openStacks.has(row.key) ? 'fold the stack' : `show all ${row.items.length} screenshots` }}
+            </button>
           </div>
         </div>
       </template>
       <div v-if="state.busy && !state.transcript.some((m) => m.streaming)" class="msg assistant"><div class="bubble typing">thinking…</div></div>
+      <div v-if="state.statusLine" class="msg assistant"><div class="bubble status"><span class="pulse" aria-hidden="true" />{{ state.statusLine }}</div></div>
     </div>
     <div v-if="pending.length" class="thumbs">
       <div v-for="p in pending" :key="p.id" class="thumb">
@@ -181,10 +246,10 @@ onBeforeUnmount(() => { removeEventListener('keydown', onKeydown); });
       <button type="button" class="attach" title="Upload an image (or paste with Ctrl+V)" @click="fileInput.click()"><span class="ic ic-folder" aria-hidden="true"></span></button>
       <div class="ta-wrap">
         <div class="grip" title="Drag to resize · double-click for auto height" @pointerdown="startResize" @dblclick="resetHeight"><span /></div>
-        <textarea ref="taRef" v-model="draft" rows="1" placeholder="Message the assistant… Enter sends · Shift+Enter new line · Ctrl+V pastes screenshots · while busy, sends queue up" @paste="onPaste" @keydown.enter="onEnterKey"></textarea>
+        <textarea ref="taRef" v-model="draft" rows="1" :placeholder="state.refining ? 'Steer the running detection — type a note and Enter folds it into the next model ask (e.g. ignore the landing gear, or the gimbal is what matters)' : 'Message the assistant… Enter sends · Shift+Enter new line · Ctrl+V pastes screenshots · while busy, sends queue up'" @paste="onPaste" @keydown.enter="onEnterKey"></textarea>
       </div>
-      <button type="submit" class="sendbtn" title="Send (Enter sends · while busy, sends queue up)" :disabled="uploading > 0 || (!draft.trim() && !pending.length)"><span class="ic ic-send" aria-hidden="true"></span></button>
-      <button type="button" class="stopbtn" title="Stop the current task (queued messages still run)" :disabled="!state.busy" @click="stop"><span class="ic ic-stop" aria-hidden="true"></span></button>
+      <button type="submit" class="sendbtn" :title="state.refining ? 'Send a steering note to the running detection loop' : 'Send (Enter sends · while busy, sends queue up)'" :disabled="uploading > 0 || (!draft.trim() && !pending.length)"><span class="ic ic-send" aria-hidden="true"></span></button>
+      <button type="button" class="stopbtn" :title="state.refining ? 'Stop the detection loop — it halts at the next safe boundary and merges nothing' : 'Stop the current task (queued messages still run)'" :disabled="!state.busy && !state.refining" @click="stop"><span class="ic ic-stop" aria-hidden="true"></span></button>
     </form>
 
     <!-- Click-to-zoom lightbox (teleported to <body> so it escapes the pane). -->
@@ -212,8 +277,38 @@ onBeforeUnmount(() => { removeEventListener('keydown', onKeydown); });
 .msg.system .bubble { background: transparent; color: var(--warn); font-size: 12px; font-family: ui-monospace, monospace; }
 .msg.streaming .bubble { opacity: .85; }
 .typing { color: var(--muted); font-style: italic; }
+/* Live status line: the single "DSH is asking <model> … please wait" bubble that
+   sits at the very end of the transcript while a remote call is in flight. A
+   soft pulsing dot marks it as LIVE (working), not as a settled answer. */
+.msg.assistant .bubble.status { color: var(--warn); border-color: var(--border-accent, var(--accent-2)); font-size: 12px; display: flex; align-items: baseline; gap: 7px; }
+.bubble.status .pulse { flex: 0 0 auto; width: 7px; height: 7px; border-radius: 50%; background: var(--warn); align-self: center; animation: statusPulse 1.1s ease-in-out infinite; }
+@keyframes statusPulse { 0%, 100% { opacity: .35; transform: scale(.82); } 50% { opacity: 1; transform: scale(1.15); } }
 .shots { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 6px; }
 .shots img { max-width: 100%; max-height: 180px; border-radius: 6px; border: 1px solid var(--border-2); display: block; }
+/* Foldable text: an over-long message clips to LONG_LINES lines and the block is
+   clickable to expand / collapse, with a hint naming the real length. */
+.txt { white-space: pre-wrap; }
+.txt.foldable { cursor: pointer; }
+/* The folded preview is clamped by HEIGHT (ten line-boxes), not by slicing source
+   lines: narrowing the panel re-wraps the text INSIDE the same ten-line window
+   instead of stretching the block. 1.45em is the bubble line-height, so ten lines
+   = 14.5em at whatever font-size the bubble uses. */
+.txtbody { display: block; white-space: pre-wrap; }
+.txtbody.clamped { max-height: 14.5em; overflow: hidden; }
+.foldhint { display: block; color: var(--muted); font-size: 11px; font-style: italic; }
+/* Screenshot stack: a run of assistant frames collapses to its first image with a
+   count badge; expanding reveals every frame with its own annotation. */
+.shot { margin-bottom: 6px; }
+.shot:last-of-type { margin-bottom: 0; }
+/* The panel's empty region (outside the thumbnails) is the fold/expand handle, so
+   it reads as clickable; thumbnails keep their own zoom-in cursor. */
+.bubble.stackb { cursor: pointer; }
+.shotimg { position: relative; display: inline-block; }
+.shotimg img { max-width: 100%; max-height: 180px; border-radius: 6px; border: 1px solid var(--border-2); display: block; }
+.stackbadge { position: absolute; top: 4px; right: 4px; background: rgba(0, 0, 0, .62); color: #fff; font-family: ui-monospace, monospace; font-size: 11px; line-height: 1; padding: 3px 6px; border-radius: 9px; pointer-events: none; }
+.shotnote { font-size: 12px; color: var(--muted); margin-top: 3px; }
+.stacktoggle { display: block; width: 100%; margin-top: 6px; background: transparent; border: 1px dashed var(--border-2); color: var(--muted); border-radius: 6px; font-size: 11px; padding: 3px 6px; cursor: pointer; }
+.stacktoggle:hover { color: var(--text); border-color: var(--border-accent); }
 .tool-line { color: var(--muted); font-family: ui-monospace, monospace; font-size: 11px; padding: 1px 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tools { margin-top: 6px; border-top: 1px dashed var(--border-2); padding-top: 4px; }
 .thumbs { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; padding: 6px 0 0; }
