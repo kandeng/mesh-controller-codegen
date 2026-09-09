@@ -47,57 +47,51 @@ export async function parseGlb(path) {
   const meshes = g.meshes || [];
   const accs = g.accessors || [];
 
-  // Local XY extent of the first mesh found in the subtree (blade vs hub hint).
+  // Local XY extent of this node's OWN mesh (blade vs hub hint). Deliberately NOT
+  // the subtree's: a container's extent is inherited from its placed world box
+  // below, because scaling a descendant's accessor extent by the CONTAINER's
+  // scale is wrong by exactly the intermediate scales in between.
   function xyExtent(i) {
-    const stack = [i];
-    while (stack.length) {
-      const n = nodes[stack.pop()];
-      if (n.mesh != null) {
-        let ex = 0; let ey = 0; let ez = 0;
-        for (const p of (meshes[n.mesh] || {}).primitives || []) {
-          const a = accs[(p.attributes || {}).POSITION];
-          if (a && a.min && a.max) {
-            ex = Math.max(ex, a.max[0] - a.min[0]);
-            ey = Math.max(ey, a.max[1] - a.min[1]);
-            ez = Math.max(ez, a.max[2] - a.min[2]);
-          }
-        }
-        return { ex, ey, ez };
+    const n = nodes[i];
+    if (n.mesh == null) return null;
+    let ex = 0; let ey = 0; let ez = 0;
+    for (const p of (meshes[n.mesh] || {}).primitives || []) {
+      const a = accs[(p.attributes || {}).POSITION];
+      if (a && a.min && a.max) {
+        ex = Math.max(ex, a.max[0] - a.min[0]);
+        ey = Math.max(ey, a.max[1] - a.min[1]);
+        ez = Math.max(ez, a.max[2] - a.min[2]);
       }
-      stack.push(...(n.children || []));
     }
-    return null;
+    return { ex, ey, ez };
   }
 
-  // Local AABB of the first mesh in the subtree: the UNION over primitives of the
-  // accessor min/max. Kept strictly separate from `ext` above (which is the
-  // per-axis max of per-primitive SPANS, the input to the phase-1 blade
-  // heuristic) so adding world bboxes cannot perturb discovery results.
+  // Local AABB of this node's OWN mesh: the UNION over primitives of the accessor
+  // min/max. Kept strictly separate from `ext` above (which is the per-axis max of
+  // per-primitive SPANS, the input to the phase-1 blade heuristic) so adding world
+  // bboxes cannot perturb discovery results. A container's world box is the union
+  // of its descendants' PLACED boxes, computed further down — transforming a
+  // descendant's accessor box by the container's matrix would drop every
+  // intermediate scale and translation on the way down the chain.
   //
   // Why this matters: `ext` alone cannot place a bbox. CAD-style exports bake
   // absolute vertex coordinates into the accessor and leave the node at the
   // origin, so centring a bbox on the node's world translation puts it in empty
   // space — up to tens of units away from the geometry it describes.
   function subtreeBox(i) {
-    const stack = [i];
-    while (stack.length) {
-      const n = nodes[stack.pop()];
-      if (n.mesh != null) {
-        let mn = null; let mx = null;
-        for (const p of (meshes[n.mesh] || {}).primitives || []) {
-          const a = accs[(p.attributes || {}).POSITION];
-          if (!a || !a.min || !a.max) continue;
-          if (!mn) { mn = a.min.slice(0, 3); mx = a.max.slice(0, 3); continue; }
-          for (let k = 0; k < 3; k += 1) {
-            if (a.min[k] < mn[k]) mn[k] = a.min[k];
-            if (a.max[k] > mx[k]) mx[k] = a.max[k];
-          }
-        }
-        if (mn) return { min: mn, max: mx };
+    const n = nodes[i];
+    if (n.mesh == null) return null;
+    let mn = null; let mx = null;
+    for (const p of (meshes[n.mesh] || {}).primitives || []) {
+      const a = accs[(p.attributes || {}).POSITION];
+      if (!a || !a.min || !a.max) continue;
+      if (!mn) { mn = a.min.slice(0, 3); mx = a.max.slice(0, 3); continue; }
+      for (let k = 0; k < 3; k += 1) {
+        if (a.min[k] < mn[k]) mn[k] = a.min[k];
+        if (a.max[k] > mx[k]) mx[k] = a.max[k];
       }
-      stack.push(...(n.children || []));
     }
-    return null;
+    return mn ? { min: mn, max: mx } : null;
   }
 
   const info = nodes.map((n, i) => {
@@ -204,9 +198,72 @@ export async function parseGlb(path) {
     n.wb = n.box ? worldBox(m, n.box) : null; // true placed world bbox
   });
 
+  // Containers inherit two DIFFERENT things from their subtree, because two
+  // different consumers need two different answers:
+  //
+  //   wb    — the placed world AABB: the UNION of descendants' PLACED boxes.
+  //           The old shortcut (transform the first descendant mesh's accessor
+  //           box by the CONTAINER's matrix) silently drops every scale and
+  //           translation between the two nodes: on drone_dji_air3 a ~0.046
+  //           scale half-way down the chain inflated the model bounds 22x
+  //           (wradius 81 over a drone 3 units across), which parked every
+  //           survey camera ~200 units from the machine and handed the coverage
+  //           maths boxes in empty space. This is what framing/visibility want.
+  //
+  //   wext  — a ROTATION-FREE shape descriptor: the per-axis MAX over
+  //           descendants' own scale-aware extents. Deliberately NOT the span of
+  //           the union box above: a world AABB re-axes a tilted plate, so a
+  //           14.2x14.7x2.1 propeller blade comes back as 16.7x8.5x16.5 and the
+  //           blade heuristic's plate test (thin axis vs two large ones) rejects
+  //           the very container that names it. Mesh nodes keep ext × world
+  //           scale; containers keep the largest part span inside them, which is
+  //           the same question the old code accidentally answered.
+  const boxOf = (min, max) => ({
+    min, max,
+    c: [(min[0] + max[0]) / 2, (min[1] + max[1]) / 2, (min[2] + max[2]) / 2],
+    h: [(max[0] - min[0]) / 2, (max[1] - min[1]) / 2, (max[2] - min[2]) / 2],
+  });
+  const unionBox = (a, b) => {
+    if (!a) return b;
+    if (!b) return a;
+    return boxOf(
+      [0, 1, 2].map((k) => Math.min(a.min[k], b.min[k])),
+      [0, 1, 2].map((k) => Math.max(a.max[k], b.max[k])),
+    );
+  };
+  const maxSpan = (a, b) => (a && b
+    ? { ex: Math.max(a.ex, b.ex), ey: Math.max(a.ey, b.ey), ez: Math.max(a.ez, b.ez) }
+    : (a || b));
+  const agg = new Array(info.length).fill(undefined);
+  const subtreeAgg = (i, seen) => {
+    if (agg[i] !== undefined) return agg[i];
+    if (seen.has(i)) return null; // a cyclic graph is invalid glTF; refuse to hang on it
+    seen.add(i);
+    let box = info[i].wb || null;
+    let span = info[i].wext || null;
+    for (const c of nodes[i].children || []) {
+      const s = subtreeAgg(c, seen);
+      if (!s) continue;
+      box = unionBox(box, s.box);
+      span = maxSpan(span, s.span);
+    }
+    seen.delete(i);
+    agg[i] = { box, span };
+    return agg[i];
+  };
+  info.forEach((n, i) => {
+    const a = subtreeAgg(i, new Set());
+    if (!a) return;
+    if (!n.wb && a.box) n.wb = a.box;
+    if (!n.wext && a.span) n.wext = a.span;
+  });
+
   const extOf = (x) => Math.max(x.ex, x.ey);
-  const maxExt = Math.max(1e-9, ...info.filter((x) => x.ext).map((x) => extOf(x.ext)));
-  const maxWExt = Math.max(1e-9, ...info.filter((x) => x.wext).map((x) => extOf(x.wext)));
+  // Over MESH nodes only: a container's extent is a footprint, not a part, and a
+  // blade heuristic normalising against the whole model's span would reject every
+  // real blade on a machine whose hull is its largest object.
+  const maxExt = Math.max(1e-9, ...info.filter((x) => x.mesh && x.ext).map((x) => extOf(x.ext)));
+  const maxWExt = Math.max(1e-9, ...info.filter((x) => x.mesh && x.wext).map((x) => extOf(x.wext)));
   // Horizontal model radius: farthest node world position from the XY centroid.
   const cx = info.reduce((a, n) => a + n.wp[0], 0) / info.length;
   const cy = info.reduce((a, n) => a + n.wp[1], 0) / info.length;

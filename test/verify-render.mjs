@@ -71,10 +71,20 @@ if (st0.ok !== true || st0.loaded !== true) {
   ok('POST /api/project loads the mesh the probe plans against',
     proj.ok === true, `${proj.joints?.length} joint units, ${proj.stats?.count} nodes`);
 }
+// Whatever is loaded is what this probe measures, and the mode assertions below
+// depend on the model (a machine with no enclosed interior has nothing for a
+// ghost frame to reveal). Say which one it is, with the two numbers that decide
+// framing: the placed-bbox circumradius the cameras are fitted to, and the node
+// spread. A wradius far larger than the machine really is means the running
+// server predates a parser fix — restart it before believing a failure here.
+const st1 = await jget('/api/state');
+console.log(`  \u2022 probing against ${st1.glb || '(unknown)'} \u2014 wradius ${Number(st1.stats?.wradius ?? 0).toFixed(2)}, node spread ${Number(st1.stats?.radius ?? 0).toFixed(2)}, ${st1.stats?.count ?? '?'} nodes`);
 
 // Plan against the whole model so the probe gets poses at several distances, then
 // capture the same pose in every mode — mode differences must come from the mode.
-const plan = await jpost('/api/observe/plan', { round: ROUND, maxViews: 4, mode: 'none', allowGhost: false });
+// Ghosts are allowed because the ghost shot below needs the planner to name the
+// interior-only parts, which is the only thing a transparent shell can reveal.
+const plan = await jpost('/api/observe/plan', { round: ROUND, maxViews: 4, mode: 'none', allowGhost: true });
 ok('POST /api/observe/plan produced poses for the probe round',
   plan.status === 200 && plan.body?.ok === true && (plan.body?.plan?.views?.length || 0) >= 1,
   `${plan.body?.plan?.views?.length} views, ${(100 * (plan.body?.plan?.coverage || 0)).toFixed(1)}% of ${plan.body?.plan?.targets} nodes in ${plan.body?.ms}ms`);
@@ -120,16 +130,26 @@ if (shots.photo.bytes) {
 
 // ---- ghost -------------------------------------------------------------------
 // Interior parts are enclosed by a closed shell, so no opaque pose can ever see
-// them. A ghost frame must be a DIFFERENT picture, or the transparency swap in
-// captureAt() silently did nothing.
-shots.ghost = await shoot('ghost', v0);
+// them. Ghost is the mode that reveals them: everything OUTSIDE the focus goes
+// translucent. So the probe focuses the interior-only parts the planner named —
+// exactly what the loop does — and then the frame MUST be a different picture, or
+// the transparency swap in captureAt() silently did nothing. A model with no
+// enclosed interior has nothing to reveal and ghost legitimately equals photo,
+// which is reported rather than asserted either way.
+const interior = Array.isArray(plan.body?.plan?.interiorOnly) ? plan.body.plan.interiorOnly : [];
+const ghostFocus = interior.length ? interior.slice(0, 8) : null;
+shots.ghost = await shoot('ghost', v0, ghostFocus);
 ok('ghost mode renders and delivers a frame', shots.ghost.status === 200 && !!shots.ghost.bytes,
   shots.ghost.error || `${shots.ghost.bytes.length} bytes`);
 if (shots.ghost.bytes && shots.photo.bytes) {
-  ok('  ghost is not the same picture as photo (the shell really went translucent)',
-    !shots.ghost.bytes.equals(shots.photo.bytes)
-    && Math.abs(shots.ghost.bytes.length - shots.photo.bytes.length) / shots.photo.bytes.length > 0.02,
-    `photo ${(shots.photo.bytes.length / 1024).toFixed(1)} kB vs ghost ${(shots.ghost.bytes.length / 1024).toFixed(1)} kB`);
+  const delta = Math.abs(shots.ghost.bytes.length - shots.photo.bytes.length) / shots.photo.bytes.length;
+  if (ghostFocus) {
+    ok('  ghost is not the same picture as photo (the shell really went translucent)',
+      !shots.ghost.bytes.equals(shots.photo.bytes) && delta > 0.02,
+      `photo ${(shots.photo.bytes.length / 1024).toFixed(1)} kB vs ghost ${(shots.ghost.bytes.length / 1024).toFixed(1)} kB (${(delta * 100).toFixed(0)}% apart), ${ghostFocus.length}/${interior.length} interior parts focused`);
+  } else {
+    console.log(`  \u2022 this model reports no interior-only parts (${interior.length}), so a ghost frame has nothing to reveal \u2014 difference check skipped`);
+  }
 }
 
 // ---- solo --------------------------------------------------------------------

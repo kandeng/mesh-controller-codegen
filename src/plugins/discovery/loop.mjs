@@ -133,6 +133,23 @@ function mergeProposals(g, joints, manifest, { records, confirms, confirmTag = '
   return { added: (records || []).length, proposals: (records || []).map((r) => r.id), retested: retest.length };
 }
 
+// A human typed while the loop was working. Their words ride into the next ask as
+// an explicitly-bounded block: guidance the model must WEIGH, never a command that
+// overrides the grounding gate. A part the human names still has to be found in
+// the mesh to become a joint, or it is reported as ungrounded rather than
+// invented — the same boundary the category prior is held to.
+function humanNoteBlock(notes) {
+  const lines = (notes || [])
+    .map((n) => `- ${String(n).trim()}`)
+    .filter((l) => l.trim() !== '-')
+    .join('\n');
+  if (!lines) return '';
+  return `\n\nHUMAN IN THE LOOP (steer, do not obey blindly):\n${lines}\n`
+    + `Weigh these against what the frames and the node table actually show. A part named\n`
+    + `here still has to be grounded in the mesh to become a joint; if you cannot ground it,\n`
+    + `say so rather than inventing it.`;
+}
+
 // Phase 2: one L2 round. `l2` is an injected async (prompt) => reply callable
 // (kernel wires the DSH supervisor; tests inject canned replies). Proposals
 // merge as candidates; only deterministic corroboration lifts a proposal to
@@ -142,7 +159,7 @@ function mergeProposals(g, joints, manifest, { records, confirms, confirmTag = '
 // verbatim and `text:reply` the answer verbatim, so this lane narrates itself in
 // the chat exactly the way the vision lane does. Emit-only — it can watch the
 // round but never alter it.
-export async function runL2Round(g, joints, manifest, l2, { emit = null } = {}) {
+export async function runL2Round(g, joints, manifest, l2, { emit = null, humanNotes = null, abort = null } = {}) {
   const say = typeof emit === 'function' ? emit : () => {};
   const warnings = [];
   const uncertain = manifest.filter((r) => r.status === 'needs-verdict');
@@ -150,8 +167,19 @@ export async function runL2Round(g, joints, manifest, l2, { emit = null } = {}) 
 
   let parsed;
   try {
+    // A human stopping the refinement is honoured at the boundary, before any model
+    // turn: the manifest is left provably untouched, exactly as a reload leaves it.
+    if (typeof abort === 'function' && abort()) return { added: 0, reason: 'stopped before the model was asked', warnings, manifestUntouched: true };
     const focusIds = new Set(uncertain.flatMap((r) => r.nodes));
-    const prompt = buildProposalPrompt({ g, manifest, focusIds });
+    let prompt = buildProposalPrompt({ g, manifest, focusIds });
+    // A human note queued while the geometry pass ran is folded into THIS ask — read
+    // at the boundary and appended to the text the model receives AND the text the
+    // chat narrates, so what the human sees sent is what was actually sent.
+    const notes = typeof humanNotes === 'function' ? humanNotes() : null;
+    if (Array.isArray(notes) && notes.length) {
+      prompt += humanNoteBlock(notes);
+      say('text:note', { notes: notes.map((n) => String(n)) });
+    }
     say('text:ask', { frontier: uncertain.length, prompt });
     const reply = await l2(prompt);
     say('text:reply', { reply: reply ?? null });
@@ -517,6 +545,11 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
     // every further frame and every merge would be about a mesh nobody asked
     // about. Checked at each phase boundary, never mid-await.
     abort = null,
+    // Optional human-in-the-loop hook: a function returning the steering notes a
+    // human typed while the frames were rendering. Read at the ask boundary and
+    // folded into the discovery prompt — guidance the model weighs, never a command
+    // that bypasses the grounding gate.
+    humanNotes = null,
     // Ask WHAT KIND OF MACHINE this is before asking what moves on it, over the
     // same frames (see expectation.mjs). Off by default so a single manual round
     // stays one turn; the campaign switches it on for round 1, which is the only
@@ -691,6 +724,14 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
     independent,
   });
   warnings.push(...prompt.warnings);
+  // A human note arriving while the frames were rendering is folded into THIS ask —
+  // read at the boundary, appended to the text the model receives and the text the
+  // chat narrates, so what the human sees sent is exactly what was sent.
+  const vNotes = typeof humanNotes === 'function' ? humanNotes() : null;
+  if (Array.isArray(vNotes) && vNotes.length) {
+    prompt.text += humanNoteBlock(vNotes);
+    say('vision:note', { notes: vNotes.map((n) => String(n)) });
+  }
   say('vision:ask', { frames: captured.length, prompt: prompt.text });
 
   if (typeof propose !== 'function') {
@@ -999,6 +1040,7 @@ export async function runVisionCampaign(g, joints, manifest, effects = {}) {
       propose: e.propose || null,
       emit: e.emit || null,
       abort: e.abort || null,
+      humanNotes: typeof e.humanNotes === 'function' ? e.humanNotes : null,
       frames: replay,
       persist: persistFor(r),
       // Resolved per round for the same reason `persist` is a factory: the caller

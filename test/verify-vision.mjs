@@ -23,8 +23,9 @@
 //      only ever LIFT a record — never demote one physics already auto-accepted
 //   G4) a project reload mid-campaign aborts at every phase boundary, with the
 //      manifest provably untouched and not one further frame spent
-//   G5) the omni survey tier is FORCED: four oblique looks plus a true top and a
-//      true bottom, paid for before masks and ghosts, inside the hard frame cap
+//   G5) the omni survey tier is FORCED: four orthogonal eye-level side looks plus
+//      a true top and a true bottom, paid for before masks and ghosts, inside the
+//      hard frame cap
 //   G6) every frame is annotated with the fov, the machine's real extent and the
 //      screen-axis mapping it was drawn in — and with NO mapping rather than a
 //      guessed one when the basis is unavailable
@@ -41,7 +42,7 @@
 //
 // Usage: node test/verify-vision.mjs
 import { parseGlb } from '../src/lib/gltf.mjs';
-import { makeCamera, namedIndex, nodeBox, planViews, rectOf, renderTargets, VIEWPORT } from '../src/plugins/discovery/views.mjs';
+import { makeCamera, modelRadius, namedIndex, nodeBox, planViews, rectOf, renderTargets, VIEWPORT } from '../src/plugins/discovery/views.mjs';
 import {
   cloudAnchor, cloudAxis, visionPropose, L2_VISION_BASE_CONFIDENCE,
 } from '../src/plugins/discovery/vision-propose.mjs';
@@ -202,10 +203,16 @@ const manifest = () => [rec()];
   ok('B: the anchor came from GEOMETRY, because depth is unrecoverable from a 2D image',
     rec0?.anchorSource === 'geometry' && [rec0.anchor.x, rec0.anchor.y, rec0.anchor.z].every(Number.isFinite),
     J(rec0?.anchor));
-  // The derived anchor must actually be near the part that was pointed at.
+  // The derived anchor must actually be near the part that was pointed at — where
+  // "near" is measured in MODEL RADII, not in units: the grounded set here is the
+  // coarse eight-part cap spanning the fuselage, so its centroid can sit a good
+  // fraction of the machine away from the part the box was drawn on. What must
+  // never happen is an anchor on the far side of the model (or outside it), which
+  // is what an absolute number in glTF units cannot tell you across exports.
   const bb = nodeBox(nameOfMesh.get(subject));
   const d = rec0 ? Math.hypot(rec0.anchor.x - bb.c[0], rec0.anchor.y - bb.c[1], rec0.anchor.z - bb.c[2]) : Infinity;
-  ok('B: the geometry anchor is near the pointed-at part', d < 40, `d=${d.toFixed(2)} units`);
+  ok('B: the geometry anchor is near the pointed-at part', d < modelRadius(g),
+    `d=${d.toFixed(2)} units = ${(d / modelRadius(g)).toFixed(2)} model radii`);
   ok('B: a reported axis is kept rather than overridden',
     rec0?.axisSource === 'model' && rec0.axis.z === 1);
   ok('B: the model reasoning and its doubts travel onto the record',
@@ -666,6 +673,37 @@ function makeFakes(replyOf) {
     res.views === bigPlan.views.length && res.shots === f.calls.capture && res.coverage != null,
     `views=${res.views} shots=${res.shots} coverage=${res.coverage}`);
 
+  // HUMAN-IN-THE-LOOP: a note queued while the frames rendered is folded into the
+  // discovery prompt the model actually receives, and narrated as its own beat. The
+  // grounding gate is unchanged — this only adds words to the ask, never a joint.
+  const fNote = makeFakes(() => '[]');
+  const noteBeats = [];
+  await runVisionRound(g, [], [], {
+    plan: fNote.plan, capture: fNote.capture, propose: fNote.propose, persist: fNote.persist,
+    humanNotes: () => ['ignore the landing gear', 'the gimbal is what matters'],
+    emit: (kind, payload) => { if (kind === 'vision:note') noteBeats.push(payload); },
+  });
+  ok('G: a human note is folded into the vision prompt the model receives',
+    typeof fNote.seen.promptText === 'string' && fNote.seen.promptText.includes('HUMAN IN THE LOOP')
+    && fNote.seen.promptText.includes('ignore the landing gear')
+    && fNote.seen.promptText.includes('the gimbal is what matters'),
+    fNote.seen.promptText ? fNote.seen.promptText.slice(-140) : 'no prompt');
+  ok('G: the round narrates the folded note as its own beat',
+    noteBeats.length === 1 && noteBeats[0].notes.length === 2, J(noteBeats));
+  ok('G: the note rides into the persisted prompt too - the audit trail shows what was really sent',
+    fNote.seen.savedReply?.prompt?.text === fNote.seen.promptText
+    && (fNote.seen.savedReply?.prompt?.text || '').includes('HUMAN IN THE LOOP'));
+
+  // No notes queued -> no block injected: the un-steered prompt is unchanged, which
+  // is what keeps every existing vision assertion byte-identical.
+  const fPlain = makeFakes(() => '[]');
+  await runVisionRound(g, [], [], {
+    plan: fPlain.plan, capture: fPlain.capture, propose: fPlain.propose, persist: fPlain.persist,
+    humanNotes: () => [],
+  });
+  ok('G: an empty note queue injects nothing into the vision prompt',
+    typeof fPlain.seen.promptText === 'string' && !fPlain.seen.promptText.includes('HUMAN IN THE LOOP'));
+
   // RESUME SEMANTICS: the manifest must not be rebuilt, so a reopened record
   // keeps its history and its regressed status through a vision round.
   const reopened = rec({
@@ -890,10 +928,18 @@ function makeFakes(replyOf) {
     surveys.length === SHOT_BUDGET.survey && surveys.every((v) => v.mode !== 'ghost'),
     `${surveys.length} survey of ${bigPlan.views.length} planned views`);
 
-  const poles = surveys.map((v) => v.spec.pole || 'oblique');
-  ok('G5: the tier is four oblique looks plus a TRUE top and a TRUE bottom',
-    poles.filter((p) => p === 'oblique').length === 4 && poles.includes('top') && poles.includes('bottom'),
+  const poles = surveys.map((v) => v.spec.pole || 'side');
+  ok('G5: the tier is four EYE-LEVEL side looks plus a TRUE top and a TRUE bottom',
+    poles.filter((p) => p === 'side').length === 4 && poles.includes('top') && poles.includes('bottom'),
     J(poles));
+  // The six-side orthographic convention: the ring sits on the horizon at azimuths
+  // 90° apart, so the frames are front/back/left/right of whatever the machine's
+  // own axes turn out to be, and a human can tell which is which without being
+  // told where the camera stood.
+  ok('G5: the four side looks are ORTHOGONAL - elevation 0, azimuths 90\u00b0 apart',
+    surveys.filter((v) => !v.spec.pole).every((v) => v.spec.elevation === 0)
+    && [...new Set(surveys.filter((v) => !v.spec.pole).map((v) => v.spec.azimuth))].sort((a, b) => a - b).join() === '0,90,180,270',
+    J(surveys.filter((v) => !v.spec.pole).map((v) => `az${v.spec.azimuth}/el${v.spec.elevation}`)));
   ok('G5: the poles really are at +/-90 elevation, not at the old +/-80 clamp',
     surveys.filter((v) => v.spec.pole).every((v) => Math.abs(v.spec.elevation) === 90),
     J(surveys.filter((v) => v.spec.pole).map((v) => `${v.spec.pole}:${v.spec.elevation}`)));
@@ -999,9 +1045,14 @@ function makeFakes(replyOf) {
     && /screen-up = -/.test(screenAxes(poleOf('bottom').cam)));
 
   const fl = (v) => frameLine({ id: v.id, mode: 'photo', spec: v.spec, cam: v.cam, covers: v.covers }, 0);
-  ok('G6: an oblique survey frame is NOT announced as a top-down one',
-    /oblique whole-machine survey view/.test(lineOf(frames[0].id)) && !/top-down/.test(lineOf(frames[0].id)),
-    lineOf(frames[0].id).slice(0, 120));
+  // The survey ring is eye-level now (SURVEY_ELEVATION = 0), so the words printed
+  // for it must say so: a frame the model believes is a top-down look is a frame
+  // it will draw a regionBox on as though the hull were not in the way.
+  ok('G6: an eye-level survey frame is announced as a SIDE view, never as a pole',
+    /eye-level orthogonal side view/.test(lineOf(frames[0].id))
+    && /elevation 0\u00b0/.test(lineOf(frames[0].id))
+    && !/top-down|bottom-up/.test(lineOf(frames[0].id)),
+    lineOf(frames[0].id).slice(0, 140));
   ok('G6: the pole frames are announced as the poles they really are',
     /true top-down/.test(fl(poleOf('top'))) && /true bottom-up/.test(fl(poleOf('bottom'))));
 }
@@ -1245,6 +1296,12 @@ function makeFakes(replyOf) {
     `${ep.images.length} attached, ${ep.frames.length} described`);
   ok('G9: the category prompt says plainly that an expectation is NEVER a discovery',
     /NEVER a/.test(ep.text) && /nothing you write here becomes a joint/.test(ep.text));
+  // The prior is read off the orthographic six, so the prompt has to SAY that: a
+  // model told it is looking at obliques will place an instance's regionBox from
+  // the wrong mental camera, and the aim that comes back misses the part.
+  ok('G9: the category prompt describes the survey it is really showing - six orthographic looks',
+    /six orthographic looks/.test(ep.text) && /eye-level side/.test(ep.text) && !/four oblique/.test(ep.text),
+    ep.text.split('\n').filter((l) => /orthographic|eye-level/.test(l)).join(' / ').slice(0, 150));
   ok('G9: the category prompt demands a count, a place, a symmetry, a doubt and an alternative',
     ['count', 'regionBox', 'symmetry', 'doubts', 'alternatives'].every((k) => ep.text.includes(k)));
   ok('G9: it maps an inexpressible motion onto the nearest of the three and forbids a fourth kind',

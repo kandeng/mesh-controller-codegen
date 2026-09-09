@@ -99,6 +99,14 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
   // this before its first await, and every long-running op compares against the
   // value it started with.
   let loadGen = 0;
+  // Human-in-the-loop intervention. A refinement runs autonomously, but a human
+  // watching the frames arrive may want to STOP it or STEER it ("ignore the landing
+  // gear", "the gimbal is the interesting part"). Both ride ONE queue the loop
+  // drains at a phase boundary — the same boundaries the reload abort already uses —
+  // so an intervention never interrupts a model turn mid-flight or leaves the
+  // manifest half-written. Reset at the start of every autoRefine.
+  let refineAbort = false;   // a human asked the in-flight refinement to stop
+  let refineNotes = [];      // [{ text, ts }] steering notes, folded into the next ask
   // Server-originated WS push. The events socket decorates the Fastify app with
   // broadcast(), but the kernel must not reach into the app, so index.mjs hands
   // the decorated function down the same way it hands down the render farm.
@@ -333,12 +341,24 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
           });
           // Live beat for the 3D theater: the frame is on disk and URL-addressable
           // NOW, so the browser can show the exact pixels the model is about to be
-          // handed, at the pose they were drawn from. Emit-only.
+          // handed, at the pose they were drawn from. Emit-only. The full camera
+          // rig (eye, look direction, range, FOV) rides along so the chat can
+          // annotate the shot with WHERE the virtual camera actually was instead
+          // of a bare "I looked at it".
           try {
+            const eye = view?.pose?.eye || null;
+            const tgt = view?.pose?.target || null;
+            const range = Array.isArray(eye) && Array.isArray(tgt)
+              ? Math.hypot(eye[0] - tgt[0], eye[1] - tgt[1], eye[2] - tgt[2])
+              : null;
             broadcast({
               kind: 'vision:frame', round: rnd, id: entry.id, mode: entry.mode,
               viewId: entry.viewId ?? view.id, url: drawn[drawn.length - 1].url,
-              eye: view?.pose?.eye || null, target: view?.pose?.target || null,
+              eye, target: tgt,
+              distance: Number.isFinite(view?.spec?.distance) ? view.spec.distance : range,
+              azimuth: Number.isFinite(view?.spec?.azimuth) ? view.spec.azimuth : null,
+              elevation: Number.isFinite(view?.spec?.elevation) ? view.spec.elevation : null,
+              fov: Number.isFinite(viewport?.fov) ? viewport.fov : null,
             });
           } catch { /* a dead socket must never kill a capture */ }
           return {
@@ -357,8 +377,13 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
 
         // Cancellation, not decoration: a reload mid-campaign orphans the arrays
         // the merge writes into, so the loop stops spending frames the moment the
-        // project it was aimed at is gone.
-        abort: () => gen !== loadGen,
+        // project it was aimed at is gone. A human STOP rides the same predicate —
+        // scoped to THIS call via opts.humanAbort, so a standalone vision round is
+        // never aborted by a flag that was set for some other refinement.
+        abort: () => gen !== loadGen || opts.humanAbort?.() === true,
+
+        // Human steering notes, read at the ask boundary and folded into the prompt.
+        humanNotes: typeof opts.humanNotes === 'function' ? opts.humanNotes : null,
 
         independent,
 
@@ -495,6 +520,9 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
       if (autoRunning) return { ok: false, code: 'ALREADY_RUNNING' };
       autoRunning = true;
       const gen = loadGen;
+      // A fresh refinement starts with a clean intervention slate: a stop or a note
+      // left over from a PREVIOUS run must never leak into this one.
+      refineAbort = false; refineNotes = [];
       const skip = (code, error) => {
         broadcast({ kind: 'refine:skip', code, error });
         return { ok: false, code, error };
@@ -528,7 +556,16 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
         const wantText = opts.text !== false;
         const wantVision = opts.vision !== false;
         const emit = (kind, payload) => { broadcast({ kind, ...payload }); };
-        emit('refine:start', { auto: true, lanes: { text: wantText, vision: wantVision } });
+        // Name the remote model on the opening beat so the client's live status
+        // line can say WHICH model DSH is waiting on, rather than a generic
+        // "please wait". The vision lane may route images to a distinct
+        // vision_model override; when it is empty, image turns use `model`.
+        emit('refine:start', {
+          auto: true,
+          lanes: { text: wantText, vision: wantVision },
+          model: host.config.model || null,
+          visionModel: host.config.visionModel || host.config.model || null,
+        });
 
         const res = await runProducerLanes(current.glb, current.joints, current.manifest, {
           emit,
@@ -543,7 +580,14 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
               return { ok: false, code: 'NO_TEXT_AGENT', reason: error, added: 0 };
             }
             emit('text:start', {});
-            const r = await runL2Round(current.glb, joints, manifest, async (p) => (await agent.send(p)).reply, { emit });
+            const r = await runL2Round(current.glb, joints, manifest, async (p) => (await agent.send(p)).reply, {
+              emit,
+              // The human's notes are external guidance, not one lane's conclusions,
+              // so sharing the SAME queue with the vision lane does not break the two
+              // producers' independence — it is an input to both, like the mesh itself.
+              humanNotes: () => refineNotes.map((n) => n.text),
+              abort: () => gen !== loadGen || refineAbort,
+            });
             emit('text:end', { ok: !r.reason || (r.added ?? 0) > 0, added: r.added ?? 0, reason: r.reason || null });
             return { ...r, ok: true };
           } : null,
@@ -571,7 +615,14 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
             // prompt withholds the text lane's conclusions and the gate stops
             // treating them as a claim on the parts, so agreement between the two
             // becomes corroboration at reconciliation instead of an echo.
-            return kernel.visionRefine({ rounds: 1, ...opts, lane: { manifest, joints }, independent: true });
+            return kernel.visionRefine({
+              rounds: 1, ...opts, lane: { manifest, joints }, independent: true,
+              // Scoped to THIS refinement: the loop reads these at its phase
+              // boundaries, so a human stop or note takes effect without ever
+              // interrupting a model turn mid-flight.
+              humanAbort: () => refineAbort,
+              humanNotes: () => refineNotes.map((n) => n.text),
+            });
           } : null,
         });
 
@@ -588,6 +639,21 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
           return {
             ...res, ok: false, code: 'PROJECT_RELOADED',
             error: 'the mesh was reloaded while the producers were running; nothing was merged',
+          };
+        }
+
+        // A human STOP discards the whole refinement: both lanes' deltas are thrown
+        // away and nothing is committed, because "stop" means "I do not want this
+        // pass's conclusions", not "keep whichever lane finished first". Mirrors the
+        // reload refusal above — same shape, same nothing-merged guarantee.
+        if (refineAbort) {
+          emit('refine:end', {
+            ok: false, code: 'HUMAN_STOPPED', added: 0, agreed: 0, stopped: true,
+            text: { added: 0, ok: false }, vision: { added: 0, ok: false },
+          });
+          return {
+            ...res, ok: false, code: 'HUMAN_STOPPED', stopped: true,
+            error: 'a human stopped the refinement; nothing was merged',
           };
         }
 
@@ -636,6 +702,25 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
       } finally {
         autoRunning = false;
       }
+    },
+
+    // Human-in-the-loop: steer or stop the in-flight parallel refinement. Called by
+    // POST /api/refine/intervene while autoRefine runs. A `text` note is queued and
+    // folded into the next model ask; `stop` sets the abort flag the loop honours at
+    // its next phase boundary. Neither interrupts a turn mid-flight, and neither
+    // touches the manifest directly — the loop stays the only writer.
+    intervene({ text = null, stop = false } = {}) {
+      if (!autoRunning) return { ok: false, code: 'NOT_RUNNING', error: 'no refinement is in flight to intervene in' };
+      const note = String(text || '').trim();
+      if (note) {
+        refineNotes.push({ text: note, ts: Date.now() });
+        broadcast({ kind: 'refine:note', text: note, queued: refineNotes.length });
+      }
+      if (stop) {
+        refineAbort = true;
+        broadcast({ kind: 'refine:abort', queued: refineNotes.length });
+      }
+      return { ok: true, aborting: refineAbort, queued: refineNotes.length, running: autoRunning };
     },
 
     // Phase 3 task 17: the symmetry peers of one joint, i.e. the joints a verdict

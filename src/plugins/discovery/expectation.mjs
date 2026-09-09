@@ -76,9 +76,10 @@ export function buildExpectationPrompt({ frames = [], g = null, viewport = null,
   const lines = [];
   lines.push('You are the CATEGORY PRIOR step of a rigged-mesh joint-discovery loop.');
   lines.push('You are looking at RENDERED FRAMES of one 3D CAD assembly, drawn by us from an');
-  lines.push('omni survey of poses we chose: four oblique looks plus, where they are listed,');
-  lines.push('a true top-down and a true bottom-up. They are not photographs — there is no');
-  lines.push('lighting realism and no branding.');
+  lines.push('omni survey of poses we chose: the six orthographic looks — four eye-level side');
+  lines.push('views 90\u00b0 apart, plus, where they are listed, a true top-down and a true');
+  lines.push('bottom-up. Which side view is "front" is for YOU to decide from the machine.');
+  lines.push('They are not photographs — there is no lighting realism and no branding.');
   lines.push('');
   lines.push(...sceneHeader(sceneFacts(g, viewport, used)));
   lines.push('');

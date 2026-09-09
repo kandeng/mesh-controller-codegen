@@ -122,15 +122,17 @@ export function frameLine(frame, i) {
   if (Number.isFinite(s.azimuth)) bits.push(`azimuth ${Math.round(s.azimuth)}\u00b0`);
   if (Number.isFinite(s.elevation)) bits.push(`elevation ${Math.round(s.elevation)}\u00b0`);
   if (Number.isFinite(s.distance)) bits.push(`eye distance ${Number(s.distance).toFixed(1)} units`);
-  // The survey tier is FOUR OBLIQUE looks plus one true pole each way, and only
-  // `spec.pole` tells them apart. Calling an oblique 25° frame "top-down" is not a
-  // cosmetic slip: the model reasons about which side of the machine a regionBox
-  // is on from the words we print here, and a wrong one is believed — it is the
-  // same class of error the screen-axis annotation below exists to remove.
+  // The survey tier is FOUR ORTHOGONAL eye-level side views 90° apart plus one
+  // true pole each way, and only `spec.pole` and the elevation tell them apart.
+  // Calling an eye-level frame "top-down" — or calling it "oblique" when it is
+  // square to the machine — is not a cosmetic slip: the model reasons about which
+  // side of the machine a regionBox is on from the words we print here, and a
+  // wrong one is believed. It is the same class of error the screen-axis
+  // annotation below exists to remove.
   if (s.kind === 'survey') {
     bits.push(s.pole === 'bottom' ? 'true bottom-up whole-machine view'
       : s.pole === 'top' ? 'true top-down whole-machine view'
-        : 'oblique whole-machine survey view');
+        : 'eye-level orthogonal side view of the whole machine (one of four, 90\u00b0 apart)');
   } else if (s.kind === 'cell') bits.push(`zoomed into one region of ${s.members ?? '?'} parts`);
   else if (s.kind === 'close-up') bits.push('close-up of one region');
   else bits.push('whole-model view');

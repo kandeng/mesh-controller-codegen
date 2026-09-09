@@ -296,9 +296,9 @@ function ringSpecs(g, { azimuths, elevations, distances }) {
 }
 
 // The omni survey tier: whole-machine looks that are NOT chosen by coverage.
-// Four oblique views 90° apart plus a true top-down and a true bottom-up — the
-// six frames a person would take before saying anything about an object whose
-// type nobody knows yet (drone? tank? robot arm?).
+// Four ORTHOGONAL side views 90° apart at eye level, plus a true top-down and a
+// true bottom-up — the six frames a person would take before saying anything
+// about an object whose type nobody knows yet (drone? tank? robot arm?).
 //
 // Greedy coverage will happily spend a whole round on whichever flank carries the
 // most parts and never look underneath, because marginal gain is a statement about
@@ -306,7 +306,15 @@ function ringSpecs(g, { azimuths, elevations, distances }) {
 // frames the greedy pass would have spent on resolution, and buys a coherent set
 // the model can reason about as a whole — which is also the only view set a
 // category expectation can honestly be read from.
-export const SURVEY_ELEVATION = 25;
+//
+// Elevation is ZERO, not a flattering oblique: the survey is the orthographic
+// six-side convention (front / back / left / right / top / bottom) that a human
+// reads without having to infer where the camera was, and a model can compare
+// part-to-part across frames because the four side views share one horizon. The
+// cost is real — an eye-level ring cannot see the top of a rotor hub or the deck
+// of a hull — and it is paid for by the two poles plus the greedy tier, which
+// buys oblique poses as soon as they earn coverage the six orthogonals missed.
+export const SURVEY_ELEVATION = 0;
 export const SURVEY_MAX = 6;
 
 export function surveySpecs(g, {

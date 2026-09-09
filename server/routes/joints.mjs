@@ -71,6 +71,18 @@ export function jointRoutes(app, kernel) {
     return r;
   });
 
+  // Human-in-the-loop intervention on the in-flight parallel refinement. A `text`
+  // note is queued and folded into the next model ask; `stop` aborts at the next
+  // phase boundary and discards the merge. 409 when no refinement is running (there
+  // is nowhere for the note to go), so the composer can say "nothing to steer".
+  app.post('/api/refine/intervene', async (req, reply) => {
+    const { text = null, stop = false } = req.body || {};
+    if (!kernel.intervene) return reply.code(501).send({ ok: false, error: 'intervention is not available on this kernel' });
+    const r = kernel.intervene({ text, stop });
+    if (!r.ok) return reply.code(409).send(r);
+    return r;
+  });
+
   // Phase 3: trigger a vision CAMPAIGN — the kernel plans poses, a connected
   // browser tab draws them, a multimodal model reads the frames and says where it
   // was unsure, and a second round goes and looks there. One press, up to two

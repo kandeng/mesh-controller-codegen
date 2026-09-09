@@ -7,6 +7,9 @@
 //   5) reopen state SURVIVES a subsequent refine round (resume semantics)
 //   6) lane mode: each producer writes into a DEEP CLONE, and the caller's
 //      manifest moves only at reconciliation — through the one writer
+//   7) human-in-the-loop: a queued note rides into the text ask (and is narrated
+//      as its own beat), an empty queue injects nothing, and STOP refuses before
+//      the model is ever called — the manifest left provably untouched
 //
 // Usage: node test/verify-manifest.mjs
 import { parseGlb } from '../src/lib/gltf.mjs';
@@ -182,6 +185,60 @@ const freeNames = g.nodes.filter((n) => !claimed.has(n.name) && n.wext).slice(0,
     quiet.length === n0 && resQuiet.added === 0 && resQuiet.manifestUntouched === true
     && resQuiet.warnings.some((w) => /the text lane failed/.test(w)),
     JSON.stringify({ len: quiet.length, added: resQuiet.added, untouched: resQuiet.manifestUntouched }));
+}
+
+// ---- 7) human-in-the-loop: a queued note rides into the text ask, and STOP ------
+//         refuses before the model is ever called ---------------------------------
+// The text lane and the vision lane share the same two seams: `humanNotes()` is
+// drained at the boundary and folded into the prompt the model actually receives
+// (narrated as its own `text:note` beat), and `abort()` short-circuits the round
+// before any turn, leaving the manifest provably untouched. Guidance only ever
+// adds words to the ask — the grounding gate still decides what becomes a joint.
+{
+  const freshFrontier = () => {
+    const m = buildManifest(joints);
+    for (const r of m) r.status = deriveStatus(r);
+    const rec = m.find((r) => r.status === 'auto-accepted');
+    reopen(rec, { name: 'human-probe', detail: 'fake crack' }, 'text-lane HITL probe');
+    return m;
+  };
+
+  // (a) a queued note is folded into the prompt AND narrated as its own beat
+  const mNote = freshFrontier();
+  let seenPrompt = null;
+  const noteBeats = [];
+  await runL2Round(g, joints, mNote, async (p) => { seenPrompt = p; return '[]'; }, {
+    humanNotes: () => ['ignore the landing gear', 'the gimbal is what matters'],
+    emit: (kind, payload) => { if (kind === 'text:note') noteBeats.push(payload); },
+  });
+  ok('HITL: a human note is folded into the text prompt the model receives',
+    typeof seenPrompt === 'string' && seenPrompt.includes('HUMAN IN THE LOOP')
+    && seenPrompt.includes('ignore the landing gear')
+    && seenPrompt.includes('the gimbal is what matters'),
+    seenPrompt ? seenPrompt.slice(-120) : 'no prompt');
+  ok('HITL: the round narrates the folded note as its own beat',
+    noteBeats.length === 1 && noteBeats[0].notes.length === 2, JSON.stringify(noteBeats));
+
+  // (b) an empty queue injects nothing - the un-steered prompt is unchanged
+  const mPlain = freshFrontier();
+  let plainPrompt = null;
+  await runL2Round(g, joints, mPlain, async (p) => { plainPrompt = p; return '[]'; }, {
+    humanNotes: () => [],
+  });
+  ok('HITL: an empty note queue injects nothing into the text prompt',
+    typeof plainPrompt === 'string' && !plainPrompt.includes('HUMAN IN THE LOOP'));
+
+  // (c) STOP refuses before the model is asked, leaving the manifest untouched
+  const mStop = freshFrontier();
+  const nStop = mStop.length;
+  let asked = false;
+  const resStop = await runL2Round(g, joints, mStop, async () => { asked = true; return '[]'; }, {
+    abort: () => true,
+  });
+  ok('HITL: a human STOP short-circuits the round before any model turn, manifest untouched',
+    asked === false && resStop.added === 0 && resStop.manifestUntouched === true
+    && mStop.length === nStop,
+    JSON.stringify({ asked, added: resStop.added, untouched: resStop.manifestUntouched, len: mStop.length }));
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

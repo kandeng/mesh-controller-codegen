@@ -19,7 +19,7 @@
 import { bladeCandidates, parseGlb } from '../src/lib/gltf.mjs';
 import { MAX_LEGEND } from '../src/plugins/discovery/vision-prompt.mjs';
 import {
-  AZIMUTH_RETRY, REGION_MAX_R, REGION_MIN_R, REGION_PAD, VIEWPORT,
+  AZIMUTH_RETRY, REGION_MAX_R, REGION_MIN_R, REGION_PAD, SURVEY_ELEVATION, VIEWPORT,
   candidateSpecs, coverageOf, fitDistance, focusFromManifest, kdCells,
   makeCamera, modelRadius, modelTarget, namedIndex, nodeBox, planCloseUps,
   planViews, poseFromSpec, project, projectNode, regionsFromSuggestViews,
@@ -103,6 +103,33 @@ const named = namedIndex(g);
     && surveySpecs(g, { count: 3 }).every((s) => s.kind === 'survey' && Math.abs(s.elevation) !== 90)
     && surveySpecs(g, { count: 0 }).length === 0,
     surveySpecs(g, { count: 6 }).map((s) => `${s.azimuth}/${s.elevation}`).join(' '));
+
+  // The survey is the ORTHOGRAPHIC six-side convention a person reads without
+  // having to infer where the camera stood: front / back / left / right at eye
+  // level, plus a true top and a true bottom. Prove the geometry of that claim
+  // rather than the constant — the four ring cameras must look horizontally,
+  // share one horizon (up = +Z, so no frame is rolled), stand 90° apart with
+  // opposite pairs antiparallel, and each one must still frame the machine.
+  const ring = surveySpecs(g, { count: 6 }).filter((s) => !s.pole);
+  const ringCams = ring.map((s) => {
+    const p = poseFromSpec(s, g);
+    return { s, p, c: makeCamera(p.eye, p.target, VIEWPORT, p.up) };
+  });
+  ok('A: the survey ring is ORTHOGONAL - four eye-level side views, not a flattering oblique',
+    ring.length === 4 && SURVEY_ELEVATION === 0
+    && ring.every((s) => s.elevation === 0 && Math.abs(s.azimuth % 90) < 1e-9)
+    && ringCams.every(({ c }) => ortho(c) && Math.abs(c.f[2]) < 1e-12 && c.up.join() === '0,0,1'),
+    ring.map((s) => `az${s.azimuth}/el${s.elevation}`).join(' '));
+  ok('A: the ring views are 90\u00b0 apart, and opposite pairs look along the same line',
+    ringCams.every(({ c }, i) => {
+      const next = ringCams[(i + 1) % ringCams.length].c;
+      const across = ringCams[(i + 2) % ringCams.length].c;
+      return Math.abs(dot(c.f, next.f)) < 1e-12 && Math.abs(dot(c.f, across.f) + 1) < 1e-12;
+    }),
+    ringCams.map(({ c }) => `f=${c.f.map((v) => v.toFixed(1)).join(',')}`).join(' | '));
+  ok('A: every orthogonal side view still frames the machine',
+    ringCams.every(({ c }) => coverageOf(c, targets).size > 0),
+    ringCams.map(({ s, c }) => `az${s.azimuth} sees ${coverageOf(c, targets).size}`).join(' '));
 }
 
 // ---- B) mesh nodes, placed by their true world box --------------------------
@@ -284,12 +311,11 @@ const photos = budget.views.filter((v) => v.mode === 'photo');
     `${cu.covered}/${cu.targets} region parts framed (${(cu.coverage * 100).toFixed(1)}%)`);
   ok('D: maxViews caps the round-2 plan', planCloseUps(g, regions, { perRegion: 4, maxViews: 3 }).views.length <= 3);
 
-  // Prove the legend-fit loop actually runs. At the real budget it rarely does —
-  // a whole-model region frames only ~38 parts because occlusion hides the rest —
-  // so drive it with a budget smaller than what the region frames, and compare
-  // against the same plan with tightening disabled. The point is not the number
-  // 12; it is that the planner zooms in just until the legend fits, says so, and
-  // never shrinks the thing it is measuring coverage of.
+  // Prove the legend-fit loop actually runs. Drive it with a budget smaller than
+  // what the region frames, and compare against the same plan with tightening
+  // disabled. The point is not the number 12; it is that the planner zooms in
+  // just until the legend fits, says so, and never shrinks the thing it is
+  // measuring coverage of.
   const TIGHT_BUDGET = 12;
   const wholeRegion = [{ id: 'whole', anchor: modelTarget(g), radius: modelRadius(g) }];
   const wide = planCloseUps(g, wholeRegion, { perRegion: 1, legendBudget: TIGHT_BUDGET });
@@ -307,12 +333,22 @@ const photos = budget.views.filter((v) => v.mode === 'photo');
   ok('D: tightening narrows the CAMERA without shrinking the REGION',
     wide.targets === loose.targets && wide.covered <= loose.covered,
     `${wide.targets} region parts either way; framed ${loose.covered} -> ${wide.covered}`);
-  // At the real budget the whole-model region already fits, so nothing is zoomed
-  // — tightening must be a last resort, not a default that throws away coverage.
-  ok('D: at the real legend budget an over-wide region is left alone',
-    planCloseUps(g, wholeRegion, { perRegion: 1 }).views[0].covers <= MAX_LEGEND
-      && planCloseUps(g, wholeRegion, { perRegion: 1 }).views[0].tightened == null,
-    `${lv.covers} parts fit ${MAX_LEGEND} without zooming`);
+  // At the real budget a region that ALREADY fits must be left alone — tightening
+  // is a last resort, not a default that throws away coverage. Whether the
+  // whole-model region happens to fit is a property of the model's true placed
+  // boxes (on this one it does not: 41 parts against a 40-colour legend), so
+  // prove the RULE across a spread of region sizes instead of pinning a number:
+  // whenever the untightened plan fits the budget, the real plan is untouched.
+  const spread = [1, 0.5, 0.25, 0.12].map((f) => {
+    const region = [{ id: `spread_${f}`, anchor: modelTarget(g), radius: f * modelRadius(g) }];
+    const real = planCloseUps(g, region, { perRegion: 1 }).views[0];
+    const free = planCloseUps(g, region, { perRegion: 1, legendBudget: 0 }).views[0];
+    return { f, covers: real?.covers ?? 0, tightened: real?.tightened ?? null, free: free?.covers ?? 0 };
+  });
+  ok('D: at the real legend budget a region that already fits is left alone',
+    spread.every((s) => (s.free > MAX_LEGEND || (s.tightened == null && s.covers <= MAX_LEGEND)))
+      && spread.some((s) => s.tightened == null),
+    spread.map((s) => `r×${s.f}: ${s.covers} parts (unzoomed ${s.free}, budget ${MAX_LEGEND})${s.tightened != null ? ` zoomed ${s.tightened}` : ''}`).join(' | '));
 
   // A cell frame must exist for the small parts: the candidate set has to contain
   // poses much closer than whole-model framing, or greedy can never buy the
