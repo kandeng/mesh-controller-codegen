@@ -60,6 +60,10 @@ export function registerEventsSocket(app, kernel, farm = null) {
         // Only a refusal is interesting; success is proved by the frame arriving.
         if (msg.ok === false) farm.nack(msg.requestId, msg.error || 'renderer refused the capture');
         break;
+      case 'framing-response':
+        // The panel's live camera framing, answered to a `framing-request`.
+        farm.deliverFraming(msg.requestId, msg.framing ?? null);
+        break;
       default:
         break;
     }

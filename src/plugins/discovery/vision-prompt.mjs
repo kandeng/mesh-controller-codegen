@@ -133,6 +133,14 @@ export function frameLine(frame, i) {
     bits.push(s.pole === 'bottom' ? 'true bottom-up whole-machine view'
       : s.pole === 'top' ? 'true top-down whole-machine view'
         : 'eye-level orthogonal side view of the whole machine (one of four, 90\u00b0 apart)');
+  } else if (s.kind === 'panel') {
+    // The panel tier is the human's own framing of the whole machine, orbited to
+    // a fixed bearing. Same honesty rule as the survey line: the elevation and
+    // the pole flag are what actually distinguish the twelve, so the words must
+    // not claim "side view" for an oblique or "top-down" for 35\u00b0.
+    bits.push(s.pole === 'bottom' ? 'true bottom-up whole-machine view (human panel framing)'
+      : s.pole === 'top' ? 'true top-down whole-machine view (human panel framing)'
+        : 'whole-machine view at the distance and FOV the human set in the 3D view panel');
   } else if (s.kind === 'cell') bits.push(`zoomed into one region of ${s.members ?? '?'} parts`);
   else if (s.kind === 'close-up') bits.push('close-up of one region');
   else bits.push('whole-model view');

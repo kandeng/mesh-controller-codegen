@@ -177,6 +177,16 @@ async function onMotionRequest(msg) {
   }
 }
 
+// The server asked for the panel's LIVE camera framing so it can plan the
+// twelve panel-framed screenshots at exactly the distance/FOV the human sees.
+// Answer synchronously from the viewer; a null framing (no model mounted) is a
+// valid answer and makes the server fall back to the coverage planner.
+function onFramingRequest(msg) {
+  let framing = null;
+  try { framing = useViewerCapture().framing() || null; } catch { framing = null; }
+  send({ kind: 'framing-response', requestId: msg.requestId, framing });
+}
+
 function connect() {
   if (ws) return ws;
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -197,6 +207,7 @@ function connect() {
     if (msg.kind === 'renderer-welcome') { state.rendererId = msg.rendererId ?? null; return; }
     if (msg.kind === 'render-request') { onRenderRequest(msg); return; }
     if (msg.kind === 'motion-request') { onMotionRequest(msg); return; }
+    if (msg.kind === 'framing-request') { onFramingRequest(msg); return; }
     // `render-cancel` needs no action here: a capture is one synchronous draw,
     // so by the time a cancel arrives the frame is already uploaded or failed.
   };

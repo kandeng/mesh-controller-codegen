@@ -55,7 +55,9 @@ export const MIN_VERIFY_OVERLAP = 0.5;
 // frame shows one sub-assembly and cannot name a machine.
 export function surveyPhotos(frames = []) {
   const photos = (frames || []).filter((f) => f?.dataBase64 && (f.mode || 'photo') === 'photo');
-  const survey = photos.filter((f) => f.spec?.kind === 'survey');
+  // 'panel' frames are survey-class: whole-machine looks at the human's own
+  // distance/FOV, exactly the frames a category can honestly be read from.
+  const survey = photos.filter((f) => f.spec?.kind === 'survey' || f.spec?.kind === 'panel');
   return survey.length ? survey : photos;
 }
 

@@ -577,6 +577,12 @@ export const SHOT_BUDGET = { survey: 6, maskPairs: 2, ghostFrames: 1, orientatio
 // 'survey' is deliberately NOT here: a whole-machine mask legend is unreadable.
 const TIGHT_KINDS = new Set(['cell', 'close-up']);
 
+// Whole-machine tiers: the fitted six-direction survey AND the panel-framed
+// twelve (kind 'panel', the human's own distance/FOV). Both are the "what
+// machine is this" allocation in selectShots and neither may carry a mask — a
+// whole-machine legend is unreadable at either framing.
+const SURVEY_KINDS = new Set(['survey', 'panel']);
+
 export function selectShots(views, {
   maxFrames = MAX_VISION_FRAMES, ...budget
 } = {}) {
@@ -585,8 +591,8 @@ export function selectShots(views, {
   const ghosts = all.filter((v) => v.mode === 'ghost');
   const photos = all.filter((v) => v.mode !== 'ghost');
   const cells = photos.filter((v) => TIGHT_KINDS.has(v.spec?.kind));
-  const surveys = photos.filter((v) => v.spec?.kind === 'survey');
-  const rings = photos.filter((v) => v.spec?.kind !== 'survey' && !TIGHT_KINDS.has(v.spec?.kind));
+  const surveys = photos.filter((v) => SURVEY_KINDS.has(v.spec?.kind));
+  const rings = photos.filter((v) => !SURVEY_KINDS.has(v.spec?.kind) && !TIGHT_KINDS.has(v.spec?.kind));
   const cap = Math.max(1, maxFrames | 0);
   const sees = (v) => (Array.isArray(v.sees) && v.sees.length ? v.sees.map(String) : null);
 
@@ -605,8 +611,12 @@ export function selectShots(views, {
   for (const v of surveys.slice(0, Math.max(0, survey | 0))) push(v, 'photo', null);
   for (const v of rings.slice(0, Math.max(0, orientation | 0))) push(v, 'photo', null);
 
-  // Tightest first; ties keep the planner's marginal-gain order.
-  const maskable = (cells.length ? cells : photos)
+  // Tightest first; ties keep the planner's marginal-gain order. When a plan has
+  // NO tight view (a panel-framed survey is all whole-machine poses), no mask is
+  // bought at all: the `photos` fallback would paint every named part in the
+  // model and the legend would be the very wall of colour this rule exists to
+  // avoid — the fallback only ever made sense for plans that mix tiers.
+  const maskable = (cells.length ? cells : [])
     .map((v, i) => ({ v, i, n: sees(v)?.length ?? Infinity }))
     .sort((a, b) => (a.n - b.n) || (a.i - b.i))
     .slice(0, Math.max(0, maskPairs | 0));

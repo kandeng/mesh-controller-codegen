@@ -11,15 +11,19 @@
 //                   swept composite (render farm, task 18 motion semantics)
 //   model()         whether a mesh is loaded at all, so the farm can tell the
 //                   server "pick me" or "not me" without either side guessing
+//   framing()       the panel's LIVE camera framing (aim point, eye distance,
+//                   FOV) so the panel-framed survey draws what the human sees
 let captureFn = null;
 let captureAtFn = null;
 let captureMotionFn = null;
 let modelInfo = null;
+let framingFn = null;
 
 export function registerViewerCapture(fn) { captureFn = fn || null; }
 export function registerViewerCaptureAt(fn) { captureAtFn = fn || null; }
 export function registerViewerCaptureMotion(fn) { captureMotionFn = fn || null; }
 export function registerViewerModel(info) { modelInfo = info || null; }
+export function registerViewerFraming(fn) { framingFn = fn || null; }
 
 export function useViewerCapture() {
   return {
@@ -27,6 +31,7 @@ export function useViewerCapture() {
     registerAt: registerViewerCaptureAt,
     registerMotion: registerViewerCaptureMotion,
     registerModel: registerViewerModel,
+    registerFraming: registerViewerFraming,
     // -> 'data:image/png;base64,...' or null when no viewer is mounted.
     capture: () => (captureFn ? captureFn() : null),
     // -> { dataUrl, width, height, mode, colorMap } or null. `view` carries the
@@ -40,5 +45,8 @@ export function useViewerCapture() {
     available: () => !!captureFn,
     // -> { hasModel, glb } or null.
     model: () => modelInfo,
+    // -> { target:[x,y,z], distance, fov } in WORLD space, or null. The panel's
+    // live framing: where it aims, how far the eye is, and the vertical FOV.
+    framing: () => (framingFn ? framingFn() : null),
   };
 }

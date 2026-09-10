@@ -11,7 +11,7 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { useProjectStore } from '../composables/useProjectStore.js';
 import { useTheme } from '../composables/useTheme.js';
 import { useSlotRouting } from '../composables/useSlotRouting.js';
-import { registerViewerCapture, registerViewerCaptureAt, registerViewerCaptureMotion, registerViewerModel } from '../composables/useViewerCapture.js';
+import { registerViewerCapture, registerViewerCaptureAt, registerViewerCaptureMotion, registerViewerModel, registerViewerFraming } from '../composables/useViewerCapture.js';
 import { useRenderFarm } from '../composables/useRenderFarm.js';
 import { useKernelApi } from '../composables/useKernelApi.js';
 // The two right-hand toolbar glyphs, inlined (?raw + v-html) so stroke="currentColor"
@@ -740,6 +740,24 @@ function announceModel() {
   useRenderFarm().refresh();
 }
 
+// The panel's LIVE camera framing, in parseGlb WORLD space (scene = world -
+// center, so world = scene + center). This is the single source of truth the
+// panel-framed survey reproduces: the aim point the human orbited to, the eye
+// distance they zoomed to, and the vertical FOV. Read at plan time — not cached
+// — because a drag changes it and the twelve screenshots must match the panel as
+// it is when the round starts, not as it was at load.
+function panelFraming() {
+  if (!camera || !drone) return null;
+  const t = orbit.target;
+  const distance = camera.position.distanceTo(t);
+  if (!(distance > 1e-3)) return null;
+  return {
+    target: [t.x + center.x, t.y + center.y, t.z + center.z],
+    distance,
+    fov: camera.fov,
+  };
+}
+
 async function loadModel(url) {
   if (!url || url === loadedGlb) return;
   teardownPivot();
@@ -759,8 +777,26 @@ async function loadModel(url) {
   restWorld = new Map();
   drone.updateMatrixWorld(true);
   drone.traverse((o) => { if (o.name) restWorld.set(o.name, o.getWorldPosition(new THREE.Vector3()).clone()); });
-  camera.position.set(radius * 1.8, radius * 1.2, radius * 1.8);
-  camera.far = radius * 20; camera.updateProjectionMatrix();
+  // AUTO-FIT the panel to the mesh: a bounding-sphere fit at the planner's 45°
+  // FOV, so the machine fills the panel without overflowing it. This is the
+  // CANONICAL framing the panel-framed survey reproduces — the human can then
+  // orbit/zoom to taste, and the twelve screenshots follow whatever they settle
+  // on (see panelFraming). The binding cone is the NARROWER half-fov: a tall
+  // panel (aspect < 1) has the tight cone horizontally, so fitting the vertical
+  // half-fov alone would clip the wings.
+  const FIT_FOV = 45;
+  camera.fov = FIT_FOV;
+  const halfV = (FIT_FOV * Math.PI / 180) / 2;
+  const aspect = camera.aspect > 0 ? camera.aspect : 1;
+  const halfH = Math.atan(Math.tan(halfV) * aspect);
+  const halfBind = Math.min(halfV, halfH);
+  const Rs = 0.5 * size.length() || radius;   // bounding-sphere radius (half bbox diagonal)
+  const fitDist = Math.max(1e-3, (Rs / Math.sin(halfBind)) * 1.03);
+  const dir = new THREE.Vector3(0.72, 0.48, 0.72).normalize();
+  camera.position.copy(dir.multiplyScalar(fitDist));
+  camera.near = Math.max(0.01, fitDist * 0.01);
+  camera.far = fitDist * 4 + Rs * 4 + 10;
+  camera.updateProjectionMatrix();
   orbit.target.set(0, 0, 0);
   orbit.update();
   status.value = '';
@@ -1346,6 +1382,7 @@ onMounted(() => {
   registerViewerCapture(captureFrame);
   registerViewerCaptureAt(captureAt);
   registerViewerCaptureMotion(captureMotion);
+  registerViewerFraming(panelFraming);
   renderer.domElement.addEventListener('pointermove', onHover);
   renderer.domElement.addEventListener('pointerdown', onDown);
   renderer.domElement.addEventListener('click', onClick);
@@ -1364,6 +1401,7 @@ onBeforeUnmount(() => {
   registerViewerCaptureAt(null);
   registerViewerCaptureMotion(null);
   registerViewerModel(null);
+  registerViewerFraming(null);
   try { renderer?.dispose(); } catch { /* ignore */ }
 });
 </script>

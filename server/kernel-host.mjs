@@ -16,7 +16,7 @@ import {
 import { reopenFromRigidity, runDiscoveryLoop, runL2Round, runVisionCampaign, runMotionRound, applyJointVerdict, amortizeVerdict, reconcileLanes, admitCandidates, refineJoint, MAX_EXTRA_VIEWS, MAX_VISION_ROUNDS, MOTION_ANGLES } from '../src/plugins/discovery/loop.mjs';
 import { saveManifest, saveRevision, listRevisions, loadRevision, latestRevision, diffManifests } from '../src/plugins/discovery/manifest.mjs';
 import { rigidityGate } from '../src/plugins/discovery/tests.mjs';
-import { focusFromManifest, modelRadius, modelTarget, planViews, VIEWPORT } from '../src/plugins/discovery/views.mjs';
+import { focusFromManifest, modelRadius, modelTarget, panelFramingOf, planPanelViews, planViews, VIEWPORT } from '../src/plugins/discovery/views.mjs';
 import { AMORTIZABLE, peersOf, symmetryGroups } from '../src/plugins/discovery/symmetry.mjs';
 import {
   MAX_FRAMES_PER_ROUND, framePath, listRounds, loadColorMap, loadRound,
@@ -313,6 +313,16 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
       };
       const timeoutMs = Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : null;
 
+      // THE HUMAN OWNS THE FRAMING. Round 1 is planned at the panel's LIVE camera
+      // framing — the aim point, distance and FOV the human orbited/zoomed to —
+      // read from the pinned renderer over the farm socket, so the twelve
+      // screenshots show the machine at the size the 3D view panel shows it, from
+      // twelve fixed directions. When no usable framing comes back (no renderer
+      // answers, the panel reports nothing sane) the round falls back to the
+      // coverage planner instead of guessing a camera.
+      const panelFraming = panelFramingOf(await farm.framing({ rendererId, timeoutMs: 8_000 }), current.glb);
+      const panelPlan = !!panelFraming;
+
       // Which frames actually reached the model, collected as they are captured,
       // so the response can point the UI at the exact pixels behind each claim.
       // `round` is carried per frame because a campaign spans several directories
@@ -320,14 +330,24 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
       const drawn = [];
 
       const res = await runVisionCampaign(current.glb, joints, manifest, {
-        plan: () => planViews(current.glb, planSpec),
+        plan: () => (panelPlan
+          ? planPanelViews(current.glb, panelFraming, { viewport, count: planSpec.maxViews })
+          : planViews(current.glb, planSpec)),
 
         // The campaign passes its own round index as the fourth argument; that is
         // what routes this round's frames to their own directory.
         capture: async (view, shotMode, focusNodes, campaignRound = 0) => {
           const rnd = round + campaignRound;
+          // A panel view carries the human's FOV on its spec; the renderer must
+          // draw with THAT fov or the frame would not be the framing that was
+          // planned (and the coverage prediction beside it would describe a
+          // different camera). Every other view keeps the campaign viewport.
+          const viewFov = Number(view?.spec?.fov);
+          const shotViewport = Number.isFinite(viewFov) && viewFov >= 1 && viewFov <= 170
+            ? { ...viewport, fov: viewFov }
+            : viewport;
           const r = await farm.capture({
-            round: rnd, view, mode: shotMode, focusNodes, viewport, rendererId, timeoutMs,
+            round: rnd, view, mode: shotMode, focusNodes, viewport: shotViewport, rendererId, timeoutMs,
           });
           const entry = r?.frame || null;
           if (!entry) return null;
@@ -362,7 +382,8 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
               distance: Number.isFinite(view?.spec?.distance) ? view.spec.distance : range,
               azimuth: Number.isFinite(view?.spec?.azimuth) ? view.spec.azimuth : null,
               elevation: Number.isFinite(view?.spec?.elevation) ? view.spec.elevation : null,
-              fov: Number.isFinite(viewport?.fov) ? viewport.fov : null,
+              fov: Number.isFinite(view?.spec?.fov) ? view.spec.fov
+                : (Number.isFinite(viewport?.fov) ? viewport.fov : null),
             });
           } catch { /* a dead socket must never kill a capture */ }
           return {
@@ -402,6 +423,12 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
         maskPairs: whole(opts.maskPairs, 0, 12),
         ghostFrames: whole(opts.ghostFrames, 0, 12),
         orientation: whole(opts.orientation, 0, 12),
+        // A panel plan IS the survey tier: all twelve directions must survive
+        // shot selection, so the survey budget is raised to the plan size. The
+        // default 6 was sized for the fitted survey tier and would drop half the
+        // human's framing to the fill pass's order — same views, but the budget
+        // should say what the plan means.
+        ...(panelPlan ? { survey: planSpec.maxViews } : {}),
         rounds,
         extraViews,
         maxRegions: whole(opts.maxRegions, 1, 8),

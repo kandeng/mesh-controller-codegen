@@ -29,6 +29,7 @@ export function createRenderFarm({ timeoutMs = DEFAULT_CAPTURE_TIMEOUT_MS, onEve
   const renderers = new Map();  // socket -> entry
   const byId = new Map();       // renderer id -> socket
   const pending = new Map();    // requestId -> { resolve, reject, timer, rendererId }
+  const pendingFraming = new Map(); // requestId -> { resolve, timer, rendererId }
   let seq = 0;
 
   const note = (type, data) => { try { onEvent?.({ type, ...data }); } catch { /* never let logging break a capture */ } };
@@ -73,6 +74,9 @@ export function createRenderFarm({ timeoutMs = DEFAULT_CAPTURE_TIMEOUT_MS, onEve
     byId.delete(entry.id);
     for (const [requestId, p] of [...pending]) {
       if (p.rendererId === entry.id) fail(requestId, `renderer ${entry.id} disconnected mid-capture`);
+    }
+    for (const [requestId, p] of [...pendingFraming]) {
+      if (p.rendererId === entry.id) resolveFraming(requestId, null);
     }
     note('renderer:detached', { rendererId: entry.id, renderers: renderers.size });
   }
@@ -218,6 +222,58 @@ export function createRenderFarm({ timeoutMs = DEFAULT_CAPTURE_TIMEOUT_MS, onEve
     fail(requestId, error);
   }
 
+  // ---- panel framing ---------------------------------------------------------
+
+  // Ask a renderer for the 3D view panel's LIVE camera framing — the aim point,
+  // eye distance and FOV the human has orbited/zoomed to. The panel-framed survey
+  // (planPanelViews) draws its twelve directions at exactly this framing, so the
+  // screenshots match what the human is looking at. Read at plan time rather than
+  // announced with renderer-hello: framing changes with every drag, and a stale
+  // hello would plan against a camera the panel no longer has.
+  //
+  // Resolves { target, distance, fov } or NULL (no renderer, timeout, disconnect,
+  // refusal). Null is not an error — the caller falls back to the coverage plan.
+  async function framing(request = {}) {
+    const renderer = request.rendererId
+      ? (() => { const s = byId.get(request.rendererId); return s ? renderers.get(s) : null; })()
+      : pick();
+    if (!renderer || !renderer.hasModel) return null;
+
+    const requestId = `frm_${Date.now().toString(36)}_${nextId()}`;
+    const budget = Number(request.timeoutMs) > 0 ? Number(request.timeoutMs) : 8_000;
+
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        resolveFraming(requestId, null);
+        note('render:framing-timeout', { requestId, rendererId: renderer.id, budget });
+      }, budget);
+      pendingFraming.set(requestId, { resolve, timer, rendererId: renderer.id });
+      const sent = wsSend(renderer.socket, { kind: 'framing-request', requestId });
+      if (!sent) resolveFraming(requestId, null);
+    });
+  }
+
+  // Called from the /api/events inbound handler on `framing-response`. Returns
+  // false for an unknown/expired requestId so a late answer is simply dropped.
+  function deliverFraming(requestId, framingInfo) {
+    const f = framingInfo && typeof framingInfo === 'object' ? {
+      target: Array.isArray(framingInfo.target) && framingInfo.target.length === 3
+        ? framingInfo.target.map(Number) : null,
+      distance: Number.isFinite(Number(framingInfo.distance)) ? Number(framingInfo.distance) : null,
+      fov: Number.isFinite(Number(framingInfo.fov)) ? Number(framingInfo.fov) : null,
+    } : null;
+    return resolveFraming(requestId, f && Number.isFinite(f.distance) && Number.isFinite(f.fov) ? f : null);
+  }
+
+  function resolveFraming(requestId, value) {
+    const p = pendingFraming.get(requestId);
+    if (!p) return false;
+    pendingFraming.delete(requestId);
+    clearTimeout(p.timer);
+    p.resolve(value);
+    return true;
+  }
+
   function fail(requestId, message) {
     const p = pending.get(requestId);
     if (!p) return false;
@@ -265,6 +321,7 @@ export function createRenderFarm({ timeoutMs = DEFAULT_CAPTURE_TIMEOUT_MS, onEve
 
   function dispose() {
     for (const id of [...pending.keys()]) fail(id, 'render farm disposed');
+    for (const id of [...pendingFraming.keys()]) resolveFraming(id, null);
     renderers.clear();
     byId.clear();
   }
@@ -272,5 +329,6 @@ export function createRenderFarm({ timeoutMs = DEFAULT_CAPTURE_TIMEOUT_MS, onEve
   return {
     attach, update, detach, list, status, pick,
     capture, captureMotion, deliver, nack, cancel, fail, dispose,
+    framing, deliverFraming,
   };
 }

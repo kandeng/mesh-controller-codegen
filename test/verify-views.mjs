@@ -19,11 +19,11 @@
 import { bladeCandidates, parseGlb } from '../src/lib/gltf.mjs';
 import { MAX_LEGEND } from '../src/plugins/discovery/vision-prompt.mjs';
 import {
-  AZIMUTH_RETRY, REGION_MAX_R, REGION_MIN_R, REGION_PAD, SURVEY_ELEVATION, VIEWPORT,
+  AZIMUTH_RETRY, PANEL_ANGLES, REGION_MAX_R, REGION_MIN_R, REGION_PAD, SURVEY_ELEVATION, VIEWPORT,
   candidateSpecs, coverageOf, fitDistance, focusFromManifest, kdCells,
-  makeCamera, modelRadius, modelTarget, namedIndex, nodeBox, planCloseUps,
-  planViews, poseFromSpec, project, projectNode, regionsFromSuggestViews,
-  renderTargets, surveySpecs, unfitDistance,
+  makeCamera, modelRadius, modelTarget, namedIndex, nodeBox, panelFramingOf,
+  planCloseUps, planPanelViews, planViews, poseFromSpec, project, projectNode,
+  rectOf, regionsFromSuggestViews, renderTargets, surveySpecs, unfitDistance,
 } from '../src/plugins/discovery/views.mjs';
 
 const GLB = 'samples/drone_dji_inspire3.glb';
@@ -583,6 +583,73 @@ const photos = budget.views.filter((v) => v.mode === 'photo');
     cu.views.length > 0 && cu.views.some((v) => v.sees.includes(part))
       && cu.views.every((v) => Array.isArray(v.sees) && v.sees.length > 0),
     `${cu.views.length} frames, ${cu.covered}/${cu.targets} region parts framed`);
+}
+
+console.log('\n  G) the panel-framed survey draws the human\'s own distance/FOV from 12 angles');
+{
+  // A framing the human might settle on: a 40° FOV, pulled back to 2.5 model
+  // radii, aimed slightly off-centre. planPanelViews must reproduce THAT framing
+  // in all twelve views — same distance, same fov — and only vary the bearing.
+  const framing = { target: [3, -2, 1.5], distance: modelRadius(g) * 2.5, fov: 40 };
+  const f = panelFramingOf(framing, g);
+  ok('G: a sane framing is accepted verbatim (target, distance, fov)',
+    !!f && f.distance === framing.distance && f.fov === framing.fov
+      && f.target.every((v, k) => v === framing.target[k]));
+  ok('G: a framing with no distance or a nonsensical fov is rejected (null)',
+    panelFramingOf({ fov: 40 }, g) === null
+      && panelFramingOf({ distance: 10 }, g) === null
+      && panelFramingOf({ distance: 10, fov: 0 }, g) === null
+      && panelFramingOf({ distance: -5, fov: 40 }, g) === null);
+  ok('G: a missing aim point defaults to the model centre, not to nothing',
+    (() => { const d = panelFramingOf({ distance: 100, fov: 45 }, g); const mt = modelTarget(g); return !!d && d.target.every((v, k) => Math.abs(v - mt[k]) < 1e-9); })());
+
+  const plan = planPanelViews(g, framing);
+  ok('G: planPanelViews returns one view per PANEL_ANGLES direction',
+    !!plan && plan.views.length === PANEL_ANGLES.length,
+    `${plan?.views.length} views for ${PANEL_ANGLES.length} angles`);
+  ok('G: EVERY view carries the human\'s exact distance and fov (the whole point)',
+    plan.views.every((v) => Math.abs(v.spec.distance - framing.distance) < 1e-9
+      && v.spec.fov === framing.fov && Math.abs(v.cam.fov - framing.fov) < 1e-9)
+      && plan.framing.fov === framing.fov,
+    `d=${framing.distance.toFixed(1)}, fov=${framing.fov}\u00b0`);
+  ok('G: all twelve aim at the SAME target (only the bearing changes)',
+    plan.views.every((v) => v.pose.target.every((t, k) => Math.abs(t - framing.target[k]) < 1e-9)));
+  ok('G: every eye sits exactly one framing-distance from its target',
+    plan.views.every((v) => Math.abs(
+      Math.hypot(v.pose.eye[0] - v.pose.target[0], v.pose.eye[1] - v.pose.target[1], v.pose.eye[2] - v.pose.target[2])
+      - framing.distance) < 1e-6));
+  ok('G: the twelve bearings are all distinct (no two directions coincide)',
+    new Set(plan.views.map((v) => `${v.spec.azimuth}|${v.spec.elevation}`)).size === plan.views.length);
+  ok('G: panel views are kind \'panel\' and photo-mode, with a live cam basis',
+    plan.views.every((v) => v.spec.kind === 'panel' && v.mode === 'photo'
+      && v.cam && Array.isArray(v.cam.f) && v.cam.f.every(Number.isFinite)));
+  ok('G: the plan reports coverage in planViews\' shape (targets, covered, unseen)',
+    Number.isFinite(plan.targets) && Number.isFinite(plan.covered)
+      && plan.coverage >= 0 && plan.coverage <= 1 && Array.isArray(plan.unseen),
+    `${plan.covered}/${plan.targets} named parts seen, coverage ${(plan.coverage * 100).toFixed(0)}%`);
+  ok('G: the poles survive (a true top-down and bottom-up look are in the twelve)',
+    plan.views.some((v) => v.spec.pole === 'top' && v.spec.elevation === 90)
+      && plan.views.some((v) => v.spec.pole === 'bottom' && v.spec.elevation === -90));
+
+  // A rejected framing must yield null, so the kernel falls back to planViews.
+  ok('G: planPanelViews returns null on an unusable framing (kernel falls back)',
+    planPanelViews(g, { fov: 45 }) === null && planPanelViews(g, null) === null);
+
+  // The whole sphere must fit at the human's framing when it was itself a fit:
+  // a bounding-sphere distance at this fov keeps every model corner in frame.
+  const fitFov = 45;
+  const Rs = modelRadius(g);
+  const fitD = fitDistance(Rs, { ...VIEWPORT, fov: fitFov });
+  const fitPlan = planPanelViews(g, { distance: fitD, fov: fitFov });
+  const cornersIn = fitPlan.views.every((v) => {
+    // A box spanning the model's bounding sphere, projected into the frame. At a
+    // true sphere-fit distance every one of its eight corners lands inside, so a
+    // non-null clipped rect means the whole machine fits the panel frame.
+    const b = { c: modelTarget(g), h: [Rs, Rs, Rs] };
+    return rectOf(b, v.cam) !== null;
+  });
+  ok('G: at a bounding-sphere fit the whole model stays inside every panel frame',
+    cornersIn, `fit d=${fitD.toFixed(1)} at ${fitFov}\u00b0`);
 }
 
 console.log(`\n${fail === 0 ? 'VIEWS_PROBE_OK' : 'VIEWS_PROBE_FAILED'} \u2014 ${pass} passed, ${fail} failed\n`);

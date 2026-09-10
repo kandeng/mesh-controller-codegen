@@ -339,6 +339,102 @@ export function surveySpecs(g, {
   return specs;
 }
 
+// The panel-framed survey: twelve fixed directions, ONE framing. The human owns
+// the 3D view panel — they orbit and zoom it until the machine looks right — and
+// this plan reproduces exactly what they framed: the panel's own aim point, eye
+// distance and FOV, looked at from twelve bearings. No fit, no greedy, no cell
+// pass: the size of the machine in every frame is the size the human chose, and
+// the only thing the planner contributes is WHERE around the model to stand.
+//
+// `framing` is { target, distance, fov } in parseGlb world space, read live from
+// the renderer that will draw the frames (server/render-farm.mjs `framing()`).
+// A framing with no usable distance or fov is rejected (null) so the caller
+// falls back to the coverage planner instead of drawing twelve guesses.
+//
+// The twelve directions: four eye-level orthogonals (the survey convention),
+// four upper obliques and two lower obliques on the diagonals (deck and belly
+// context the orthogonals cannot see), and a true top and bottom pole each.
+// Elevation is capped below the poles so no two directions nearly coincide.
+export const PANEL_ANGLES = [
+  { azimuth: 0, elevation: 0 }, { azimuth: 90, elevation: 0 },
+  { azimuth: 180, elevation: 0 }, { azimuth: 270, elevation: 0 },
+  { azimuth: 45, elevation: 35 }, { azimuth: 135, elevation: 35 },
+  { azimuth: 225, elevation: 35 }, { azimuth: 315, elevation: 35 },
+  { azimuth: 45, elevation: -35 }, { azimuth: 225, elevation: -35 },
+  { azimuth: 0, elevation: 90, pole: 'top' }, { azimuth: 0, elevation: -90, pole: 'bottom' },
+];
+
+// Accepted panel framing, or null. Distance and fov must be finite and positive;
+// the aim point defaults to the model centre when the panel never reported one.
+export function panelFramingOf(framing, g) {
+  const distance = Number(framing?.distance);
+  const fov = Number(framing?.fov);
+  if (!Number.isFinite(distance) || distance <= 1e-3) return null;
+  if (!Number.isFinite(fov) || fov < 1 || fov > 170) return null;
+  const t = framing?.target;
+  const target = Array.isArray(t) && t.length === 3 && t.every(Number.isFinite) ? t.map(Number) : modelTarget(g);
+  return { target, distance, fov };
+}
+
+// Views come out in the SAME shape planViews emits ({id, mode, spec, pose,
+// marginal, covers, sees, cam}) so selectShots, the prompt builder, grounding
+// and the theater treat a panel plan exactly like a coverage plan. `spec.kind`
+// is 'panel' — its own tier in selectShots (survey-classed: never masked, since
+// a whole-machine legend is unreadable) — and it carries `fov` because this is
+// the one plan whose FOV is the human's, not the viewport default's.
+export function planPanelViews(g, framing, {
+  count = PANEL_ANGLES.length, viewport = VIEWPORT, minArea = MIN_AREA,
+} = {}) {
+  const f = panelFramingOf(framing, g);
+  if (!f) return null;
+  const named = namedIndex(g);
+  const targets = renderTargets(g);
+  const label = (n) => named.get(n.i);
+  const want = new Set(targets.map(label));
+  const maxRad = targets.reduce((m, n) => Math.max(m, Math.max(...nodeBox(n).h)), 0);
+  const vp = { ...viewport, fov: f.fov };
+
+  const n = Math.max(1, Math.min(PANEL_ANGLES.length, count | 0));
+  const covered = new Set();
+  const views = [];
+  for (let i = 0; i < n; i += 1) {
+    const a = PANEL_ANGLES[i];
+    const spec = {
+      kind: 'panel', azimuth: a.azimuth, elevation: a.elevation,
+      ...(a.pole ? { pole: a.pole } : {}),
+      distance: f.distance, target: f.target.slice(), fov: f.fov,
+    };
+    const pose = poseFromSpec(spec, g);
+    const cam = makeCamera(pose.eye, pose.target, vp, pose.up);
+    const covers = coverageOf(cam, targets, { minArea, label, reach: reachOf(spec, g, maxRad) });
+    let marginal = 0;
+    for (const nm of covers) if (!covered.has(nm)) marginal += 1;
+    for (const nm of covers) covered.add(nm);
+    views.push({
+      id: `p${i}`, mode: 'photo', spec, pose, marginal, covers: covers.size,
+      cam, sees: [...covers].slice(0, SEES_CAP),
+    });
+  }
+
+  const total = want.size;
+  return {
+    views,
+    meshes: targets.length,
+    targets: total,
+    covered: covered.size,
+    coverage: total ? covered.size / total : 1,
+    // Same fields planViews reports. A panel plan buys no ghost frames — the
+    // human chose an opaque look — so parts only a transparent shell can show
+    // are listed here exactly as the coverage plan lists them: a fact about the
+    // model, reported not hidden.
+    interiorOnly: [],
+    unseen: [...want].filter((nm) => !covered.has(nm)),
+    // Recorded so plan.json and the response can say the frames were the
+    // human's framing, and with what numbers.
+    framing: f,
+  };
+}
+
 // Adaptive spatial subdivision: split the target set by its longest axis at the
 // median until each cell holds at most `maxMembers` boxes (or the depth/size
 // floor is hit). Median splits rather than a full octree because a drone is
