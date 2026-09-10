@@ -821,6 +821,17 @@ const freshStage = () => {
     /const stopped = await stopEverything\(\{ kernel, agent \}\);/.test(routeSrc)
       && /agent\.send\(text, images, \{ origin: 'user' \}\)/.test(routeSrc)
       && /e\.dropped \|\| e\.message === DROPPED_MSG/.test(routeSrc));
+  // Session isolation: a lane send must NEVER prompt the human DSH session. One
+  // shared session is exactly how a human turn that arrives right after a vision
+  // round came to be answered IN the vision reply schema — the freshest contract
+  // in the history wins. Lane calls are self-contained, so they get a stateless
+  // session each; mux events and cancel are addressed to the turn's own session.
+  const dshSrc = readFileSync(new URL('../server/dsh-agent.mjs', import.meta.url), 'utf8');
+  ok('S9: lane sends prompt a stateless session of their own — the human session stays purely human',
+    /const sid = opts\?\.origin === 'user' \? sessionId : await createLaneSession\(\);/.test(dshSrc)
+      && /rpc\('session\.prompt', \{ sessionId: sid, mode: 'queue', content \}\)/.test(dshSrc)
+      && /f\.sessionId !== \(turnSid \|\| sessionId\)/.test(dshSrc)
+      && /rpc\('session\.cancel', \{ sessionId: turnSid \|\| sessionId \}, 5_000\)/.test(dshSrc));
   const sockSrc = readFileSync(new URL('../app/src/composables/useAgentSocket.js', import.meta.url), 'utf8');
   const stopFn = sockSrc.slice(sockSrc.indexOf('function stop()'), sockSrc.indexOf('function stop()') + 400);
   ok('S9: the red button sends ONE stop for every case — no discovery special case left',

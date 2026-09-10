@@ -42,11 +42,18 @@ export function createDshAgent(kernel) {
   let mode = 'stub';            // 'live' once the web host answers
   let child = null;
   let base = null;              // http://127.0.0.1:<port> of the dsh web host
-  let sessionId = null;
+  let sessionId = null;         // the HUMAN session — chat turns and nothing else
+  // Session of the turn currently in flight (human or lane). Mux events and
+  // session.cancel are addressed to IT, never to `sessionId` blindly: a lane
+  // turn owns its own session (see sendLive), so a late event from a finished
+  // lane session must not be read as an event of the turn that follows it.
+  let turnSid = null;
+  let laneSessions = 0;         // how many stateless lane sessions were minted
+  let lastLaneSession = null;   // most recent lane session id (observability)
+  const modelBySession = new Map(); // session.selectModel state is PER session
   let startPromise = null;
   let muxWs = null;             // the downlink-only events.mux WebSocket
   let disposed = false;
-  let lastModel = null;         // last model handed to session.selectModel
   let lastAssistantText = '';   // final reply text captured from assistant/message this turn
   let logFd = null;
 
@@ -113,9 +120,12 @@ export function createDshAgent(kernel) {
   let turnTools = [];     // per-turn tool activity lines (persisted with the reply)
   const emit = (frame) => { try { agent.onEvent?.(frame); } catch { /* listener went away */ } };
 
-  // f is the MuxFrame (msg.payload). Only session/event frames carry agent events.
+  // f is the MuxFrame (msg.payload). Only session/event frames carry agent events,
+  // and only those of the turn in flight: with lane sessions in play the host
+  // multiplexes several of OUR sessions on this one socket, and a turn/end from
+  // a session whose turn already settled would otherwise kill the next turn.
   function frameEvent(f) {
-    if (f?.type !== 'session/event' || f.sessionId !== sessionId) return;
+    if (f?.type !== 'session/event' || f.sessionId !== (turnSid || sessionId)) return;
     const ev = f.event || {};
     const kind = ev.type;
     if (kind === 'assistant/chunk') {
@@ -245,10 +255,28 @@ export function createDshAgent(kernel) {
     });
   }
 
-  async function selectModel(model) {
-    if (!model || model === lastModel) return;
-    try { await rpc('session.selectModel', { sessionId, provider: 'bailian', model }); lastModel = model; }
+  async function selectModel(model, sid = sessionId) {
+    if (!model || modelBySession.get(sid) === model) return;
+    try { await rpc('session.selectModel', { sessionId: sid, provider: 'bailian', model }); modelBySession.set(sid, model); }
     catch (e) { log('selectModel failed:', e.message); }
+  }
+
+  // A STATELESS session for one kernel lane call (vision producer, category
+  // prior, L2 refine). The lane prompts are self-contained by construction —
+  // every round re-embeds the frames, the schema and the prior observations as
+  // text — so history buys them nothing, and what it costs is contract
+  // crosstalk: with one shared session the freshest contract in the history
+  // wins, and a human turn that arrives right after a vision round gets
+  // answered IN the vision round's reply schema instead of in chat. Fresh
+  // session per lane call makes the human session purely human and each lane
+  // call purely itself. Lane sessions are not persisted: a server restart
+  // loses nothing a prompt needed.
+  async function createLaneSession() {
+    const id = `mcc-lane-${randomUUID()}`;
+    await rpc('session.create', { cwd: kernel.runDir, sessionId: id });
+    laneSessions += 1;
+    lastLaneSession = id;
+    return id;
   }
 
   async function start() {
@@ -281,7 +309,7 @@ export function createDshAgent(kernel) {
         sessionId = created?.sessionId || wanted;
         kernel.sessionStore?.setSession({ sessionId });
         mode = 'live';
-        lastModel = null;
+        modelBySession.clear(); // a fresh host has no model selected in any session
         connectMux();
         log(`live: ${base} session=${sessionId}`);
       } catch (e) {
@@ -295,14 +323,19 @@ export function createDshAgent(kernel) {
     try { await startPromise; } finally { startPromise = null; }
   }
 
-  async function sendLive(text, images = []) {
+  async function sendLive(text, images = [], opts = {}) {
     await start();
     turnTools = [];
     lastAssistantText = '';
     // qwen3.8-max (the default) is multimodal, so image turns run on it unless
     // an explicit vision_model override is configured.
     const model = (images.length && cfg.visionModel) ? cfg.visionModel : cfg.model;
-    await selectModel(model);
+    // Session isolation (see createLaneSession): a human send prompts the
+    // persistent human session; anything else prompts a session minted for
+    // this one call, so neither history ever sees the other's contract.
+    const sid = opts?.origin === 'user' ? sessionId : await createLaneSession();
+    turnSid = sid;
+    await selectModel(model, sid);
 
     const content = [{ type: 'text', text }];
     for (const img of images) content.push({ type: 'image', mediaType: img.mediaType, data: img.dataBase64, ...(img.name ? { name: img.name } : {}) });
@@ -311,14 +344,14 @@ export function createDshAgent(kernel) {
       const timer = setTimeout(() => {
         pendingTurn = null;
         closeGate(); // this turn's late turn/end must not hit the next prompt
-        rpc('session.cancel', { sessionId }).catch(() => {});
+        rpc('session.cancel', { sessionId: sid }).catch(() => {});
         rej(new Error('agent turn timed out'));
       }, Math.max(cfg.dshTimeoutMs || 900_000, 300_000));
       pendingTurn = { resolve: res, reject: rej, timer, prompted: false };
     });
     await turnGate.p; // previous turn's end event consumed (or forced) — safe to prompt
     try {
-      await rpc('session.prompt', { sessionId, mode: 'queue', content });
+      await rpc('session.prompt', { sessionId: sid, mode: 'queue', content });
     } catch (e) {
       // Don't leak the pending turn if the prompt itself was rejected.
       if (pendingTurn) { clearTimeout(pendingTurn.timer); pendingTurn = null; }
@@ -340,7 +373,7 @@ export function createDshAgent(kernel) {
     let reply = lastAssistantText.trim();
     if (!reply) {
       try {
-        const hist = await rpc('session.history', { sessionId, maxMessages: 20 });
+        const hist = await rpc('session.history', { sessionId: sid, maxMessages: 20 });
         const events = hist?.events || [];
         for (let i = events.length - 1; i >= 0; i--) {
           const ev = events[i]?.event;
@@ -354,6 +387,7 @@ export function createDshAgent(kernel) {
         }
       } catch (e) { log('history fallback failed:', e.message); }
     }
+    turnSid = null; // the turn settled; late events from this session are noise
     return { reply: reply || '(the assistant produced no text this turn)', tools: turnTools.slice() };
   }
 
@@ -378,6 +412,7 @@ export function createDshAgent(kernel) {
     status() {
       return {
         mode, sessionId, model: cfg.model, visionModel: cfg.visionModel || null,
+        laneSessions, lastLaneSession,
         dsh: base ? { base, pid: child?.pid ?? null } : null,
         methods: contract.methods,
       };
@@ -391,9 +426,12 @@ export function createDshAgent(kernel) {
     // images: [{ mediaType, dataBase64, name? }]
     // opts.origin: 'user' for a send typed in the composer; everything else (the
     // kernel's vision/lane prompts) counts as a 'lane' send. The distinction is
-    // what makes a stop safe: only user sends may be dropped from the queue.
+    // what makes a stop safe (only user sends may be dropped from the queue)
+    // AND what keeps the contracts apart: a lane send prompts a stateless
+    // session of its own, so the human session's history stays purely human.
     send(text, images = [], opts = {}) {
       const item = { origin: opts?.origin === 'user' ? 'user' : 'lane', dropped: false };
+      const sendOpts = opts;
       const behind = running;
       queued.push(item);
       if (behind) waiting += 1;
@@ -411,7 +449,7 @@ export function createDshAgent(kernel) {
         const wasLive = mode === 'live';
         if (wasLive || existsSync(cfg.paths.dshBin)) {
           try {
-            const r = await sendLive(text, images);
+            const r = await sendLive(text, images, sendOpts);
             return { role: 'assistant', text, reply: r.reply, tools: r.tools, mode: 'live' };
           } catch (e) {
             if (e.message === STOP_MSG) throw e; // user stop: never stub-mask it
@@ -451,7 +489,9 @@ export function createDshAgent(kernel) {
       clearTimeout(pendingTurn.timer);
       const p = pendingTurn;
       pendingTurn = null;
-      try { await rpc('session.cancel', { sessionId }, 5_000); } catch (e) { log('session.cancel failed:', e.message); }
+      // Cancel the session the in-flight turn actually owns — a lane turn lives
+      // in its own stateless session, not in the human one.
+      try { await rpc('session.cancel', { sessionId: turnSid || sessionId }, 5_000); } catch (e) { log('session.cancel failed:', e.message); }
       closeGate(); // this turn's late turn/end must not hit the next prompt
       p.reject(new Error(STOP_MSG));
       return { stopped: true, dropped };
