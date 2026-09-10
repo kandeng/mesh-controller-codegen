@@ -33,8 +33,8 @@ const firstReady = computed(() => state.joints.find((j) => !pending(j))?.id || n
 watch(firstReady, (id) => { if (id && !state.activeJointId) selectJoint(id); }, { immediate: true });
 
 // Picking a joint asks the assistant for the inspection guidance and then selects
-// it. The guidance is said ONCE (the store collapses an unchanged repeat), so
-// walking down the list does not stack the same paragraph into the chat.
+// it. The guidance is said ONCE per conversation (the store scans the transcript),
+// so walking down the list — or coming back after a question — never restacks it.
 function pick(j) {
   sayJointGuidance();
   selectJoint(j.id);

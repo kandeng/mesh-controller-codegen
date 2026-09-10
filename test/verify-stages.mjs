@@ -38,9 +38,13 @@
 //       recovered from the transcript, folded into one more proposals-only look as
 //       words AND pictures, still cannot bypass the grounding gate, and unions into
 //       the candidate list without invalidating it
+//   S9) STOP IS ONE VERB: the red button and /stop reach all four things that can be
+//       running — discovery, generation, the model turn in flight, and the QUEUE,
+//       whose remaining user requests are removed rather than served later
 //
 // Usage: node test/verify-stages.mjs
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { parseGlb } from '../src/lib/gltf.mjs';
 import { geometryDiscovery } from '../src/plugins/discovery/geometry.mjs';
 import { claimedNodeSet } from '../src/plugins/discovery/manifest.mjs';
@@ -52,12 +56,14 @@ import {
 } from '../src/plugins/discovery/loop.mjs';
 // Importing the server headlessly is safe: slash-commands.mjs has no imports at
 // all, routes/project.mjs pulls in only slots.mjs -> src/core/registry.mjs, and
-// dsh-agent.mjs boots its child process lazily (never at construction).
-import { findCommand, helpText, parseSlash, slashSection } from '../server/slash-commands.mjs';
+// dsh-agent.mjs boots its child process lazily (never at construction). Same for
+// dsh-bridge.mjs: it spawns only inside run(), which S9 drives with a stand-in.
+import { findCommand, helpText, parseSlash, slashSection, stopEverything } from '../server/slash-commands.mjs';
 import { jointSummary } from '../server/routes/project.mjs';
-import { createDshAgent } from '../server/dsh-agent.mjs';
+import { createDshAgent, DROPPED_MSG } from '../server/dsh-agent.mjs';
 import { userGuidanceSince } from '../server/session-store.mjs';
 import { buildVisionPrompt } from '../src/plugins/discovery/vision-prompt.mjs';
+import { dshBridge } from '../src/bridges/dsh-bridge.mjs';
 
 const GLB = 'samples/drone_dji_inspire3.glb';
 
@@ -709,6 +715,121 @@ const freshStage = () => {
   ok('S8: the steered origin is stamped onto the records it added BEFORE they are admitted',
     stamp > guid && stamp < at('const adm2 = admitCandidates(') && stamp < stage2,
     J({ guid, stamp, admit: at('const adm2 = admitCandidates('), stage2 }));
+}
+
+// ---- S9) Stop is ONE verb with four reachabilities ---------------------------
+// The question this leg answers: when the human hits the red button (or types
+// /stop), does everything stop immediately — including the requests already sent
+// to the remote model — and are the requests still waiting in the queue REMOVED
+// rather than served afterwards? Four things can be running at once, and each
+// needs its own handle: the staged discovery (a boundary flag), a controller
+// generation (a separate headless child, off the turn chain), the model turn in
+// flight (session.cancel tears the stream down client-side — the only abort a
+// remote provider can be given), and the queue itself.
+{
+  // (a) THE QUEUE. A stop removes the user's queued sends; the lane's survive.
+  // Dropping a lane send would strand an await inside the running discovery and
+  // freeze the orchestrator, which is why discovery is halted by its own flag.
+  const agent = createDshAgent({ config: { paths: { dshBin: '/nonexistent/dsh' }, model: 'm' }, diagnostics: { note() {} } });
+  const p1 = agent.send('first ask', [], { origin: 'user' });
+  const p2 = agent.send('second ask', [], { origin: 'user' });
+  const p3 = agent.send('a lane prompt', []);                     // no opts -> lane
+  const p4 = agent.send('another lane prompt', [], { origin: 'lane' });
+  // No host, so nothing is in flight — but the queue is not empty, and that is
+  // exactly what item (4) is about.
+  const st = await agent.stop();
+  const settled = await Promise.allSettled([p1, p2, p3, p4]);
+  const dropped = settled.filter((s) => s.status === 'rejected' && s.reason?.message === DROPPED_MSG);
+  const answered = settled.filter((s) => s.status === 'fulfilled').map((s) => s.value.text).sort();
+  ok('S9: stop() reports what it actually did — { stopped, dropped }',
+    st.stopped === false && st.dropped === 2, J(st));
+  ok('S9: every queued USER request is removed from the queue and never reaches the model',
+    dropped.length === 2 && dropped.every((s) => s.reason.dropped === true)
+      && !answered.includes('first ask') && !answered.includes('second ask'),
+    J({ dropped: dropped.length, answered }));
+  ok('S9: lane sends survive — a stop must not strand the discovery that is awaiting them',
+    J(answered) === J(['a lane prompt', 'another lane prompt']), J(answered));
+  ok('S9: a request sent AFTER the stop is a fresh one, not a dropped one',
+    (await agent.send('after the stop', [], { origin: 'user' })).reply.includes('after the stop'));
+  ok('S9: and the queue is empty again — idle() does not park on the dropped sends',
+    (await (async () => { const t0 = Date.now(); await agent.idle(); return Date.now() - t0; })()) < 250);
+  await agent.dispose?.();
+
+  // (b) THE ENTRY POINTS. The button (WS {type:'stop'}) and /stop call the SAME
+  // function, so they cannot drift; discovery is flagged FIRST so the lane turn
+  // that is about to be cancelled unwinds into HUMAN_STOPPED, not a crash.
+  const calls = [];
+  const fakeKernel = {
+    abortRefine: () => { calls.push('refine'); return { ok: true }; },
+    abortGenerate: () => { calls.push('generate'); return { ok: true }; },
+  };
+  const fakeAgent = { stop: async () => { calls.push('agent.stop'); return { stopped: true, dropped: 3 }; } };
+  const r1 = await stopEverything({ kernel: fakeKernel, agent: fakeAgent });
+  const said = await findCommand('stop').run({ kernel: fakeKernel, agent: fakeAgent, args: '' });
+  ok('S9: one stop reaches all three hooks, discovery first',
+    J(calls.slice(0, 3)) === J(['refine', 'generate', 'agent.stop']) && calls.length === 6, J(calls));
+  ok('S9: /stop names everything it stopped, including the queue it drained',
+    r1.nothing === false && /discovery is halting/.test(said) && /generation was killed/.test(said)
+      && /turn in flight/.test(said) && /3 queued message\(s\) removed/.test(said), said);
+  ok('S9: with nothing running it is an honest sentence, not a fake success',
+    (await stopEverything({
+      kernel: { abortRefine: () => ({ ok: false, code: 'NOT_RUNNING' }), abortGenerate: () => ({ ok: false, code: 'NOT_RUNNING' }) },
+      agent: { stop: async () => ({ stopped: false, dropped: 0 }) },
+    })).nothing === true);
+  ok('S9: a kernel or agent missing the hooks degrades instead of throwing',
+    (await stopEverything({})).nothing === true);
+
+  // (c) GENERATION, the one job off the turn chain — proved with a real child.
+  ok('S9: the bridge exposes abort() beside run()',
+    typeof dshBridge.api.run === 'function' && typeof dshBridge.api.abort === 'function');
+  ok('S9: aborting an idle bridge is NOT_RUNNING, never a kill of the wrong process',
+    dshBridge.api.abort().code === 'NOT_RUNNING', J(dshBridge.api.abort()));
+
+  const dir = resolve('runs', `_s9-abort-${Date.now()}`);
+  mkdirSync(dir, { recursive: true });
+  const bin = resolve(dir, 'slow-dsh.sh');
+  const patch = resolve(dir, 'noop.patch.yml');
+  // `exec` so the SIGTERM lands on the sleeper itself, not on a shell that would
+  // orphan it: the probe must prove the CHILD dies, not just that sh exited.
+  writeFileSync(bin, '#!/bin/sh\nexec sleep 30\n', { mode: 0o755 });
+  writeFileSync(patch, '- id: noop\n');
+  const fakeHost = {
+    // dshTimeoutMs is long on purpose: only a user abort may end this child.
+    config: { paths: { dshBin: bin, bailianPatch: patch }, apiKey: 'x', dshTimeoutMs: 30_000, model: 'qwen3.8-max' },
+    resources: { trackChild() {} },
+    bus: { emit() {} },
+    diagnostics: { note() {} },
+  };
+  const t0 = Date.now();
+  const running = dshBridge.api.run({ host: fakeHost, task: 'sleep', runDir: dir, model: null });
+  await new Promise((r) => setTimeout(r, 400)); // let the stand-in child start
+  const killed = dshBridge.api.abort();
+  const outcome = await running.then(() => 'resolved-without-error', (e) => e.message);
+  const ms = Date.now() - t0;
+  ok('S9: abort() SIGTERMs the generation child that is really in flight',
+    killed.ok === true && typeof killed.pid === 'number', J(killed));
+  ok('S9: a 30s generation ends at once and says a human aborted it — not "no controller was produced"',
+    /aborted by the user/i.test(outcome) && ms < 5000, `${ms}ms -> ${outcome}`);
+  ok('S9: and the bridge is idle again afterwards', dshBridge.api.abort().code === 'NOT_RUNNING');
+  rmSync(dir, { recursive: true, force: true });
+
+  // (d) THE WIRING, in source order: the WS stop handler and the button both go
+  // through stopEverything, the composer's send is tagged as a user send (that tag
+  // is what makes it droppable), and the button no longer special-cases discovery.
+  const routeSrc = readFileSync(new URL('../server/routes/agent.mjs', import.meta.url), 'utf8');
+  ok('S9: the WS stop handler calls the shared stopEverything, and the send is tagged origin:user',
+    /const stopped = await stopEverything\(\{ kernel, agent \}\);/.test(routeSrc)
+      && /agent\.send\(text, images, \{ origin: 'user' \}\)/.test(routeSrc)
+      && /e\.dropped \|\| e\.message === DROPPED_MSG/.test(routeSrc));
+  const sockSrc = readFileSync(new URL('../app/src/composables/useAgentSocket.js', import.meta.url), 'utf8');
+  const stopFn = sockSrc.slice(sockSrc.indexOf('function stop()'), sockSrc.indexOf('function stop()') + 400);
+  ok('S9: the red button sends ONE stop for every case — no discovery special case left',
+    stopFn.includes("ws.send(JSON.stringify({ type: 'stop' }))") && !/if \(state\.refining\)/.test(stopFn),
+    stopFn.split('\n').filter((l) => l.trim()).slice(0, 3).join(' | '));
+  const kernelSrc = readFileSync(new URL('../server/kernel-host.mjs', import.meta.url), 'utf8');
+  ok('S9: the kernel exposes abortGenerate() and it goes to the dsh bridge\'s abort hook',
+    /abortGenerate\(\) \{/.test(kernelSrc) && /host\.registry\.get\(CATEGORY\.BRIDGE, 'dsh'\)/.test(kernelSrc)
+      && /bridge\?\.api\?\.abort\?\.\(\)/.test(kernelSrc));
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

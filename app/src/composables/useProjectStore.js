@@ -71,13 +71,12 @@ function notify(text) {
 }
 
 // The inspection guidance the assistant says when the human picks a joint from the
-// list. It is said ONCE per unchanged wording: clicking joint after joint must not
-// stack identical paragraphs into the chat, so the previous transcript entry is
-// checked and a message the assistant already said verbatim is not repeated.
+// list. It is said ONCE per conversation: the whole transcript is scanned, not just
+// its last entry, so clicking joint after joint — with questions and screenshots in
+// between — never stacks the same paragraph into the chat a second time.
 const JOINT_GUIDANCE = 'Verify this joint\'s scope: it must contain every part that belongs to it, and none that doesn\'t. Then drive its motion with the step 3 controls to confirm it moves as expected and nothing is broken. If something needs pointing out, mark the 3D view with the pens (arrow, rectangle, curve, text, any colour) and send a screenshot — the marks make your request clearer.';
 function sayJointGuidance() {
-  const last = state.transcript[state.transcript.length - 1];
-  if (last?.text === JOINT_GUIDANCE) return;
+  if (state.transcript.some((e) => e.text === JOINT_GUIDANCE)) return;
   state.transcript.push({ role: 'assistant', text: JOINT_GUIDANCE, ts: Date.now() });
 }
 
@@ -383,7 +382,10 @@ function connectEvents() {
         });
       } else if (msg.kind === 'refine:abort') {
         pushEvent({ type: 'refine:abort', ts: Date.now(), data: { queued: msg.queued ?? 0 } });
-        setStatus('DSH is stopping discovery at its next boundary — the joints already checked stay; the rest remain candidates. Please wait …');
+        // A stop now cancels the look in flight as well, so the wait is the
+        // unwinding (the cancelled turn rejects, the orchestrator lands on its
+        // boundary and reports), not the rest of a model call nobody wants.
+        setStatus('DSH is stopping discovery — the model call in flight is being cancelled; the joints already checked stay, the rest remain candidates. Please wait …');
       } else if (msg.kind === 'refine:skip') {
         state.refining = false; state.discovering = false; state.visionActive = false;
         // A skipped refinement leaves no prior at all; keeping the previous mesh's

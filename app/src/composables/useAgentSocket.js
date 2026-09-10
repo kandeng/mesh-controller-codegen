@@ -117,14 +117,19 @@ export function useAgentSocket() {
     }
   }
 
-  // Stop. While a staged discovery is in flight this stops THE ORCHESTRATOR at its
-  // next boundary: the joints already refined STAY committed (each was saved and
-  // revisioned at its own boundary), and the rest remain candidates rather than
-  // half-checked. Otherwise it cancels the running chat turn on the DSH host; queued
-  // sends (if any) still run afterwards.
+  // Stop — one button, one meaning: STOP EVERYTHING, now. The server side does the
+  // four things a browser cannot: halt the staged discovery, kill a running
+  // controller generation (a separate headless process that no turn cancel can
+  // reach), cancel the model turn in flight, and REMOVE the queued messages so
+  // nothing resurrects the job that was just stopped.
+  //
+  // Discovery semantics are unchanged where they matter: the joints already
+  // refined STAY committed (each was saved and revisioned at its own boundary) and
+  // the rest remain candidates rather than half-checked. What is new is that the
+  // look in flight dies with the stop instead of running to its own end first.
   function stop() {
-    if (state.refining) { api.abortRefine().catch(() => {}); return; }
     if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'stop' }));
+    else api.abortRefine().catch(() => {}); // socket down: still halt discovery
   }
 
   // Restore the persisted transcript (resumability across localhost restarts).

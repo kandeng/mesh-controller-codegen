@@ -13,6 +13,44 @@
 // after the name ("/clean up the previous chat") falls through to the assistant
 // as ordinary prose instead of misfiring. A slash-shaped input whose name is NOT
 // in the registry ("/rig") is rejected with a "no such slash command" notice.
+// /clean and /clear are ONE command under two names — people type either, and
+// both must wipe in exactly the same way, so they share a single run(). Keeping
+// the behaviour in one function (rather than a copy) is what makes "identical"
+// true by construction instead of by discipline.
+const wipeTranscript = ({ kernel }) => {
+  kernel.sessionStore?.clearTranscript();
+  return { clear: true };
+};
+
+// The one Stop, reachable from two doors: the red button (WS {type:'stop'}) and
+// the /stop command. Both must mean the same thing, so both call THIS — one
+// function is what keeps "identical" true instead of merely intended.
+// Four reachabilities, in the order that matters:
+//   1. discovery — set the boundary flag FIRST, so the lane turn that is about to
+//      be cancelled unwinds into a clean HUMAN_STOPPED refine:end instead of a
+//      crash (the orchestrator checks the flag at the boundary it lands on);
+//   2. generation — kill the headless dsh child; generation is the one job that
+//      does not ride the turn chain, so cancelling a turn cannot reach it;
+//   3. the live model turn — session.cancel tears the request down client-side,
+//      which is the only abort the remote provider can be given;
+//   4. the queue — the user's queued sends are REMOVED, not merely postponed,
+//      so nothing resurrects the job that was just stopped. Lane sends are kept:
+//      they are awaits inside the running discovery, and discovery is stopped by
+//      (1), not by stranding its own await.
+export async function stopEverything({ kernel, agent } = {}) {
+  const refine = kernel?.abortRefine?.() || { ok: false };
+  const generate = kernel?.abortGenerate?.() || { ok: false };
+  const r = (await agent?.stop?.()) || {};
+  const stopped = r.stopped === true;
+  const dropped = r.dropped || 0;
+  const parts = [];
+  if (refine.ok) parts.push('discovery is halting — the joints already checked stay committed');
+  if (generate.ok) parts.push('the controller generation was killed');
+  if (stopped) parts.push('the model turn in flight is being cancelled');
+  if (dropped) parts.push(`${dropped} queued message(s) removed from the queue`);
+  return { refine, generate, stopped, dropped, parts, nothing: parts.length === 0 };
+}
+
 export const COMMANDS = [
   {
     name: 'help',
@@ -28,23 +66,31 @@ export const COMMANDS = [
     desc: 'Wipe this install\'s conversation history in every tab (attached image files stay on disk).',
     example: '/clean',
     takesArgs: false,
-    run: ({ kernel }) => {
-      kernel.sessionStore?.clearTranscript();
-      return { clear: true };
-    },
+    run: wipeTranscript,
+  },
+  {
+    name: 'clear',
+    usage: '/clear',
+    desc: 'Alias of /clean — wipe this install\'s conversation history in every tab (attached image files stay on disk).',
+    example: '/clear',
+    takesArgs: false,
+    run: wipeTranscript,
   },
   {
     name: 'stop',
     usage: '/stop',
-    desc: 'Stop the currently running assistant turn; queued messages still run afterwards.',
+    desc: 'Stop everything at once: halt discovery, kill a running generation, cancel the model turn in flight, and remove queued messages from the queue.',
     example: '/stop',
     takesArgs: false,
     // No turn-start/turn-end frames: /stop fires WHILE a turn is live and
     // must not flip the tabs' busy state out from under it.
     quiet: true,
-    run: async ({ agent }) => ((await agent.stop())
-      ? 'Stop requested — the running turn is being cancelled. Queued messages (if any) still run.'
-      : 'No task is running — nothing to stop.'),
+    run: async ({ kernel, agent }) => {
+      const r = await stopEverything({ kernel, agent });
+      return r.nothing
+        ? 'No task is running — nothing to stop.'
+        : `Stop requested — ${r.parts.join('; ')}.`;
+    },
   },
   {
     // Plan control for the STAGED discovery. Discovery yields at every boundary

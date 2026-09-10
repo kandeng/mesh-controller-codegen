@@ -4,7 +4,7 @@
 // joint's own nodes (rotor spin w/ CCW-CW direction, gimbal pitch/yaw, hinge
 // angle) and publish readouts back to the store. Also renders the active
 // joint's viewer-overlay slot (spin-axis marker at the joint anchor).
-import { nextTick, onMounted, onBeforeUnmount, ref, watch } from 'vue';
+import { computed, nextTick, onMounted, onBeforeUnmount, ref, watch } from 'vue';
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
@@ -14,6 +14,11 @@ import { useSlotRouting } from '../composables/useSlotRouting.js';
 import { registerViewerCapture, registerViewerCaptureAt, registerViewerCaptureMotion, registerViewerModel } from '../composables/useViewerCapture.js';
 import { useRenderFarm } from '../composables/useRenderFarm.js';
 import { useKernelApi } from '../composables/useKernelApi.js';
+// The two right-hand toolbar glyphs, inlined (?raw + v-html) so stroke="currentColor"
+// themes them exactly like the pens beside them — a mask-image would work too (see
+// ChatPanel) but the pens are inline SVG, and one DOM style keeps the row coherent.
+import cleanIcon from '../assets/clean.svg?raw';
+import escapeIcon from '../assets/escape.svg?raw';
 
 const { state } = useProjectStore();
 const { state: themeState } = useTheme();
@@ -129,6 +134,13 @@ function captureFrame() {
 // weight as the colour swatch beside it — unicode glyphs rendered too small next
 // to the solid block, and the rectangle glyph was a flat bar, not the near-square
 // the tool actually draws.
+// Right of the divider sit the two exits: CLEAN wipes every mark (dimmed while there
+// is nothing to wipe), ESCAPE is exactly the highlighted pen's own toggle — lit and
+// enabled only while a pen is armed, dimmed in orbit mode, and clicking it lands in
+// the same state as clicking the lit pen again: nothing armed, nothing lit. The Esc
+// key is the keyboard twin (while a text draft is open the FIRST Esc cancels the
+// draft and only the next puts the pen down). Both glyphs live in app/src/assets,
+// redrawn as stroke paths on the same 20x20 grid / 1.9 stroke / 18px box as the pens.
 const TOOLS = [
   { id: 'arrow', path: 'M3 10 H16 M16 10 L11 5.5 M16 10 L11 14.5', title: 'Arrow — drag from tail to head' },
   { id: 'rect', path: 'M4 4 H16 V16 H4 Z', title: 'Rectangle — drag corner to corner' },
@@ -254,6 +266,29 @@ function toggleTool(id) {
   draft = null;
   textAt.value = null;
   redrawInk();
+}
+
+// The escape glyph's title says what the button DOES in each mode.
+const orbitTitle = computed(() => (tool.value
+  ? 'Put the pen down — same as clicking the highlighted pen — back to orbit, pan and zoom'
+  : 'No pen armed — drag rotates, wheel zooms, right-drag pans'));
+
+function disarm() {
+  tool.value = null;
+  draft = null;
+  textAt.value = null;
+  redrawInk();
+}
+
+// Window-level so it works no matter where focus sits (the canvas, the body, a
+// pen button). Two guards: with no pen armed Esc belongs to whoever else wants
+// it, and a keydown whose TARGET is the text input is the draft-cancelling Esc —
+// that input's own handler runs first at target phase, so without this guard the
+// same keystroke would cancel the draft AND put the pen down.
+function onEsc(ev) {
+  if (ev.key !== 'Escape' || !tool.value) return;
+  if (ev.target === textInput.value) return;
+  disarm();
 }
 
 function clearMarks() {
@@ -1307,6 +1342,7 @@ onMounted(() => {
   tick();
   sizeInk();
   addEventListener('resize', resize);
+  addEventListener('keydown', onEsc);
   registerViewerCapture(captureFrame);
   registerViewerCaptureAt(captureAt);
   registerViewerCaptureMotion(captureMotion);
@@ -1320,6 +1356,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   cancelAnimationFrame(raf);
   removeEventListener('resize', resize);
+  removeEventListener('keydown', onEsc);
   renderer?.domElement?.removeEventListener('pointermove', onHover);
   renderer?.domElement?.removeEventListener('pointerdown', onDown);
   renderer?.domElement?.removeEventListener('click', onClick);
@@ -1350,7 +1387,15 @@ onBeforeUnmount(() => {
         ><path :d="t.path" /></svg>
       </button>
       <input type="color" v-model="inkColor" title="Ink colour" />
-      <button v-if="marks.length" type="button" class="clear" title="Clear every mark" @click="clearMarks">✕</button>
+      <span class="sep" aria-hidden="true"></span>
+      <button
+        type="button" :disabled="!marks.length" title="Clear every mark"
+        @click="clearMarks" v-html="cleanIcon"
+      ></button>
+      <button
+        type="button" :class="{ on: !!tool }" :disabled="!tool" :title="orbitTitle"
+        @click="disarm" v-html="escapeIcon"
+      ></button>
     </div>
     <input
       v-if="textAt" ref="textInput" v-model="textDraft" class="inktext"
@@ -1402,10 +1447,20 @@ onBeforeUnmount(() => {
 .pens button .pic { width: 18px; height: 18px; display: block; }
 .pens button:hover { background: var(--surface-3); }
 .pens button.on { border-color: var(--accent-2); color: var(--text); background: var(--item-active); }
-.pens button.clear { color: var(--muted); font-size: 12px; }
+.pens .sep { width: 1px; height: 16px; background: var(--border-2); margin: 0 2px; }
+.pens button:disabled { opacity: .35; cursor: default; }
+.pens button:disabled:hover { background: transparent; }
+.pens button > svg { width: 18px; height: 18px; display: block; }
 .pens input[type='color'] {
-  width: 26px; height: 24px; padding: 0; border: none; background: transparent; cursor: pointer;
+  width: 26px; height: 24px; padding: 6px 7px; border: none; background: transparent; cursor: pointer;
 }
+/* The visible swatch is the CONTENT box — 12x12, the same footprint as the rectangle
+   pen's square (12 units of the 20 grid at 18px, plus its stroke) — so the solid
+   block no longer outweighs the outline glyphs beside it. The 26x24 box stays the
+   click target; only the painted swatch shrinks. */
+.pens input[type='color']::-webkit-color-swatch-wrapper { padding: 0; }
+.pens input[type='color']::-webkit-color-swatch { border: none; border-radius: 2px; }
+.pens input[type='color']::-moz-color-swatch { border: none; border-radius: 2px; }
 .inktext {
   position: absolute; z-index: 30; min-width: 150px;
   background: var(--overlay-bg); border: 1px dashed currentColor; border-radius: 4px;

@@ -6,6 +6,7 @@
 import { mkdirSync, copyFileSync, readFileSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { createHost } from '../src/core/host.mjs';
+import { CATEGORY } from '../src/core/registry.mjs';
 import { loadConfig } from '../src/config.mjs';
 import { registerAllPlugins } from '../src/plugins/index.mjs';
 import {
@@ -884,6 +885,19 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
       refineAbort = true;
       broadcast({ kind: 'refine:abort', queued: 0 });
       return { ok: true, aborting: true, running: autoRunning };
+    },
+
+    // Kill an in-flight controller generation. Generation is the ONE job that does
+    // not ride the supervisor's turn chain — the bridge spawns its own headless dsh
+    // child — so cancelling a model turn cannot reach it; this is the only handle a
+    // Stop has on it. The bridge SIGTERMs the child and turns that into an explicit
+    // "aborted by user" failure, so POST /api/generate returns promptly instead of
+    // idling until the timeout killer fires.
+    abortGenerate() {
+      const bridge = host.registry.get(CATEGORY.BRIDGE, 'dsh');
+      const r = bridge?.api?.abort?.();
+      if (!r) return { ok: false, code: 'NO_BRIDGE', error: 'the dsh bridge exposes no abort hook' };
+      return r;
     },
 
     // Plan mutation from the queue: a served user request may reshape what is LEFT

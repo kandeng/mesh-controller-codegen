@@ -8,6 +8,13 @@ import { resolve } from 'node:path';
 import { definePlugin, CATEGORY } from '../core/registry.mjs';
 import { EVT } from '../core/events.mjs';
 
+// The generation child, remembered while it runs. Generation is the one job that
+// does NOT ride the supervisor's turn chain — it is a separate headless `dsh`
+// process — so cancelling a model turn cannot reach it and a user Stop would
+// otherwise have to wait out the timeout killer. `reason` distinguishes a human
+// abort from the timeout so the failure the pipeline reports says which it was.
+let active = null; // { child, reason: null | 'user' | 'timeout' }
+
 export const dshBridge = definePlugin({
   category: CATEGORY.BRIDGE,
   name: 'dsh',
@@ -29,7 +36,7 @@ export const dshBridge = definePlugin({
       }
 
       bus.emit(EVT.GENERATE_START, { model: activeModel, bridge: 'dsh' });
-      const code = await new Promise((res) => {
+      const done = await new Promise((res) => {
         const fd = openSync(logFile, 'w');
         const child = spawn(config.paths.dshBin, [
           '--profile', 'headless',
@@ -38,16 +45,37 @@ export const dshBridge = definePlugin({
           task,
         ], { cwd: runDir, env: { ...process.env, BAILIAN_API_KEY: config.apiKey } });
 
+        const run = { child, reason: null };
+        active = run;
         resources.trackChild(child, 'dsh');
         child.stdout.on('data', (d) => writeSync(fd, d));
         child.stderr.on('data', (d) => writeSync(fd, d));
-        const killer = setTimeout(() => child.kill('SIGTERM'), config.dshTimeoutMs);
-        child.on('close', (c) => { clearTimeout(killer); closeSync(fd); res(c); });
+        const killer = setTimeout(() => { run.reason = 'timeout'; child.kill('SIGTERM'); }, config.dshTimeoutMs);
+        child.on('close', (c) => {
+          clearTimeout(killer);
+          closeSync(fd);
+          if (active === run) active = null;
+          res({ code: c, reason: run.reason });
+        });
       });
 
-      bus.emit(EVT.GENERATE_DONE, { exit: code, model: activeModel, log: logFile });
-      diagnostics.note('dsh run complete', { exit: code, model: activeModel });
-      return code;
+      bus.emit(EVT.GENERATE_DONE, { exit: done.code, model: activeModel, log: logFile, aborted: done.reason || null });
+      diagnostics.note('dsh run complete', { exit: done.code, model: activeModel, aborted: done.reason || null });
+      // A human abort is not a generation failure to be repaired by another round:
+      // it is a decision. Throwing here (instead of returning a null exit code)
+      // names it, and the pipeline's emitter guard turns it into one honest
+      // "aborted by user" failure rather than "generation produced no controller".
+      if (done.reason === 'user') throw new Error('generation aborted by the user (SIGTERM to the headless dsh child)');
+      return done.code;
+    },
+
+    // Stop hook for the app's red button / /stop: end the in-flight generation now.
+    // NOT_RUNNING when idle, so a stop with nothing to kill stays a no-op sentence.
+    abort() {
+      if (!active || active.child.exitCode !== null) return { ok: false, code: 'NOT_RUNNING', error: 'no generation is in flight' };
+      active.reason = 'user';
+      try { active.child.kill('SIGTERM'); } catch (e) { return { ok: false, code: 'KILL_FAILED', error: e.message }; }
+      return { ok: true, pid: active.child.pid ?? null };
     },
   },
 });

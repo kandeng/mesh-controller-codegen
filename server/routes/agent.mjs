@@ -16,8 +16,8 @@
 // id->image-part resolution live in ../attachments.mjs, which the kernel also
 // calls when a steered second look folds a screenshot into a vision prompt.
 import fastifyStatic from '@fastify/static';
-import { COMMANDS, parseSlash, findCommand } from '../slash-commands.mjs';
-import { STOP_MSG } from '../dsh-agent.mjs';
+import { COMMANDS, parseSlash, findCommand, stopEverything } from '../slash-commands.mjs';
+import { STOP_MSG, DROPPED_MSG } from '../dsh-agent.mjs';
 import { attachmentsDir, attachmentMeta, readImages, storeImage } from '../attachments.mjs';
 
 export async function agentRoutes(app, kernel, agent) {
@@ -57,14 +57,17 @@ export async function agentRoutes(app, kernel, agent) {
       try { msg = JSON.parse(raw.toString()); } catch { return send({ type: 'error', error: 'invalid json' }); }
       if (msg.type === 'status') return send({ type: 'status', ...agent.status() });
       if (msg.type === 'stop') {
-        // Stop button / programmatic stop: cancel the in-flight turn on the
-        // host; the unwinding send broadcasts the queue-aware turn-end.
-        const stopped = await agent.stop();
-        const note = stopped ? 'task stopped by user' : 'no task is running — nothing to stop';
+        // Stop button / programmatic stop: ONE verb, four reachabilities (see
+        // stopEverything) — halt discovery, kill a running generation, cancel the
+        // model turn in flight on the host, and remove the user's queued sends so
+        // they cannot resurrect what was just stopped. The unwinding send of a
+        // cancelled turn broadcasts the queue-aware turn-end itself.
+        const stopped = await stopEverything({ kernel, agent });
+        const note = stopped.nothing ? 'no task is running — nothing to stop' : `stop: ${stopped.parts.join('; ')}`;
         const sysEntry = kernel.sessionStore?.append({ role: 'system', text: note, ts: Date.now() })
           || { role: 'system', text: note, ts: Date.now() };
         broadcast({ type: 'transcript', msg: sysEntry });
-        if (!stopped) broadcast({ type: 'turn-end', mode: agent.mode, queued: agent.queueDepth() });
+        if (!stopped.stopped) broadcast({ type: 'turn-end', mode: agent.mode, queued: agent.queueDepth() });
         return;
       }
       if (msg.type === 'send') {
@@ -123,7 +126,9 @@ export async function agentRoutes(app, kernel, agent) {
           broadcast({ type: 'notice', text: `queued as #${agent.queueDepth() + 1} — runs after the current turn finishes` });
         }
         try {
-          const r = await agent.send(text, images);
+          // origin:'user' is what makes this send removable from the queue by a
+          // stop; the kernel's lane prompts are not, on purpose.
+          const r = await agent.send(text, images, { origin: 'user' });
           const asstEntry = kernel.sessionStore?.append({ role: 'assistant', text: r.reply, ts: Date.now(), tools: r.tools || undefined })
             || { role: 'assistant', text: r.reply, ts: Date.now(), tools: r.tools || undefined };
           broadcast({ type: 'transcript', msg: asstEntry });
@@ -132,6 +137,14 @@ export async function agentRoutes(app, kernel, agent) {
           if (e.message === STOP_MSG) {
             // Stopped turn: the system note already explains it; just release
             // the tabs' busy state (queued sends, if any, keep it true).
+            broadcast({ type: 'turn-end', mode: agent.mode, queued: agent.queueDepth() });
+            return;
+          }
+          if (e.dropped || e.message === DROPPED_MSG) {
+            // This send was removed from the queue by a stop: no reply and no
+            // error bubble — the persisted stop note already says how many were
+            // dropped. Release the busy state so the composer comes back.
+            broadcast({ type: 'notice', text: 'queued message dropped by stop — it will not be answered' });
             broadcast({ type: 'turn-end', mode: agent.mode, queued: agent.queueDepth() });
             return;
           }

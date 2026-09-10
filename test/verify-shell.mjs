@@ -116,7 +116,22 @@ ok('GET /api/agent/status', agStat.ok === true && ['stub', 'live'].includes(agSt
 
 // 7e) Slash-command registry is exposed for the UI (help + clean ship by default).
 const cmds = await jget('/api/agent/commands');
-ok('GET /api/agent/commands', cmds.ok === true && Array.isArray(cmds.commands) && ['help', 'clean'].every((n) => cmds.commands.some((c) => c.name === n && c.usage && c.desc && c.example)), `n=${cmds.commands?.length}`);
+ok('GET /api/agent/commands', cmds.ok === true && Array.isArray(cmds.commands) && ['help', 'clean', 'clear'].every((n) => cmds.commands.some((c) => c.name === n && c.usage && c.desc && c.example)), `n=${cmds.commands?.length}`);
+
+// 7f) /clear is a TRUE alias of /clean, proved against the registry itself (not
+// over HTTP): same run() function, same effect on a store, same {clear:true}
+// answer — and the same exact-match guard, so "/clear up the desk" is prose.
+const { findCommand, parseSlash } = await import('../server/slash-commands.mjs');
+const cmdClean = findCommand('clean');
+const cmdClear = findCommand('clear');
+ok('/clear ships in the registry', !!cmdClear && cmdClear.takesArgs === false && !!cmdClear.usage && !!cmdClear.desc && !!cmdClear.example);
+ok('/clear and /clean share ONE run()', !!cmdClean && !!cmdClear && cmdClean.run === cmdClear.run);
+let wipes = 0;
+const fakeKernel = { sessionStore: { clearTranscript: () => { wipes += 1; } } };
+const ranClean = cmdClean.run({ kernel: fakeKernel });
+const ranClear = cmdClear.run({ kernel: fakeKernel });
+ok('both wipe the store once and answer {clear:true}', wipes === 2 && ranClean?.clear === true && ranClear?.clear === true, `wipes=${wipes}`);
+ok('"/clear" fires, "/clear up the desk" stays prose', parseSlash('/clear')?.name === 'clear' && !parseSlash('/clear')?.args && parseSlash('/clear up the desk')?.args === 'up the desk');
 
 // 8) Live events WebSocket streams a hello + kernel events.
 const wsProof = await new Promise((resolve) => {

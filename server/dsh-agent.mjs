@@ -30,6 +30,7 @@ import { defineAgentContract } from './agent-contract.mjs';
 import { writeAgentWorkspace } from './agent-workspace.mjs';
 
 export const STOP_MSG = 'agent turn stopped by user';
+export const DROPPED_MSG = 'queued message dropped by user stop';
 const STUB_NOTE =
   'The live DSH assistant is unavailable (web host did not start), so this is a stub reply. ' +
   'The app shell remains fully functional: load a mesh, pick a joint, drive its knobs, and validate/generate from the toolbar.';
@@ -54,6 +55,13 @@ export function createDshAgent(kernel) {
   let chain = Promise.resolve();
   let running = false; // a turn body is executing right now
   let waiting = 0;     // sends chained behind the running turn
+  // The sends that have been chained but have NOT started yet, oldest first. A
+  // promise chain cannot be spliced, so a queued send is removed from the queue
+  // by MARKING it: the body sees the mark the instant the chain reaches it and
+  // unwinds without prompting the model. This is the app-level queue — the DSH
+  // host's own inbox stays empty because we only ever prompt once the previous
+  // turn has ended (turnGate), so draining here drains everything a user typed.
+  const queued = [];   // { origin: 'user' | 'lane', dropped }
 
   const log = (...a) => kernel.diagnostics?.note?.('dsh-agent', { msg: a.join(' ') });
 
@@ -350,6 +358,16 @@ export function createDshAgent(kernel) {
   }
 
   // ----------------------------------------------------------------- api ----
+  // Remove every QUEUED user send from the queue. Lane sends are deliberately
+  // left alone: a lane send is an `await` INSIDE the running discovery, so
+  // dropping it would strand that await and freeze the orchestrator — discovery
+  // is halted through refineAbort instead (see kernel-host.abortRefine).
+  function dropQueuedUsers() {
+    let n = 0;
+    for (const it of queued) if (it.origin === 'user' && !it.dropped) { it.dropped = true; n += 1; }
+    return n;
+  }
+
   const agent = {
     get mode() { return mode; },
     contract,
@@ -371,11 +389,22 @@ export function createDshAgent(kernel) {
     },
 
     // images: [{ mediaType, dataBase64, name? }]
-    send(text, images = []) {
+    // opts.origin: 'user' for a send typed in the composer; everything else (the
+    // kernel's vision/lane prompts) counts as a 'lane' send. The distinction is
+    // what makes a stop safe: only user sends may be dropped from the queue.
+    send(text, images = [], opts = {}) {
+      const item = { origin: opts?.origin === 'user' ? 'user' : 'lane', dropped: false };
       const behind = running;
+      queued.push(item);
       if (behind) waiting += 1;
       const run = chain.then(async () => {
+        const at = queued.indexOf(item);
+        if (at >= 0) queued.splice(at, 1);
         if (behind) waiting -= 1;
+        // Removed from the queue by a stop: never prompt the model, and say so
+        // with a marker the WS route can tell apart from a real failure (it
+        // owes the tabs a released busy state, not an error bubble).
+        if (item.dropped) { const e = new Error(DROPPED_MSG); e.dropped = true; throw e; }
         running = true;
         try {
         if (disposed) throw new Error('agent disposed');
@@ -410,18 +439,22 @@ export function createDshAgent(kernel) {
 
     // User-initiated stop: gracefully cancel the in-flight turn on the host
     // (same RPC the timeout path uses) and reject the pending turn so this
-    // send unwinds; chained (queued) sends still run afterwards. The cancel
-    // is AWAITED before rejecting: otherwise the host can apply it to the
+    // send unwinds — AND remove the queued user sends, because a stop that left
+    // them chained would simply resurrect the job the user just killed. The
+    // cancel is AWAITED before rejecting: otherwise the host can apply it to the
     // next queued prompt and kill that turn too.
+    // Returns { stopped, dropped }: whether a turn was actually cancelled, and
+    // how many queued user sends were removed.
     async stop() {
-      if (!pendingTurn) return false;
+      const dropped = dropQueuedUsers();
+      if (!pendingTurn) return { stopped: false, dropped };
       clearTimeout(pendingTurn.timer);
       const p = pendingTurn;
       pendingTurn = null;
       try { await rpc('session.cancel', { sessionId }, 5_000); } catch (e) { log('session.cancel failed:', e.message); }
       closeGate(); // this turn's late turn/end must not hit the next prompt
       p.reject(new Error(STOP_MSG));
-      return true;
+      return { stopped: true, dropped };
     },
     isBusy() { return running || waiting > 0; },
     queueDepth() { return waiting; },
