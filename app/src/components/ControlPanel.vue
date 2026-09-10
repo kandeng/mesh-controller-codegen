@@ -28,52 +28,6 @@ const { selectJoint } = useSlotRouting();
 // is the one number that says "there is reading to do here".
 const pending = computed(() => state.joints.filter((j) => j.status === 'needs-verdict').length);
 
-// Step 2 readout — the vision lane's category GUESS set against what was actually
-// grounded. Both numbers are always shown side by side, because a prior on its own
-// reads like a finding, and the whole point of the lane is that a guess is never a
-// joint: it aims the camera and it falsifies a count, and nothing else. Amber
-// while anything expected is still missing, green once every expectation is
-// grounded. Not shown at all when the model declined to name a category or was not
-// confident enough to aim with — which leaves the panel saying exactly what it said
-// before this lane existed.
-const expectReadout = computed(() => {
-  const exp = state.expectation;
-  if (!exp?.usable || !(exp.instances || []).length) return null;
-  const gaps = new Map((Array.isArray(state.gaps) ? state.gaps : []).map((g) => [g.type, g]));
-  const perType = new Map();
-  for (const ins of exp.instances) {
-    if (!ins?.type) continue;
-    const g = gaps.get(ins.type);
-    const cur = perType.get(ins.type) || { type: ins.type, expected: 0, found: 0 };
-    cur.expected += Number(ins.count) || 0;
-    cur.found = g ? (g.found || 0) : cur.found;
-    perType.set(ins.type, cur);
-  }
-  const parts = [...perType.values()];
-  if (!parts.length) return null;
-  const missing = parts.reduce((n, p) => n + Math.max(0, p.expected - p.found), 0);
-  // Grounded types the guess did NOT expect are the most interesting line here: it
-  // is where an unknown machine contradicts its own category (a tank's tracks, an
-  // arm's extra hinge), and it is counted from the served joint list because the
-  // gap table only covers expected types.
-  const wanted = new Set(parts.map((p) => p.type));
-  const unplanned = {};
-  for (const j of state.joints || []) {
-    if (!j?.type || j.status === 'rejected' || wanted.has(j.type)) continue;
-    unplanned[j.type] = (unplanned[j.type] || 0) + 1;
-  }
-  const extraKeys = Object.keys(unplanned);
-  return {
-    category: exp.category || 'an unnamed machine',
-    text: parts.map((p) => `${p.type}: expected ${p.expected}, grounded ${p.found}`).join(' · '),
-    extra: extraKeys.length
-      ? `also grounded, which the guess did not expect: ${extraKeys.map((k) => `${unplanned[k]} ${k}`).join(', ')}`
-      : '',
-    missing,
-    ok: missing === 0,
-  };
-});
-
 // Step 1 — mesh
 const glbPath = ref('samples/drone_dji_inspire3.glb');
 const glbFull = ref('');
@@ -192,11 +146,6 @@ async function generate() {
         appear as dimmed candidates first and become clickable one by one as each
         one's checks pass.
       </p>
-      <p v-if="expectReadout" class="expect" :class="expectReadout.ok ? 'good' : 'warn'"
-         :title="'A category guess, checked against what was actually grounded. The guess aims the camera and checks a count; it can never itself become a joint.'">
-        <span class="tick">{{ expectReadout.ok ? '✓' : '⚠' }}</span>
-        <span class="exbody">read as <b>{{ expectReadout.category }}</b> — {{ expectReadout.text }}<template v-if="expectReadout.extra"> · {{ expectReadout.extra }}</template></span>
-      </p>
       <JointList />
     </section>
 
@@ -286,15 +235,6 @@ button.gen { border-color: var(--gen-border); color: var(--gen-text); }
 .pathline { display: flex; gap: 6px; align-items: baseline; margin: 2px 0 0; }
 .tick { color: var(--good); flex: none; }
 .path { font-family: ui-monospace, monospace; font-size: 11px; color: var(--value); word-break: break-all; }
-
-/* the category prior vs. what was grounded — a guess on trial, so it is coloured
-   by whether the guess survived, not by whether it was confident */
-.expect { display: flex; gap: 6px; align-items: baseline; margin: 4px 0 0; font-size: 11px; line-height: 1.45; }
-.expect .tick { color: inherit; }
-.expect .exbody { color: var(--muted); }
-.expect .exbody b { color: var(--text); font-weight: 600; }
-.expect.good { color: var(--good); }
-.expect.warn { color: var(--warn); }
 
 /* static (non-draggable) horizontal divider between steps */
 .rule { height: 0; border: none; border-top: 1px solid var(--border); margin: 2px 0; }
