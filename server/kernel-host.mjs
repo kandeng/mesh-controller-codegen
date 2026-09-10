@@ -12,7 +12,7 @@ import {
   discoverJoints, validateController, generateController, repairWithNotes,
   loadThree, toViewerUrl, refreshView, finalizeRun,
 } from '../src/pipeline.mjs';
-import { reopenFromRigidity, runDiscoveryLoop, runL2Round, runProducerLanes, runVisionCampaign, runMotionRound, applyJointVerdict, amortizeVerdict, MAX_EXTRA_VIEWS, MAX_VISION_ROUNDS, MOTION_ANGLES } from '../src/plugins/discovery/loop.mjs';
+import { reopenFromRigidity, runDiscoveryLoop, runL2Round, runVisionCampaign, runMotionRound, applyJointVerdict, amortizeVerdict, reconcileLanes, admitCandidates, refineJoint, MAX_EXTRA_VIEWS, MAX_VISION_ROUNDS, MOTION_ANGLES } from '../src/plugins/discovery/loop.mjs';
 import { saveManifest, saveRevision, listRevisions, loadRevision, latestRevision, diffManifests } from '../src/plugins/discovery/manifest.mjs';
 import { rigidityGate } from '../src/plugins/discovery/tests.mjs';
 import { focusFromManifest, modelRadius, modelTarget, planViews, VIEWPORT } from '../src/plugins/discovery/views.mjs';
@@ -23,6 +23,7 @@ import {
 } from '../src/plugins/discovery/observations.mjs';
 import { createVisionProvider } from '../src/plugins/discovery/vision-provider.mjs';
 import { createSessionStore } from './session-store.mjs';
+import { attachmentsDir, readImages } from './attachments.mjs';
 
 const TS = () => new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
 
@@ -99,14 +100,16 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
   // this before its first await, and every long-running op compares against the
   // value it started with.
   let loadGen = 0;
-  // Human-in-the-loop intervention. A refinement runs autonomously, but a human
-  // watching the frames arrive may want to STOP it or STEER it ("ignore the landing
-  // gear", "the gimbal is the interesting part"). Both ride ONE queue the loop
-  // drains at a phase boundary — the same boundaries the reload abort already uses —
-  // so an intervention never interrupts a model turn mid-flight or leaves the
-  // manifest half-written. Reset at the start of every autoRefine.
+  // Human-in-the-loop, staged. The refinement yields at every boundary (after
+  // stage 1 and after each joint) so the assistant can serve what queued up; a
+  // human STOP rides the same seam and takes effect at the NEXT boundary. Unlike
+  // the old one-shot stop it discards nothing: joints refined so far were saved
+  // and revised at their own boundary, so "stop" means "no further joints".
   let refineAbort = false;   // a human asked the in-flight refinement to stop
-  let refineNotes = [];      // [{ text, ts }] steering notes, folded into the next ask
+  // How long a boundary waits for the assistant to finish serving the queue. A
+  // chatty user must not park discovery forever; the FIFO chain keeps ordering
+  // safe if the cap hits mid-turn (the next lane prompt simply chains behind).
+  const YIELD_MS = 120_000;
   // Server-originated WS push. The events socket decorates the Fastify app with
   // broadcast(), but the kernel must not reach into the app, so index.mjs hands
   // the decorated function down the same way it hands down the render farm.
@@ -146,8 +149,8 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
       // deterministic rest-pose battery, derive statuses. On any failure the raw
       // discovery output is served as before (strangler-fig fallback).
       try {
-        current.manifest = runDiscoveryLoop(current.glb, current.joints, { runDir }).manifest;
-        commitRevision('discovery loop (project load)');
+        current.manifest = runDiscoveryLoop(current.glb, current.joints, { runDir, score: false }).manifest;
+        commitRevision('discovery loop (project load) — candidates, battery deferred to stage 2');
       } catch (e) {
         host.diagnostics.note('discovery loop failed — serving raw joints', { error: e.message });
         current.manifest = null;
@@ -385,7 +388,13 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
         // Human steering notes, read at the ask boundary and folded into the prompt.
         humanNotes: typeof opts.humanNotes === 'function' ? opts.humanNotes : null,
 
+        // The pictures behind those notes. Attached AFTER the rendered frames and
+        // described to the model as not-frames: a proposal must still cite a frame
+        // we drew, because that is the only frame grounding has a camera pose for.
+        extraImages: Array.isArray(opts.extraImages) && opts.extraImages.length ? opts.extraImages : null,
+
         independent,
+        stopAfter: opts.stopAfter || null,
 
         viewport,
         maxFrames: whole(opts.maxFrames, 1, MAX_FRAMES_PER_ROUND),
@@ -494,35 +503,39 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
       };
     },
 
-    // Chained refinement: geometry discovers, then TWO producers look — the JSON
-    // semantic lane and the vision lane — CONCURRENTLY, and neither reads the
-    // other's conclusions. Called fire-and-forget right after a successful load.
-    // It NEVER fails the load: every unmet precondition becomes a skip broadcast
-    // for the lane it belongs to, and the geometry result stands.
+    // STAGED discovery, fire-and-forget right after a successful load. It NEVER
+    // fails the load: every unmet precondition becomes a skip broadcast for the
+    // stage it belongs to, and the geometry candidates stand.
     //
-    // Why one method rather than two fire-and-forget calls: there is exactly ONE
-    // writer of the manifest, ONE save and ONE revision. Two producers merging
-    // concurrently would interleave the physics battery, the node-set dedupe and
-    // the id allocation — all three stateful across a whole batch — and would
-    // leave two revisions describing one change of belief. runProducerLanes hands
-    // each lane a CLONE and applies the deltas serially through mergeProposals;
-    // this method owns the commit that follows.
+    //   stage 1  the geometry pass (already admitted at load, unscored) unions
+    //            with ONE proposals-only vision look through the overlap merge;
+    //            every record lands as a `candidate` — listed, dimmed, not
+    //            clickable — and the list goes live at once.
+    //   boundary the assistant serves whatever queued up while stage 1 looked.
+    //   stage 2  one joint at a time: the physics battery plus the vision lane's
+    //            grounding over the stage-1 frames; each settled row becomes
+    //            clickable at its own save+revision+beat, then the queue is
+    //            served again and the LIVE list is re-read — so a request that
+    //            was just answered can drop or postpone what is left to do.
+    //
+    // There is exactly ONE writer of the manifest and one commit per boundary:
+    // two producers merging concurrently would interleave the battery, the
+    // node-set dedupe and the id allocation, and would leave two revisions
+    // describing one change of belief.
     //
     // The agent boots LAZILY (mode flips stub->live inside its first start()), so
-    // gating on provider.available() up front would always skip on a cold server.
-    // Both lanes therefore await the SAME single boot. The bounded RENDERER wait
-    // gates the VISION lane only, and runs concurrently with that boot: with no
-    // browser tab connected the text lane still runs and still reports, which is
-    // the difference between "vision is unavailable" and "refinement is
-    // unavailable". A boot failure (missing binary, bad patch, quota at handshake)
-    // is a skip carrying the true reason, never a silent no-op.
+    // gating on provider.available() up front would always skip on a cold server;
+    // stage 1 therefore awaits the SAME bounded boot and renderer wait the
+    // one-shot lane had. A boot failure is a skip carrying the true reason,
+    // never a silent no-op — and stage 2 still scores the geometry candidates,
+    // so a server with no model at all ends with a clickable, honest list.
     async autoRefine(opts = {}) {
       if (autoRunning) return { ok: false, code: 'ALREADY_RUNNING' };
       autoRunning = true;
       const gen = loadGen;
-      // A fresh refinement starts with a clean intervention slate: a stop or a note
-      // left over from a PREVIOUS run must never leak into this one.
-      refineAbort = false; refineNotes = [];
+      // A fresh refinement starts with a clean slate: a stop left over from a
+      // PREVIOUS run must never leak into this one.
+      refineAbort = false;
       const skip = (code, error) => {
         broadcast({ kind: 'refine:skip', code, error });
         return { ok: false, code, error };
@@ -553,7 +566,6 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
           return !!farm.status()?.ready;
         })();
 
-        const wantText = opts.text !== false;
         const wantVision = opts.vision !== false;
         const emit = (kind, payload) => { broadcast({ kind, ...payload }); };
         // Name the remote model on the opening beat so the client's live status
@@ -562,137 +574,297 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
         // vision_model override; when it is empty, image turns use `model`.
         emit('refine:start', {
           auto: true,
-          lanes: { text: wantText, vision: wantVision },
+          lanes: { text: true, vision: wantVision },
           model: host.config.model || null,
           visionModel: host.config.visionModel || host.config.model || null,
+          staged: true,
         });
 
-        const res = await runProducerLanes(current.glb, current.joints, current.manifest, {
-          emit,
-          text: wantText ? async (manifest, joints) => {
-            const bootErr = await boot;
-            if (gen !== loadGen) {
-              return { ok: false, code: 'PROJECT_RELOADED', reason: 'the mesh was reloaded while the text lane was starting up', added: 0 };
-            }
-            if (!agent || agent.mode !== 'live') {
-              const error = bootErr?.message || 'the assistant host is not live, so there is no model to ask';
-              emit('text:skip', { code: 'NO_TEXT_AGENT', error });
-              return { ok: false, code: 'NO_TEXT_AGENT', reason: error, added: 0 };
-            }
-            emit('text:start', {});
-            const r = await runL2Round(current.glb, joints, manifest, async (p) => (await agent.send(p)).reply, {
-              emit,
-              // The human's notes are external guidance, not one lane's conclusions,
-              // so sharing the SAME queue with the vision lane does not break the two
-              // producers' independence — it is an input to both, like the mesh itself.
-              humanNotes: () => refineNotes.map((n) => n.text),
-              abort: () => gen !== loadGen || refineAbort,
-            });
-            emit('text:end', { ok: !r.reason || (r.added ?? 0) > 0, added: r.added ?? 0, reason: r.reason || null });
-            return { ...r, ok: true };
-          } : null,
-          vision: wantVision ? async (manifest, joints) => {
-            const [bootErr, ready] = await Promise.all([boot, renderer]);
-            if (gen !== loadGen) {
-              return { ok: false, code: 'PROJECT_RELOADED', reason: 'the mesh was reloaded while the vision lane was starting up', added: 0 };
-            }
-            if (!ready) {
-              const error = !farm
-                ? 'the render farm is not available on this server'
-                : 'no browser renderer with a loaded model connected in time — open the viewer tab and load the mesh';
-              emit('vision:skip', { code: 'NO_RENDERER', error });
-              return { ok: false, code: 'NO_RENDERER', reason: error, added: 0 };
-            }
-            const provider = createVisionProvider(host.config, agent);
-            if (!provider.available()) {
-              const error = bootErr?.message || provider.reason() || 'no live multimodal model is available';
-              emit('vision:skip', { code: 'NO_VISION_AGENT', error });
-              return { ok: false, code: 'NO_VISION_AGENT', reason: error, added: 0 };
-            }
-            emit('vision:start', { auto: true, independent: true });
-            // LANE MODE: writes into the clone it was handed and defers the save,
-            // because the ONE commit belongs to this method. INDEPENDENT: the
-            // prompt withholds the text lane's conclusions and the gate stops
-            // treating them as a claim on the parts, so agreement between the two
-            // becomes corroboration at reconciliation instead of an echo.
-            return kernel.visionRefine({
-              rounds: 1, ...opts, lane: { manifest, joints }, independent: true,
-              // Scoped to THIS refinement: the loop reads these at its phase
-              // boundaries, so a human stop or note takes effect without ever
-              // interrupting a model turn mid-flight.
-              humanAbort: () => refineAbort,
-              humanNotes: () => refineNotes.map((n) => n.text),
-            });
-          } : null,
-        });
-
-        // Both lanes merged into CLONES; runProducerLanes applied their deltas to
-        // the real arrays serially. If a load swapped current.* underneath that,
-        // those writes landed in orphaned arrays and saving now would persist the
-        // NEW project's manifest while this response claims the OLD run's
-        // additions — a success message about nothing.
-        if (gen !== loadGen) {
+        // A BOUNDARY YIELD. The assistant and the lanes share ONE FIFO turn chain,
+        // so a queued user turn always completes before the next lane prompt even
+        // without this wait; what the wait buys is a moment where the assistant
+        // has the floor to ITSELF — long enough to answer what queued up, and to
+        // let a served request reshape the plan — before the next stage reads the
+        // plan again. Bounded, because a chatty user must not park discovery
+        // forever, and ordering stays safe if the cap hits mid-turn.
+        const yieldToQueue = async () => {
+          if (!agent?.idle) return;
+          await Promise.race([agent.idle(), new Promise((r) => setTimeout(r, YIELD_MS))]);
+        };
+        const reloaded = () => gen !== loadGen;
+        const endReloaded = () => {
           emit('refine:end', {
-            ok: false, code: 'PROJECT_RELOADED', added: 0, agreed: 0,
+            ok: false, code: 'PROJECT_RELOADED', added: 0, agreed: 0, staged: true,
             text: { added: 0, ok: false }, vision: { added: 0, ok: false },
           });
           return {
-            ...res, ok: false, code: 'PROJECT_RELOADED',
+            ok: false, code: 'PROJECT_RELOADED',
             error: 'the mesh was reloaded while the producers were running; nothing was merged',
           };
-        }
+        };
 
-        // A human STOP discards the whole refinement: both lanes' deltas are thrown
-        // away and nothing is committed, because "stop" means "I do not want this
-        // pass's conclusions", not "keep whichever lane finished first". Mirrors the
-        // reload refusal above — same shape, same nothing-merged guarantee.
+        // ---- STAGE 1: candidates ----------------------------------------------
+        // The geometry pass admitted its records at load with the battery deferred
+        // (score:false), so current.manifest already holds unscored candidates —
+        // the JSON side's rough answer. The vision lane now looks ONCE and stops
+        // at its proposals; the two sets union through the overlap merge so a part
+        // both producers found is ONE candidate, and everything lands unscored.
+        // The list goes live immediately, dimmed and not clickable.
+        //
+        // The transcript WATERMARK for a steered second look, taken before stage 1
+        // asks anything: "what did the human say while the first look was in
+        // flight" is then exactly the user entries whose seq is above this one —
+        // no clock, no guessing, and a message sent BEFORE the run is not mistaken
+        // for steering of it.
+        const guidanceMark = sessionStore.seq();
+        let vision = null;
+        if (wantVision) {
+          // Give the assistant host and a browser renderer the same grace period
+          // the one-shot lane had: right after a load the tab may not have
+          // announced itself to the farm yet, and a provider check NOW would
+          // refuse a lane that would have been live two seconds later.
+          await Promise.all([boot, renderer]);
+          if (reloaded()) return endReloaded();
+          const cloneM = current.manifest.map((r) => ({
+            ...r, nodes: [...(r.nodes || [])], evidence: [...(r.evidence || [])],
+            tests: [...(r.tests || [])], history: [...(r.history || [])],
+          }));
+          const cloneJ = current.joints.map((j) => ({ ...j, nodes: [...(j.nodes || [])] }));
+          const v = await kernel.visionRefine({
+            rounds: 1,
+            stopAfter: 'proposals',
+            lane: { manifest: cloneM, joints: cloneJ },
+            independent: true,
+            humanAbort: () => refineAbort,
+          });
+          if (v?.ok && v.stopped === 'proposals') {
+            vision = v;
+          } else {
+            emit('vision:skip', {
+              code: v?.code || 'VISION_FAILED',
+              error: v?.error || v?.reason || 'the vision lane could not look',
+            });
+          }
+        }
+        if (reloaded()) return endReloaded();
+        // A stop before anything was committed commits nothing — there is nothing
+        // to keep yet, so the old "discard everything" reading still holds here.
         if (refineAbort) {
           emit('refine:end', {
-            ok: false, code: 'HUMAN_STOPPED', added: 0, agreed: 0, stopped: true,
+            ok: false, code: 'HUMAN_STOPPED', added: 0, agreed: 0, stopped: true, staged: true,
             text: { added: 0, ok: false }, vision: { added: 0, ok: false },
           });
-          return {
-            ...res, ok: false, code: 'HUMAN_STOPPED', stopped: true,
-            error: 'a human stopped the refinement; nothing was merged',
-          };
+          return { ok: false, code: 'HUMAN_STOPPED', stopped: true, error: 'a human stopped the refinement before stage 1 settled; nothing was merged' };
         }
 
-        const text = res.lanes?.text || null;
-        const vision = res.lanes?.vision || null;
-        // ONE save and ONE revision after BOTH lanes: the change of belief is a
-        // single event, so the history must read as one entry naming both
-        // contributions and how much they agreed.
-        if (!res.manifestUntouched) {
-          saveManifest(runDir, current.manifest);
-          commitRevision(`parallel producers: text +${text?.merged ?? 0}, vision +${vision?.merged ?? 0}, agreed ${res.agreed.length}`);
-          sessionStore.setWork({ joints: current.joints.map((j) => ({ id: j.id, label: j.label, type: j.type, nodeCount: (j.nodes || []).length })) });
-        }
-        host.diagnostics.note('parallel refine', {
-          ok: res.ok, added: res.added, agreed: res.agreed.length,
-          text: text ? { ok: text.ok, added: text.added, merged: text.merged, code: text.code } : null,
-          vision: vision ? { ok: vision.ok, added: vision.added, merged: vision.merged, code: vision.code, frames: vision.frames } : null,
-          category: vision?.expectation?.category || null,
-          warnings: res.warnings?.length || 0,
-        });
-        emit('refine:end', {
-          ok: !!res.ok, added: res.added, agreed: res.agreed.length,
-          text: { added: text?.merged ?? 0, ok: text?.ok ?? false, code: text?.code || null },
-          vision: { added: vision?.merged ?? 0, ok: vision?.ok ?? false, code: vision?.code || null },
+        const reconciled = reconcileLanes(
+          current.manifest,
+          { records: vision?.proposals || [], confirms: vision?.confirmList || [] },
+          { origin: 'L2-vision', tag: 'cross-producer:L2-vision' },
+        );
+        const admitted = admitCandidates(current.joints, current.manifest, reconciled);
+        // The vision grounding per candidate, zipped by node set: a vision record's
+        // nodes ARE the names grounding resolved, so the set is the identity.
+        // MUTABLE on purpose: a steered second look grounds its own proposals
+        // against its own frames, and those entries have to be findable through the
+        // same zip or the candidates it adds would reach the battery with no vision
+        // evidence behind them at all.
+        const visionGrounded = [...(vision?.grounded || [])];
+        const groundedFor = (rec) => {
+          const key = [...(rec.nodes || [])].sort().join('|');
+          const e = visionGrounded.find((x) => [...(x.names || [])].sort().join('|') === key);
+          return e ? { ...e.grounding, frameId: e.frameId, uncertainties: e.uncertainties } : null;
+        };
+        saveManifest(runDir, current.manifest);
+        commitRevision(`stage 1: ${current.manifest.length} candidate(s) — vision +${admitted.added}, agreed ${reconciled.agreed.length}`);
+        sessionStore.setWork({ joints: current.joints.map((j) => ({ id: j.id, label: j.label, type: j.type, nodeCount: (j.nodes || []).length })) });
+        emit('discover:candidates', {
+          count: current.manifest.length,
+          added: admitted.added,
+          agreed: reconciled.agreed.length,
           category: vision?.expectation?.category || null,
           gaps: vision?.gaps || null,
         });
-        // The category prior and its outcome ride on the response body: it is the
-        // vision lane's internal business (the text lane never sees it, which is
-        // what keeps the two independent), but a caller pressing the button
-        // deserves to know what the machine was guessed to be and how many of the
-        // expected parts were actually grounded.
+
+        // ---- STEERED SECOND LOOK — only when the human said something ----------
+        // Stage 1 is ONE composed turn: a message that arrives while it is running
+        // cannot edit a prompt that was already sent, and stage 2 has no model turn
+        // at all — it is the deterministic battery over frames that already exist.
+        // Left alone, an instruction sent mid-detection is answered BESIDE the run
+        // and never reaches it. This is the one boundary where folding it in is
+        // both cheap and honest: the candidate list is committed, but no joint has
+        // been measured yet, so a second proposals-only look can only ADD to the
+        // list — nothing already promised to the human is invalidated, and nothing
+        // already measured has to be re-measured.
+        //
+        // It runs BEFORE `discover:stage 2` on purpose. That beat is what releases
+        // the camera lock, and this look renders frames; and since the assistant and
+        // the lanes share ONE FIFO turn chain, the human's queued turn is served
+        // first and this prompt chains behind it — the model reads the instruction
+        // as guidance while the human is reading its answer.
+        //
+        // It costs one extra model turn, and only when there is something to fold:
+        // an idle run pays nothing and behaves exactly as it did before.
+        const guidance = sessionStore.guidanceSince(guidanceMark);
+        // What the extra look bought, kept for the closing beat: refine:end reports
+        // the whole job, and a candidate that only exists because a human asked for
+        // it should be countable as such.
+        let steered = null;
+        if (guidance.length && wantVision && !refineAbort && !reloaded()) {
+          const notes = guidance.map((x) => x.text);
+          // The screenshots behind those words, read from the SAME stable path the
+          // chat read them from, so the model is shown the picture the human sees.
+          const extraImages = readImages(
+            attachmentsDir(host.repoRoot),
+            guidance.flatMap((x) => x.attachments),
+          );
+          emit('discover:look', { look: 2, steered: true, notes: notes.length, images: extraImages.length });
+          const cloneM2 = current.manifest.map((r) => ({
+            ...r, nodes: [...(r.nodes || [])], evidence: [...(r.evidence || [])],
+            tests: [...(r.tests || [])], history: [...(r.history || [])],
+          }));
+          const cloneJ2 = current.joints.map((j) => ({ ...j, nodes: [...(j.nodes || [])] }));
+          const v2 = await kernel.visionRefine({
+            rounds: 1,
+            stopAfter: 'proposals',
+            lane: { manifest: cloneM2, joints: cloneJ2 },
+            independent: true,
+            humanAbort: () => refineAbort,
+            humanNotes: () => notes,
+            extraImages,
+          });
+          if (v2?.ok && v2.stopped === 'proposals') {
+            const rec2 = reconcileLanes(
+              current.manifest,
+              { records: v2.proposals || [], confirms: v2.confirmList || [] },
+              // A distinct tag: the audit trail should be able to say which
+              // candidates arrived because a human asked for a second look.
+              { origin: 'L2-vision', tag: 'steered:L2-vision' },
+            );
+            // The tag reconcileLanes was given only lands on CONFIRMS — a record the
+            // lane newly minted keeps the evidence the gate stamped on it — so the
+            // steered origin is pushed here, before admission. Without it the audit
+            // trail cannot tell a candidate that exists because a human asked for a
+            // second look from one the first look found on its own.
+            for (const rec of rec2.records) {
+              rec.evidence = Array.isArray(rec.evidence) ? rec.evidence : [];
+              if (!rec.evidence.includes('steered:L2-vision')) rec.evidence.push('steered:L2-vision');
+            }
+            const adm2 = admitCandidates(current.joints, current.manifest, rec2);
+            visionGrounded.push(...(v2.grounded || []));
+            saveManifest(runDir, current.manifest);
+            commitRevision(`stage 1b: steered second look — ${current.manifest.length} candidate(s), vision +${adm2.added}, agreed ${rec2.agreed.length}`);
+            sessionStore.setWork({ joints: current.joints.map((j) => ({ id: j.id, label: j.label, type: j.type, nodeCount: (j.nodes || []).length })) });
+            emit('discover:candidates', {
+              count: current.manifest.length,
+              added: adm2.added,
+              agreed: rec2.agreed.length,
+              look: 2,
+              steered: true,
+              notes: notes.length,
+              images: extraImages.length,
+              category: v2?.expectation?.category || vision?.expectation?.category || null,
+              gaps: v2?.gaps || null,
+            });
+            host.diagnostics.note('steered second look', {
+              notes: notes.length, images: extraImages.length,
+              added: adm2.added, agreed: rec2.agreed.length,
+            });
+            steered = { notes: notes.length, images: extraImages.length, added: adm2.added, agreed: rec2.agreed.length };
+          } else {
+            // The first look's list stands. A second look that could not run is a
+            // missed opportunity, not a failed discovery — the human is told, and
+            // stage 2 proceeds over the candidates that do exist.
+            emit('vision:skip', {
+              look: 2,
+              code: v2?.code || 'VISION_FAILED',
+              error: v2?.error || v2?.reason || 'the steered second look could not run',
+            });
+          }
+        }
+        if (reloaded()) return endReloaded();
+        if (refineAbort) {
+          // A stop landing HERE is not the pre-commit stop above: the candidate
+          // list is real, revised and already on screen, so it stays. What is
+          // abandoned is the measuring, which is exactly what "stop" means now.
+          emit('refine:end', {
+            ok: false, code: 'HUMAN_STOPPED', stopped: true, staged: true,
+            added: current.manifest.length, agreed: reconciled.agreed.length,
+            text: { added: 0, ok: false }, vision: { added: 0, ok: false },
+          });
+          return {
+            ok: false, code: 'HUMAN_STOPPED', stopped: true,
+            error: 'a human stopped the refinement after the candidate list landed; no joint was measured',
+          };
+        }
+
+        // ---- STAGE 2: per-joint refinement at queue boundaries -----------------
+        // One joint at a time: battery + the vision lane's grounding over the
+        // stage-1 frames, then a save, a revision and a beat that makes exactly
+        // that row clickable — then the queue is served before the next joint.
+        // The list is re-read every boundary, so a served request (or a slash
+        // command it triggered) can drop or postpone what is left of the plan.
+        emit('discover:stage', { stage: 2 });
+        await yieldToQueue();
+        const refined = [];
+        while (!refineAbort && !reloaded()) {
+          const next = current.manifest.find((r) => r.status === 'candidate');
+          if (!next) break;
+          refineJoint(current.glb, current.joints, next, { grounded: groundedFor(next) });
+          refined.push(next.id);
+          saveManifest(runDir, current.manifest);
+          commitRevision(`stage 2: ${next.id} refined to ${next.status}`);
+          broadcast({
+            kind: 'joint:refined',
+            id: next.id, status: next.status, confidence: next.confidence,
+            remaining: current.manifest.filter((r) => r.status === 'candidate').length,
+          });
+          await yieldToQueue();
+        }
+        if (reloaded()) return endReloaded();
+
+        const remaining = current.manifest.filter((r) => r.status === 'candidate').length;
+        sessionStore.setWork({ joints: current.joints.map((j) => ({ id: j.id, label: j.label, type: j.type, nodeCount: (j.nodes || []).length })) });
+        host.diagnostics.note('staged refine', {
+          candidates: current.manifest.length, refined: refined.length, remaining,
+          agreed: reconciled.agreed.length, stopped: refineAbort,
+          category: vision?.expectation?.category || null,
+          frames: vision?.frames ?? 0,
+          steered: steered ? { notes: steered.notes, images: steered.images, added: steered.added } : null,
+        });
+        emit('refine:end', {
+          ok: !refineAbort, staged: true, stopped: refineAbort,
+          added: refined.length, agreed: reconciled.agreed.length,
+          candidates: current.manifest.length, remaining,
+          text: { added: 0, ok: true, code: null },
+          vision: vision
+            ? { added: admitted.added + (steered?.added || 0), ok: true, code: null }
+            : { added: 0, ok: false, code: 'SKIPPED' },
+          category: vision?.expectation?.category || null,
+          gaps: vision?.gaps || null,
+          steered: steered || null,
+        });
         return {
-          ...res,
+          ok: !refineAbort, staged: true, stopped: refineAbort,
+          refined, remaining, agreed: reconciled.agreed,
           expectation: vision?.expectation ?? null,
           expectationUsable: vision?.expectation ? true : false,
           gaps: vision?.gaps ?? null,
+          steered: steered || null,
         };
       } catch (e) {
+        // A crash must not freeze the list: whatever is still a candidate gets its
+        // battery now, in one batch, so the rows a human sees are clickable and
+        // honest about having been scored in a fallback rather than at a boundary.
+        try {
+          for (const rec of (current.manifest || []).filter((r) => r.status === 'candidate')) {
+            refineJoint(current.glb, current.joints, rec, {});
+          }
+          if (Array.isArray(current.manifest) && current.manifest.length) {
+            saveManifest(runDir, current.manifest);
+            commitRevision('stage 2 fallback: batch-scored after a refinement failure');
+          }
+        } catch { /* the failure below is the one that matters */ }
         broadcast({
           kind: 'refine:end',
           ok: false, added: 0, agreed: 0, code: 'REFINE_FAILED', reason: e.message,
@@ -704,23 +876,46 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
       }
     },
 
-    // Human-in-the-loop: steer or stop the in-flight parallel refinement. Called by
-    // POST /api/refine/intervene while autoRefine runs. A `text` note is queued and
-    // folded into the next model ask; `stop` sets the abort flag the loop honours at
-    // its next phase boundary. Neither interrupts a turn mid-flight, and neither
-    // touches the manifest directly — the loop stays the only writer.
-    intervene({ text = null, stop = false } = {}) {
-      if (!autoRunning) return { ok: false, code: 'NOT_RUNNING', error: 'no refinement is in flight to intervene in' };
-      const note = String(text || '').trim();
-      if (note) {
-        refineNotes.push({ text: note, ts: Date.now() });
-        broadcast({ kind: 'refine:note', text: note, queued: refineNotes.length });
-      }
-      if (stop) {
-        refineAbort = true;
-        broadcast({ kind: 'refine:abort', queued: refineNotes.length });
-      }
-      return { ok: true, aborting: refineAbort, queued: refineNotes.length, running: autoRunning };
+    // Stop the in-flight staged refinement at its NEXT boundary. Joints refined so
+    // far stay committed — each was saved and revised at its own boundary — so
+    // this is "no further joints", not the old "discard everything".
+    abortRefine() {
+      if (!autoRunning) return { ok: false, code: 'NOT_RUNNING', error: 'no refinement is in flight to stop' };
+      refineAbort = true;
+      broadcast({ kind: 'refine:abort', queued: 0 });
+      return { ok: true, aborting: true, running: autoRunning };
+    },
+
+    // Plan mutation from the queue: a served user request may reshape what is LEFT
+    // of the stage-2 plan. The loop re-reads current.manifest at every boundary, so
+    // dropping or postponing a candidate here takes effect at the next one, without
+    // ever touching a record mid-measurement. A refined joint is not plan any more
+    // — it is belief — so it refuses both and points at the edit/verdict surfaces.
+    dropCandidate(id) {
+      const rec = (current.manifest || []).find((r) => r.id === id || r.label === id);
+      if (!rec) return { ok: false, code: 'NO_SUCH_JOINT', error: `no joint named "${id}"` };
+      if (rec.status !== 'candidate') return { ok: false, code: 'ALREADY_REFINED', error: `${rec.id} is already refined — edit or verdict it instead` };
+      current.manifest = current.manifest.filter((r) => r !== rec);
+      current.joints = current.joints.filter((j) => j.id !== rec.id);
+      saveManifest(runDir, current.manifest);
+      commitRevision(`stage 2: candidate ${rec.id} dropped from the plan`);
+      broadcast({
+        kind: 'discover:candidates',
+        count: current.manifest.length, dropped: rec.id,
+        remaining: current.manifest.filter((r) => r.status === 'candidate').length,
+      });
+      return { ok: true, dropped: rec.id, remaining: current.manifest.filter((r) => r.status === 'candidate').length };
+    },
+
+    postponeCandidate(id) {
+      const rec = (current.manifest || []).find((r) => r.id === id || r.label === id);
+      if (!rec) return { ok: false, code: 'NO_SUCH_JOINT', error: `no joint named "${id}"` };
+      if (rec.status !== 'candidate') return { ok: false, code: 'ALREADY_REFINED', error: `${rec.id} is already refined` };
+      const jn = current.joints.find((j) => j.id === rec.id);
+      current.manifest = [...current.manifest.filter((r) => r !== rec), rec];
+      current.joints = [...current.joints.filter((j) => j !== jn), ...(jn ? [jn] : [])];
+      broadcast({ kind: 'discover:candidates', count: current.manifest.length, postponed: rec.id });
+      return { ok: true, postponed: rec.id };
     },
 
     // Phase 3 task 17: the symmetry peers of one joint, i.e. the joints a verdict

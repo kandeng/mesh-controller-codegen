@@ -46,6 +46,45 @@ export const COMMANDS = [
       ? 'Stop requested — the running turn is being cancelled. Queued messages (if any) still run.'
       : 'No task is running — nothing to stop.'),
   },
+  {
+    // Plan control for the STAGED discovery. Discovery yields at every boundary
+    // (after stage 1 and after each joint) and re-reads its live plan there, so a
+    // request served from the queue can genuinely reshape what is left to do —
+    // these are the deterministic verbs the assistant (or the user) uses to do it.
+    name: 'discovery',
+    usage: '/discovery <status|stop|drop <id>|postpone <id>>',
+    desc: 'Inspect or reshape the running discovery plan: status, stop at the next boundary, drop a candidate, or postpone one to the end.',
+    example: '/discovery drop rotor_vis_4',
+    takesArgs: true,
+    // The WS handler calls run({ kernel, agent, args }) — one context object.
+    run: ({ kernel, args = '' }) => {
+      const [verb, ...rest] = String(args || '').trim().split(/\s+/);
+      const id = rest.join(' ').trim();
+      if (verb === 'status') {
+        const list = kernel.current?.manifest || [];
+        const cand = list.filter((r) => r.status === 'candidate').map((r) => r.id);
+        const done = list.filter((r) => r.status !== 'candidate').map((r) => `${r.id}:${r.status}`);
+        return `discovery: ${cand.length} candidate(s) left [${cand.join(', ') || 'none'}] · settled [${done.join(', ') || 'none'}]`;
+      }
+      if (verb === 'stop') {
+        const r = kernel.abortRefine?.() || { ok: false, error: 'abort is not available on this kernel' };
+        return r.ok
+          ? 'Stop requested — the discovery halts at its next boundary. Joints refined so far stay; the rest remain candidates.'
+          : `Nothing to stop: ${r.error}`;
+      }
+      if (verb === 'drop') {
+        if (!id) return 'Usage: /discovery drop <joint id or label>';
+        const r = kernel.dropCandidate?.(id) || { ok: false, error: 'not available on this kernel' };
+        return r.ok ? `Dropped ${r.dropped} from the plan — ${r.remaining} candidate(s) left.` : `Could not drop: ${r.error}`;
+      }
+      if (verb === 'postpone') {
+        if (!id) return 'Usage: /discovery postpone <joint id or label>';
+        const r = kernel.postponeCandidate?.(id) || { ok: false, error: 'not available on this kernel' };
+        return r.ok ? `Postponed ${r.postponed} to the end of the plan.` : `Could not postpone: ${r.error}`;
+      }
+      return `Unknown /discovery verb "${verb || ''}" — use status, stop, drop <id> or postpone <id>.`;
+    },
+  },
 ];
 
 // "/name [args...]" -> { name, args } | null (null = not a slash command).

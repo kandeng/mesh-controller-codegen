@@ -246,10 +246,10 @@ onBeforeUnmount(() => { removeEventListener('keydown', onKeydown); });
       <button type="button" class="attach" title="Upload an image (or paste with Ctrl+V)" @click="fileInput.click()"><span class="ic ic-folder" aria-hidden="true"></span></button>
       <div class="ta-wrap">
         <div class="grip" title="Drag to resize · double-click for auto height" @pointerdown="startResize" @dblclick="resetHeight"><span /></div>
-        <textarea ref="taRef" v-model="draft" rows="1" :placeholder="state.refining ? 'Steer the running detection — type a note and Enter folds it into the next model ask (e.g. ignore the landing gear, or the gimbal is what matters)' : 'Message the assistant… Enter sends · Shift+Enter new line · Ctrl+V pastes screenshots · while busy, sends queue up'" @paste="onPaste" @keydown.enter="onEnterKey"></textarea>
+        <textarea ref="taRef" v-model="draft" rows="1" :placeholder="state.refining ? 'Message the assistant… discovery pauses at every boundary to answer you — and a served request can change what is left of the plan (try /discovery status, stop, drop <joint>, postpone <joint>)' : 'Message the assistant… Enter sends · Shift+Enter new line · Ctrl+V pastes screenshots · while busy, sends queue up'" @paste="onPaste" @keydown.enter="onEnterKey"></textarea>
       </div>
-      <button type="submit" class="sendbtn" :title="state.refining ? 'Send a steering note to the running detection loop' : 'Send (Enter sends · while busy, sends queue up)'" :disabled="uploading > 0 || (!draft.trim() && !pending.length)"><span class="ic ic-send" aria-hidden="true"></span></button>
-      <button type="button" class="stopbtn" :title="state.refining ? 'Stop the detection loop — it halts at the next safe boundary and merges nothing' : 'Stop the current task (queued messages still run)'" :disabled="!state.busy && !state.refining" @click="stop"><span class="ic ic-stop" aria-hidden="true"></span></button>
+      <button type="submit" class="sendbtn" :title="state.refining ? 'Send — it queues behind the running step and is answered at the next boundary' : 'Send (Enter sends · while busy, sends queue up)'" :disabled="uploading > 0 || (!draft.trim() && !pending.length)"><span class="ic ic-send" aria-hidden="true"></span></button>
+      <button type="button" class="stopbtn" :title="state.refining ? 'Stop discovery at its next boundary — the joints already checked stay, the rest remain candidates' : 'Stop the current task (queued messages still run)'" :disabled="!state.busy && !state.refining" @click="stop"><span class="ic ic-stop" aria-hidden="true"></span></button>
     </form>
 
     <!-- Click-to-zoom lightbox (teleported to <body> so it escapes the pane). -->

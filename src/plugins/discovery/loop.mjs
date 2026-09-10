@@ -56,13 +56,19 @@ export function runBattery(g, joints, recs) {
   }
 }
 
-export function runDiscoveryLoop(g, joints, { runDir = null } = {}) {
+export function runDiscoveryLoop(g, joints, { runDir = null, score = true } = {}) {
   const manifest = buildManifest(joints);
   const frontier = [...manifest]; // BFS frontier — phase 1: depth 0 only
   const producers = { L2: [], L3: [] }; // filled by runL2Round / phase 3
 
-  runBattery(g, joints, frontier);
-  for (const rec of frontier) rec.status = deriveStatus(rec);
+  // score:false is the staged-discovery seam: the geometry pass ADMITS its records
+  // as candidates and defers the battery to stage 2, where it runs per joint at a
+  // queue boundary. A record the battery has not scored yet stays `candidate`,
+  // which is exactly the status the UI reads as "listed but not clickable".
+  if (score) {
+    runBattery(g, joints, frontier);
+    for (const rec of frontier) rec.status = deriveStatus(rec);
+  }
 
   applyManifest(joints, manifest);
   const file = saveManifest(runDir, manifest);
@@ -131,6 +137,91 @@ function mergeProposals(g, joints, manifest, { records, confirms, confirmTag = '
 
   applyManifest(joints, manifest);
   return { added: (records || []).length, proposals: (records || []).map((r) => r.id), retested: retest.length };
+}
+
+// Stage-1 admission: merge a producer's delta into the manifest WITHOUT scoring
+// it. mergeProposals' battery + confidence dispose is stage 2's per-joint job in
+// the staged pipeline, so here a record lands exactly as the gate minted it
+// (status 'candidate') and a confirm only adds its evidence tag — no confidence
+// lift, no deriveStatus, because both would score a joint before its boundary.
+// The split bookkeeping is kept verbatim: a candidate that claims a subset of an
+// existing record must subtract it now, or `isolation` sees one node in two joints
+// for the whole of stage 1.
+export function admitCandidates(joints, manifest, { records = [], confirms = [] } = {}) {
+  for (const c of confirms || []) {
+    const t = manifest.find((r) => r.id === c.targetId);
+    if (!t) continue;
+    t.evidence.push(c.tag || 'cross-producer');
+  }
+  for (const rec of records || []) {
+    if (rec.splitFrom) {
+      const t = manifest.find((r) => r.id === rec.splitFrom);
+      const tj = joints.find((j) => j.id === rec.splitFrom);
+      if (t) {
+        t.nodes = t.nodes.filter((n) => !rec.nodes.includes(n));
+        t.history.push({ at: new Date().toISOString(), event: 'split-off', note: `${rec.nodes.length} nodes → ${rec.id}` });
+      }
+      if (tj) tj.nodes = tj.nodes.filter((n) => !rec.nodes.includes(n));
+    }
+    joints.push({ ...rec }); // joint-shaped view for the battery + UI
+    manifest.push(rec);
+  }
+  applyManifest(joints, manifest);
+  return { added: (records || []).length, proposals: (records || []).map((r) => r.id) };
+}
+
+// Stage-2 refinement of ONE joint: the rest-pose battery over this record alone,
+// then the status the battery earned. Everything else about the record (nodes,
+// evidence, provenance) is untouched — this is a measurement, not an edit.
+//
+// `grounded` is the vision lane's grounding of this record over the stage-1
+// frames, computed in memory at round time over both channels (painted colour ids
+// and the projected box). It is re-used rather than re-run from disk because the
+// pre-dilation box and the raw colour ids are not persisted: groundRegion over a
+// saved round would ground against the DILATED box, a lossy imitation of the real
+// measurement. Re-using the round's own grounding IS re-using its frames.
+//
+// The measurement is also copied onto the SERVED joint object. applyManifest cannot
+// do this job here: it guards confidence and evidence with `== null` / `if (!...)`,
+// which is right for a first admission and wrong for a re-score — a candidate
+// already carries the admission's base confidence, so the guard would leave the
+// stale number on the wire and the row's tooltip would contradict its own status.
+export function refineJoint(g, joints, rec, { grounded = null, emit = null } = {}) {
+  const say = typeof emit === 'function' ? emit : () => {};
+  if (!rec) return { ok: false, reason: 'no such record' };
+  // Replace, never append: a re-run must not stack a second isolation entry next
+  // to the first (same rule as the edit-verdict re-score).
+  rec.tests = (rec.tests || []).filter((t) => !BATTERY_TESTS.has(t.name));
+  runBattery(g, joints, [rec]);
+  const fails = rec.tests.some((t) => t.level !== 'warn' && !t.pass);
+  const warns = rec.tests.some((t) => t.level === 'warn' && !t.pass);
+  rec.confidence = fails ? 0.7 : warns ? 0.75 : 0.8; // physics disposes
+  if (grounded) {
+    if (!Array.isArray(rec.uncertainties)) rec.uncertainties = [];
+    for (const u of grounded.uncertainties || []) if (!rec.uncertainties.includes(u)) rec.uncertainties.push(u);
+    rec.evidence.push(`vision-grounding:${grounded.source || 'none'}@frame ${grounded.frameId ?? '?'}`);
+    rec.grounding = {
+      source: grounded.source || null,
+      agreement: grounded.agreement?.verdict ?? null,
+      frameId: grounded.frameId ?? null,
+    };
+  }
+  rec.status = deriveStatus(rec);
+  // Publish the result to the served list. /api/joints reads `joints`, not the
+  // manifest, so without this the row would stay a 'candidate' on the wire forever
+  // and never become clickable no matter what the battery concluded.
+  const j = (joints || []).find((x) => x.id === rec.id);
+  if (j) {
+    j.status = rec.status;
+    j.tests = rec.tests;
+    j.confidence = rec.confidence;
+    j.evidence = rec.evidence;
+    j.verdict = rec.verdict || null;
+    if (rec.uncertainties) j.uncertainties = rec.uncertainties;
+    if (rec.grounding) j.grounding = rec.grounding;
+  }
+  say('joint:refined', { id: rec.id, status: rec.status, confidence: rec.confidence });
+  return { ok: true, status: rec.status, confidence: rec.confidence, tests: rec.tests, grounded: !!grounded };
 }
 
 // A human typed while the loop was working. Their words ride into the next ask as
@@ -585,6 +676,12 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
     // folded into the discovery prompt — guidance the model weighs, never a command
     // that bypasses the grounding gate.
     humanNotes = null,
+    // Optional HUMAN REFERENCE IMAGES: the pictures behind a steering note, in
+    // the same [{ mediaType, dataBase64, name }] shape agent.send() uses. They
+    // are attached AFTER the rendered frames and are guidance, never evidence —
+    // a proposal still has to cite a frame we drew, because that is the only
+    // frame grounding has a camera pose for.
+    extraImages = null,
     // Ask WHAT KIND OF MACHINE this is before asking what moves on it, over the
     // same frames (see expectation.mjs). Off by default so a single manual round
     // stays one turn; the campaign switches it on for round 1, which is the only
@@ -595,6 +692,14 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
     // as a claim on the parts. Two producers agreeing then reconciles into one
     // record instead of one dropped proposal.
     independent = false,
+    // STAGED DISCOVERY seam: stop after step 5 and hand back the round's
+    // PROPOSALS — grounded, but not yet judged. The orchestrator lists them as
+    // candidates immediately and lets the battery score each joint later, at a
+    // queue boundary; merging here would score them in one batch and hide the
+    // list until every joint settled, which is the one-shot behaviour this seam
+    // exists to split. `proposals` on this path carries RECORD OBJECTS, not the
+    // merged ids the default path returns.
+    stopAfter = null,
   } = effects || {};
   const say = typeof emit === 'function' ? emit : () => {};
 
@@ -757,6 +862,7 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
     // prompt exactly as this round built it before the lane existed.
     hypothesis: expectationBrief(expectation, gapsAtAsk),
     independent,
+    extraImages: Array.isArray(extraImages) ? extraImages : [],
   });
   warnings.push(...prompt.warnings);
   // A human note arriving while the frames were rendering is folded into THIS ask —
@@ -765,7 +871,7 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
   const vNotes = typeof humanNotes === 'function' ? humanNotes() : null;
   if (Array.isArray(vNotes) && vNotes.length) {
     prompt.text += humanNoteBlock(vNotes);
-    say('vision:note', { notes: vNotes.map((n) => String(n)) });
+    say('vision:note', { notes: vNotes.map((n) => String(n)), references: prompt.references.length });
   }
   say('vision:ask', { frames: captured.length, prompt: prompt.text });
 
@@ -815,6 +921,48 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
   const rejected = parsed.grounded
     .filter((e) => !survivors.has(e.index))
     .map((e) => ({ index: e.index, frameId: e.frameId, names: e.names, grounding: e.grounding, uncertainties: e.uncertainties }));
+
+  if (stopAfter === 'proposals') {
+    // The audit trail is written exactly as the merging path would write it, so a
+    // staged round is replayable from disk like any other; the evidence-round
+    // stamp goes onto the records here because there is no post-merge step to do
+    // it later, and only this caller knows which directory the frames went to.
+    if (Number.isFinite(evidenceRound)) {
+      for (const r of parsed.records) r.frameRound = evidenceRound;
+    }
+    persist?.proposals?.({
+      records: parsed.records, confirms: parsed.confirms,
+      warnings: parsed.warnings, rejected,
+      grounded: parsed.grounded, suggestViews: parsed.suggestViews,
+    });
+    return {
+      ok: true,
+      stopped: 'proposals',
+      added: 0,
+      proposals: parsed.records,
+      confirms: parsed.confirms.length,
+      confirmList: parsed.confirms,
+      retested: 0,
+      reason: parsed.records.length ? null : 'the model proposed nothing',
+      views: plan.views.length,
+      shots: shots.length,
+      frames: captured.length,
+      coverage: plan.coverage ?? null,
+      interiorOnly: plan.interiorOnly ?? null,
+      grounded: parsed.grounded,
+      admitted: parsed.admitted,
+      rejected,
+      suggestViews: parsed.suggestViews,
+      expectation,
+      expectationUsable: expectationIsUsable(expectation),
+      gaps: expectation ? expectationGap(expectation, manifest) : null,
+      expectationVerified: expectation ? verifiedInstances(expectation, parsed.grounded) : null,
+      model: turn?.model ?? null,
+      ms: Date.now() - t0,
+      manifestUntouched: true,
+      warnings,
+    };
+  }
 
   // 6. MERGE + BATTERY ----------------------------------------------------
   const merged = mergeProposals(g, joints, manifest, {
@@ -924,8 +1072,11 @@ export async function runVisionCampaign(g, joints, manifest, effects = {}) {
   const say = typeof e.emit === 'function' ? e.emit : () => {};
 
   const askedRounds = Number.isFinite(e.rounds) ? Math.max(1, Math.floor(e.rounds)) : MAX_VISION_ROUNDS;
-  const maxRounds = Math.min(MAX_VISION_ROUNDS, askedRounds);
+  let maxRounds = Math.min(MAX_VISION_ROUNDS, askedRounds);
   if (askedRounds > MAX_VISION_ROUNDS) warnings.push(`rounds=${askedRounds} was capped to MAX_VISION_ROUNDS=${MAX_VISION_ROUNDS}`);
+  // A proposals-only campaign is ONE look by definition: round 2 exists to chase
+  // round 1's doubts through the merge it just performed, and there is no merge.
+  if (e.stopAfter === 'proposals') maxRounds = 1;
   const askedExtra = Number.isFinite(e.extraViews) ? Math.max(0, Math.floor(e.extraViews)) : MAX_EXTRA_VIEWS;
   const extraBudget = Math.min(MAX_EXTRA_VIEWS, askedExtra);
   if (askedExtra > MAX_EXTRA_VIEWS) warnings.push(`extraViews=${askedExtra} was capped to MAX_EXTRA_VIEWS=${MAX_EXTRA_VIEWS}`);
@@ -1076,6 +1227,10 @@ export async function runVisionCampaign(g, joints, manifest, effects = {}) {
       emit: e.emit || null,
       abort: e.abort || null,
       humanNotes: typeof e.humanNotes === 'function' ? e.humanNotes : null,
+      // The same pictures go to every round of the campaign: a steering note that
+      // arrived once is still true in round 2, and a round that dropped it would
+      // be reasoning from less than the round before it.
+      extraImages: Array.isArray(e.extraImages) && e.extraImages.length ? e.extraImages : null,
       frames: replay,
       persist: persistFor(r),
       // Resolved per round for the same reason `persist` is a factory: the caller
@@ -1100,6 +1255,7 @@ export async function runVisionCampaign(g, joints, manifest, effects = {}) {
       // whole point; a caller may switch it off to get the single-turn round.
       expectation: r === 0 ? e.expectation !== false : false,
       independent: e.independent === true,
+      stopAfter: e.stopAfter || null,
     });
 
     prevPlan = planObj;
@@ -1135,6 +1291,12 @@ export async function runVisionCampaign(g, joints, manifest, effects = {}) {
   }
 
   const okRounds = rounds.filter((x) => x.ok);
+  // A proposals-only campaign ends because it was TOLD to, not because it ran out
+  // of questions. Saying so in `stop` is what keeps the diagnostics honest: without
+  // it a stage-1 look reports a null stop and reads as a campaign that finished.
+  if (e.stopAfter === 'proposals' && !stop) {
+    stop = 'stopped after the proposals of round 1 — the caller owns the merge (stage 1 of staged discovery)';
+  }
   const last = okRounds[okRounds.length - 1] || rounds[rounds.length - 1] || null;
   const failed = rounds.find((x) => !x.ok) || null;
   const added = okRounds.reduce((n, x) => n + (x.added || 0), 0);
@@ -1148,7 +1310,19 @@ export async function runVisionCampaign(g, joints, manifest, effects = {}) {
     ok: okRounds.length > 0,
     added,
     confirms,
+    // TWO meanings, told apart by `stopped`. A merged round reports the IDS it
+    // added; a proposals-only round (stage 1 of staged discovery) reports the
+    // RECORD OBJECTS it parsed, because the merge that would have admitted them
+    // never ran and the caller owns it. Reading this field without checking
+    // `stopped` first is the one mistake this shape permits.
     proposals: okRounds.flatMap((x) => x.proposals || []),
+    // The proposals-only seam stops BEFORE the merge, so its corroboration is a
+    // DELTA THE CALLER OWNS: `confirms` alone is a count, and a count cannot be
+    // routed through reconcileLanes. `stopped` travels for the same reason — it is
+    // how a caller tells "looked and merged nothing" from "looked and was told not
+    // to merge", which are opposite instructions for what to do next.
+    confirmList: okRounds.flatMap((x) => x.confirmList || []),
+    stopped: last?.stopped ?? null,
     retested: sum('retested'),
     roundCount: rounds.length,
     rounds,

@@ -69,7 +69,8 @@ const st0 = await jget('/api/state');
 if (st0.ok !== true || st0.loaded !== true) {
   const proj = await jpost('/api/project', { glb: GLB });
   ok('POST /api/project loads the mesh the probe plans against',
-    proj.ok === true, `${proj.joints?.length} joint units, ${proj.stats?.count} nodes`);
+    proj.status === 200 && proj.body?.ok === true,
+    `${proj.body?.joints?.length} joint units, ${proj.body?.stats?.count} nodes`);
 }
 // Whatever is loaded is what this probe measures, and the mode assertions below
 // depend on the model (a machine with no enclosed interior has nothing for a

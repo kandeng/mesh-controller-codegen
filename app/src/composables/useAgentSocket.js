@@ -99,26 +99,13 @@ export function useAgentSocket() {
     const t = String(text || '').trim();
     if (!t && !attachments.length) return;
 
-    // HUMAN-IN-THE-LOOP: while a parallel refinement is in flight, the composer
-    // talks to the LOOP instead of the chat agent — the words become a steering note
-    // the producers fold into their next model ask (and a stop rides the same seam).
-    // The 3D view and knobs stay locked, but the chat does not: watching the frames
-    // arrive and typing "ignore the landing gear" IS the intervention.
-    if (state.refining && t) {
-      // Show the human's own words now; the loop acknowledges with a refine:note
-      // beat, not a transcript entry, so the bubble is pushed here.
-      state.transcript.push({ role: 'user', text: t, ts: Date.now(), attachments: attachments.length ? attachments : undefined });
-      try {
-        const r = await api.intervene({ text: t });
-        if (r.status === 409 || r.body?.ok === false) {
-          notify('the refinement settled before your note could be folded in — send it again to talk to the assistant directly');
-        }
-      } catch (e) {
-        state.transcript.push({ role: 'system', text: `could not reach the loop: ${e.message}`, ts: Date.now() });
-      }
-      return;
-    }
-
+    // The composer ALWAYS talks to the assistant — including while discovery is in
+    // flight. There is no special mode any more: the supervisor is a FIFO turn chain,
+    // so a send made mid-job simply queues, and the staged orchestrator yields at
+    // every boundary (after stage 1, and after each joint) until that queue drains.
+    // The consequence is that a request served at a boundary can reshape the rest of
+    // the plan (the boundaries re-read the live manifest), which is the whole reason
+    // for staging. The old steering-note hijack is retired.
     if (ws && ws.readyState === 1) {
       // No optimistic push: the server broadcasts the persisted user entry back
       // to every tab (including this one) as a `transcript` frame.
@@ -130,12 +117,13 @@ export function useAgentSocket() {
     }
   }
 
-  // Stop. While a refinement is in flight this stops THE LOOP — an abort the
-  // producers honour at their next phase boundary, discarding the merge (nothing
-  // half-written is committed). Otherwise it cancels the running chat turn on the
-  // DSH host; queued sends (if any) still run afterwards.
+  // Stop. While a staged discovery is in flight this stops THE ORCHESTRATOR at its
+  // next boundary: the joints already refined STAY committed (each was saved and
+  // revisioned at its own boundary), and the rest remain candidates rather than
+  // half-checked. Otherwise it cancels the running chat turn on the DSH host; queued
+  // sends (if any) still run afterwards.
   function stop() {
-    if (state.refining) { api.intervene({ stop: true }).catch(() => {}); return; }
+    if (state.refining) { api.abortRefine().catch(() => {}); return; }
     if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'stop' }));
   }
 

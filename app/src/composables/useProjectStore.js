@@ -10,7 +10,9 @@ const state = reactive({
   connected: false,       // events WS connected
   loaded: false,          // a project (GLB) is discovered
   busy: false,            // a generate/validate is in flight
-  discovering: false,     // an AI discovery op (load/refine/vision) is in flight
+  discovering: false,     // the 3D view/knobs are locked: a CAMERA is being driven
+                          // (stage 1 of discovery, or a manual vision round). Stage 2
+                          // measures joints and captures nothing, so it drops there.
   phase: null,            // active discovery sub-job: 'views' | 'decompose' | 'axis'
   tourRound: null,        // observation round whose camera path the 3D view replays
   visionActive: false,    // a chained vision campaign is narrating itself live
@@ -22,7 +24,6 @@ const state = reactive({
   expectation: null,      // the vision lane's category prior (a guess, never a joint)
   gaps: null,             // expected-vs-grounded per type, from the latest refinement
   verdictFlash: null,     // { id, decision, peers:[ids], ts } — draw the amortization links
-  sweepReq: null,         // { id, ts } — ask the 3D view to fan-sweep this joint
   error: null,
   glb: null,
   stats: null,
@@ -69,6 +70,17 @@ function notify(text) {
   state.transcript.push({ role: 'system', text: t, ts: Date.now() });
 }
 
+// The inspection guidance the assistant says when the human picks a joint from the
+// list. It is said ONCE per unchanged wording: clicking joint after joint must not
+// stack identical paragraphs into the chat, so the previous transcript entry is
+// checked and a message the assistant already said verbatim is not repeated.
+const JOINT_GUIDANCE = 'Verify this joint\'s scope: it must contain every part that belongs to it, and none that doesn\'t. Then drive its motion with the step 3 controls to confirm it moves as expected and nothing is broken. If something needs pointing out, mark the 3D view with the pens (arrow, rectangle, curve, text, any colour) and send a screenshot — the marks make your request clearer.';
+function sayJointGuidance() {
+  const last = state.transcript[state.transcript.length - 1];
+  if (last?.text === JOINT_GUIDANCE) return;
+  state.transcript.push({ role: 'assistant', text: JOINT_GUIDANCE, ts: Date.now() });
+}
+
 // The live status line is NOT a transcript entry: it is a single reactive string
 // the chat renders at the very end while a remote model call is in flight, and
 // clears the moment the work settles. It says WHICH model DSH is waiting on and
@@ -77,8 +89,10 @@ function setStatus(text) { state.statusLine = text ? String(text) : null; }
 
 // The chained vision campaign narrates itself over the same socket. The 3D view
 // consumes `visionFeed` to animate the look-around as it happens; `discovering`
-// re-locks the whole UI for the campaign's duration so a human cannot steer (or
-// click, or orbit) mid-look — and unlocks the instant it ends or is skipped.
+// locks orbit/picks/knobs for as long as a CAMERA is being driven, so a human cannot
+// fight the render farm mid-look — and unlocks the instant that ends or is skipped.
+// It is deliberately NOT the whole-discovery lock: staged discovery keeps running
+// (per-joint checks) after the camera is done, and that part is safe to look at.
 function pushVision(msg) {
   state.visionFeed.push(msg);
   if (state.visionFeed.length > 400) state.visionFeed.splice(0, state.visionFeed.length - 400);
@@ -132,9 +146,14 @@ function connectEvents() {
         // not look; the other lane is still running, so the UI stays locked until
         // the orchestrator says both have settled.
         if (!state.refining) { state.visionActive = false; state.discovering = false; setStatus(null); }
-        pushEvent({ type: msg.kind, ts: Date.now(), data: { ok: !!msg.ok, code: msg.code || null, reason: msg.reason || msg.error || null } });
+        pushEvent({ type: msg.kind, ts: Date.now(), data: { ok: !!msg.ok, code: msg.code || null, reason: msg.reason || msg.error || null, look: msg.look ?? 1 } });
         if (msg.kind === 'vision:skip') {
-          notify(`the vision lane was skipped: ${msg.error || msg.code || 'unavailable'}`);
+          // A skip of the STEERED second look is a different sentence: the run is
+          // not degraded, the instruction simply could not be folded in, and the
+          // list from the first look still stands.
+          notify(msg.look === 2
+            ? `your instruction could not be folded in — the second look was skipped (${msg.error || msg.code || 'unavailable'}). The candidate list from the first look stands, and DSH will keep checking those joints.`
+            : `the vision lane was skipped: ${msg.error || msg.code || 'unavailable'}`);
         } else if (msg.ok) {
           notify(`vision refinement finished — the physics battery accepted ${msg.added ?? 0} new joint(s)`);
           refreshJoints();
@@ -208,6 +227,20 @@ function connectEvents() {
           attachments: [{ id: msg.id, url: msg.url }],
           ts: Date.now(),
         });
+      } else if (msg.kind === 'vision:note' && (msg.notes || []).length) {
+        // The human's own words, folded into the prompt at the ask boundary. Shown
+        // verbatim and BEFORE the ask that carries them, so the chat reads in the
+        // order the model received it: what you said, then what was sent. A note
+        // the model never saw would be the worst kind of lie to tell here.
+        setStatus(`DSH folded your note into the vision prompt. Please wait …`);
+        state.transcript.push({
+          role: 'assistant',
+          text: `I folded what you said into the look I am about to make:\n\n${msg.notes.map((n) => `- ${n}`).join('\n')}`
+            + (msg.references
+              ? `\n\nand attached the ${msg.references} image(s) you sent with it as REFERENCE pictures. The model is told they are not frames we rendered, so it cannot cite them as evidence — only read them as guidance. A proposal still has to point at a frame we drew, because that is the only kind we can project back into the geometry.`
+              : ''),
+          ts: Date.now(),
+        });
       } else if (msg.kind === 'vision:ask' && msg.prompt) {
         setStatus(`DSH is asking ${state.visionModel} to detect the joints from ${msg.frames} rendered frame(s). Please wait …`);
         state.transcript.push({
@@ -254,10 +287,14 @@ function connectEvents() {
         pushEvent({ type: 'text:skip', ts: Date.now(), data: { code: msg.code || null } });
         notify(`the semantic lane was skipped: ${msg.error || msg.code || 'unavailable'}`);
       }
-    } else if (typeof msg.kind === 'string' && (msg.kind.startsWith('refine:') || msg.kind === 'lane:merged')) {
-      // The ORCHESTRATOR beats. One refinement = two lanes = one lock, one
-      // notification and one revision, so the UI reads it as one event with two
-      // contributions rather than as two competing jobs.
+    } else if (typeof msg.kind === 'string' && (msg.kind.startsWith('refine:') || msg.kind.startsWith('discover:') || msg.kind === 'lane:merged' || msg.kind === 'joint:refined')) {
+      // The ORCHESTRATOR beats. Discovery is STAGED now, so these read as one job
+      // with two acts: `discover:candidates` is stage 1 landing the rough list,
+      // `discover:stage` is the hand-over to stage 2 (and the moment the 3D view
+      // unlocks, because stage 2 captures nothing), and `joint:refined` is one row
+      // becoming clickable. Between every one of those beats the orchestrator
+      // yields to the assistant queue, so a message sent mid-job is answered before
+      // the next one arrives.
       if (msg.kind === 'refine:start') {
         state.refining = true; state.discovering = true; state.visionFeed = [];
         state.expectation = null; state.gaps = null;
@@ -269,22 +306,84 @@ function connectEvents() {
           ? `DSH is asking the remote ${state.model} AI model to detect the joints — one producer reads the node hierarchy while another looks at rendered frames. Please wait …`
           : `DSH is asking the remote ${msg.lanes?.vision === false ? state.model : state.visionModel} AI model to detect the joints. Please wait …`);
         notify(msg.lanes?.text !== false && msg.lanes?.vision !== false
-          ? 'two independent producers are looking at the mesh now — one reads the node hierarchy, one renders frames and looks at them; neither is shown the other\'s conclusions, and the controls stay locked until both settle'
+          ? 'two independent producers are looking at the mesh now — one reads the node hierarchy, one renders frames and looks at them. They will agree on a CANDIDATE list first, which appears in step (2) dimmed; each candidate is then checked one at a time, and the chat is served between them'
           : `refinement started with ${msg.lanes?.vision === false ? 'the semantic lane only' : 'the vision lane only'}`);
+      } else if (msg.kind === 'discover:look') {
+        // The steered second look starting. `discovering` is still true, so the
+        // camera lock is still held — this look renders frames, and a human
+        // orbiting the model mid-capture would corrupt them.
+        setStatus(`DSH is taking a SECOND look with your instruction folded in (${msg.notes ?? 0} message(s)${msg.images ? `, ${msg.images} image(s)` : ''}). Please wait …`);
+        pushEvent({ type: 'discover:look', ts: Date.now(), data: { look: msg.look ?? 2, notes: msg.notes ?? 0, images: msg.images ?? 0 } });
+        notify(`you spoke while the first look was running — so DSH is looking again with your instruction${msg.images ? ' and your screenshot' : ''} folded into the prompt, BEFORE any joint is measured. Whatever it finds is added to the candidate list; nothing already listed is thrown away.`);
+      } else if (msg.kind === 'discover:candidates') {
+        // Stage 1 landed (or the plan was reshaped by a served request: a drop or a
+        // postpone arrives on the same beat, because both change the candidate list).
+        pushEvent({
+          type: 'discover:candidates', ts: Date.now(),
+          data: {
+            count: msg.count ?? 0, added: msg.added ?? 0, agreed: msg.agreed ?? 0,
+            dropped: msg.dropped || null, postponed: msg.postponed || null,
+            remaining: msg.remaining ?? null,
+            look: msg.look ?? 1, steered: !!msg.steered,
+          },
+        });
+        refreshJoints();
+        if (msg.look === 2 && msg.steered) {
+          // The SECOND look landing. Same beat as stage 1 (it is the same thing —
+          // a candidate list settling), but the wording has to say whose idea it
+          // was, or a human who typed an instruction cannot tell whether it did
+          // anything at all.
+          if (msg.gaps) state.gaps = msg.gaps;
+          const parts = [`${msg.count} candidate joint(s) in step (2)`];
+          parts.push(msg.added ? `the second look added ${msg.added}` : 'the second look added nothing new');
+          if (msg.agreed) parts.push(`and independently re-found ${msg.agreed} part(s) already listed — corroboration of one joint, never a duplicate`);
+          notify(`your instruction was folded in — ${parts.join(', ')}.`);
+        } else if (msg.dropped) {
+          notify(`dropped ${msg.dropped} from the plan — ${msg.remaining ?? 0} candidate(s) left to check`);
+        } else if (msg.postponed) {
+          notify(`postponed ${msg.postponed} to the end of the plan`);
+        } else if (msg.count) {
+          if (msg.gaps) state.gaps = msg.gaps;
+          const parts = [`${msg.count} candidate joint(s) listed in step (2)`];
+          if (msg.added) parts.push(`the vision lane added ${msg.added}`);
+          if (msg.agreed) parts.push(`and both producers independently found the same ${msg.agreed} part(s) — recorded as corroboration of one joint, never as a duplicate`);
+          if (msg.category) parts.unshift(`I read the machine as ${msg.category}`);
+          notify(`stage 1 settled — ${parts.join(', ')}. Candidates are not clickable yet: each one is checked in turn, and I will answer your messages between them.`);
+        }
+      } else if (msg.kind === 'discover:stage') {
+        // Hand-over to stage 2. `discovering` drops HERE rather than at refine:end:
+        // stage 2 measures joints one at a time and captures no frames, so there is
+        // no camera to collide with — the human can orbit, pick a settled joint and
+        // drive its knobs while the rest of the list is still being checked.
+        // `refining` stays true, which is what keeps the composer queueing and the
+        // Stop button pointed at the orchestrator.
+        if (msg.stage === 2) {
+          state.discovering = false;
+          state.visionActive = false;
+          const left = state.joints.filter((j) => j.status === 'candidate').length;
+          setStatus(left ? `DSH is checking the candidate joints one at a time — ${left} left. Your messages are answered between them. Please wait …` : null);
+        }
+        pushEvent({ type: 'discover:stage', ts: Date.now(), data: { stage: msg.stage ?? null } });
+      } else if (msg.kind === 'joint:refined') {
+        // ONE row just became clickable. Re-read the list rather than patch it
+        // locally: the server is the only writer, and a patch would drift from the
+        // evidence and test results the row's tooltip is about to be asked for.
+        pushEvent({
+          type: 'joint:refined', ts: Date.now(),
+          data: { id: msg.id, status: msg.status || null, confidence: msg.confidence ?? null, remaining: msg.remaining ?? 0 },
+        });
+        refreshJoints();
+        setStatus(msg.remaining
+          ? `DSH checked ${msg.id} (${msg.status || 'settled'}) — ${msg.remaining} candidate(s) left. Please wait …`
+          : null);
       } else if (msg.kind === 'lane:merged') {
         pushEvent({
           type: 'lane:merged', ts: Date.now(),
           data: { lane: msg.lane, added: msg.added ?? 0, merged: msg.merged ?? 0, corroborated: msg.corroborated ?? 0 },
         });
-      } else if (msg.kind === 'refine:note') {
-        // A human note reached the loop's queue. The sending tab already showed the
-        // user's bubble; this acknowledges it landed and keeps the status line honest
-        // about what the next ask will carry.
-        pushEvent({ type: 'refine:note', ts: Date.now(), data: { text: msg.text, queued: msg.queued ?? 0 } });
-        setStatus('DSH queued your note and will fold it into the next model ask. Please wait …');
       } else if (msg.kind === 'refine:abort') {
         pushEvent({ type: 'refine:abort', ts: Date.now(), data: { queued: msg.queued ?? 0 } });
-        setStatus('DSH is stopping the refinement at the next safe boundary — nothing half-written will be merged. Please wait …');
+        setStatus('DSH is stopping discovery at its next boundary — the joints already checked stay; the rest remain candidates. Please wait …');
       } else if (msg.kind === 'refine:skip') {
         state.refining = false; state.discovering = false; state.visionActive = false;
         // A skipped refinement leaves no prior at all; keeping the previous mesh's
@@ -300,12 +399,22 @@ function connectEvents() {
         if (msg.gaps) state.gaps = msg.gaps;
         pushEvent({
           type: 'refine:end', ts: Date.now(),
-          data: { ok: !!msg.ok, added: msg.added ?? 0, agreed: msg.agreed ?? 0, text: t, vision: v },
+          data: {
+            ok: !!msg.ok, added: msg.added ?? 0, agreed: msg.agreed ?? 0, text: t, vision: v,
+            staged: !!msg.staged, candidates: msg.candidates ?? null, remaining: msg.remaining ?? 0,
+          },
         });
         if (msg.stopped) {
-          notify('you stopped the refinement — nothing it had found was merged; load or refine again to restart it');
+          // Incremental honesty: stopping is NOT a rollback any more. Every joint
+          // refined before the boundary stays committed, so the list says exactly
+          // what was checked and what is still a candidate.
+          notify(msg.remaining
+            ? `you stopped discovery at a boundary — ${msg.added ?? 0} joint(s) were checked and stay, ${msg.remaining} remain candidates; refine again to finish them`
+            : 'you stopped discovery before stage 1 settled — nothing was merged; load or refine again to restart it');
         } else if (msg.ok) {
-          const parts = [`the semantic lane added ${t.added ?? 0}`, `the vision lane added ${v.added ?? 0}`];
+          const parts = msg.staged
+            ? [`${msg.candidates ?? 0} candidate(s) found`, `${msg.added ?? 0} checked`]
+            : [`the semantic lane added ${t.added ?? 0}`, `the vision lane added ${v.added ?? 0}`];
           if (msg.agreed) {
             parts.push(`and both producers independently found the same ${msg.agreed} part(s) — recorded as corroboration of one joint, never as a duplicate`);
           }
@@ -327,5 +436,5 @@ function connectEvents() {
 }
 
 export function useProjectStore() {
-  return { state, activeJoint, setActiveJoint, setKnob, pushEvent, notify, connectEvents };
+  return { state, activeJoint, setActiveJoint, setKnob, pushEvent, notify, sayJointGuidance, connectEvents };
 }

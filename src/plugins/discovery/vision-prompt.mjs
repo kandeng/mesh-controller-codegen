@@ -169,13 +169,18 @@ function legendLine(frame) {
   return `LEGEND for "${frame.id}": ${shown}${more}`;
 }
 
-// Build the turn. Returns { text, images, frames, warnings } where `images` is
-// exactly the shape agent.send() wants: [{ mediaType, dataBase64, name }].
+// Build the turn. Returns { text, images, frames, references, warnings } where
+// `images` is exactly the shape agent.send() wants: [{ mediaType, dataBase64,
+// name }] — the rendered frames first, then any human reference images.
 //
 // `frames` in: [{ id, mode, spec, pose, covers, focus, colorMap, mediaType,
 //                dataBase64 }] — i.e. observation entries joined with the bytes
 //                read back off disk and, where available, the plan view that
 //                asked for them.
+// `extraImages` in: the same image-part shape, but pictures a HUMAN sent. They
+//                are described in text as not-frames and reported back in
+//                `references` (names only, no bytes) so a persisted round can
+//                say it was steered.
 export function buildVisionPrompt({
   manifest = null, frames = [], plan = null, maxFrames = MAX_VISION_FRAMES, question = null,
   // The parse table, for the SCENE header only: this module never projects
@@ -190,6 +195,14 @@ export function buildVisionPrompt({
   // cannot steer this one. Off by default: the manual "refine what is doubtful"
   // mode is a follow-up look and legitimately stands on what is already known.
   independent = false,
+  // HUMAN-SUPPLIED REFERENCE IMAGES, attached AFTER the rendered frames and
+  // described in text as NOT one of them. The whole pointing contract rests on
+  // `frameId` naming a frame WE drew from a pose we recorded, because grounding
+  // projects the reply's regionBox through that pose's camera. A box cited
+  // against a photograph has no camera behind it and gets dropped at the gate —
+  // so the prompt says that out loud instead of letting the model discover it
+  // silently and lose a proposal it believed it had supported.
+  extraImages = [],
 } = {}) {
   const warnings = [];
   const wanted = Array.isArray(frames) ? frames : [];
@@ -314,6 +327,29 @@ export function buildVisionPrompt({
   }
   if (!images.length) warnings.push('no frame carried image bytes - the model will be reasoning from text alone');
 
+  // The human's pictures go on the END of the same attachment list, named with a
+  // `ref:` prefix so they can never collide with a frame id — and so a reply that
+  // cites "ref:screenshot.png" as a frameId is visibly wrong rather than silently
+  // matching something.
+  const extras = (Array.isArray(extraImages) ? extraImages : []).filter((im) => im && im.dataBase64);
+  const droppedExtras = (Array.isArray(extraImages) ? extraImages : []).length - extras.length;
+  if (droppedExtras > 0) warnings.push(`${droppedExtras} reference image(s) carried no bytes and were not attached`);
+  if (extras.length) {
+    lines.push('');
+    lines.push(`REFERENCE IMAGES FROM THE HUMAN (${extras.length} attached AFTER the frames above):`);
+    lines.push('These are NOT frames we rendered. They are pictures the person watching this run sent');
+    lines.push('while it was in flight, to show you something about the machine. Read them as guidance.');
+    lines.push('You CANNOT point at them: "frameId" must name one of the frames listed above, because');
+    lines.push('those are the only frames we have a camera pose for, and a locator we cannot project');
+    lines.push('back into the geometry is dropped. If a reference image shows a part that none of our');
+    lines.push('frames cover, do not cite it - return no proposal for that part and fill in');
+    lines.push('"suggestView" saying what to render, and we will look again.');
+    extras.forEach((im, i) => lines.push(`  [ref ${i + 1}] ${im.name || 'unnamed'} (${im.mediaType || 'image/png'})`));
+    for (const im of extras) {
+      images.push({ mediaType: im.mediaType || 'image/png', dataBase64: im.dataBase64, name: `ref:${im.name || `human-${images.length}`}` });
+    }
+  }
+
   return {
     text: lines.join('\n'),
     images,
@@ -330,6 +366,9 @@ export function buildVisionPrompt({
       colors: f.colorMap && typeof f.colorMap === 'object' ? Object.keys(f.colorMap).length : 0,
       attached: images.some((im) => im.name === String(f.id)),
     })),
+    // What the human added, recorded the same way: an audit trail that says a
+    // round was steered, and by how many pictures, without keeping the bytes.
+    references: extras.map((im, i) => ({ index: i + 1, name: im.name || null, mediaType: im.mediaType || 'image/png' })),
     warnings,
   };
 }

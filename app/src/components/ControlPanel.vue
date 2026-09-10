@@ -18,7 +18,6 @@ import { useKernelApi } from '../composables/useKernelApi.js';
 import { useSlotRouting } from '../composables/useSlotRouting.js';
 import JointList from './JointList.vue';
 import KnobPanel from './KnobPanel.vue';
-import VerdictBar from './VerdictBar.vue';
 
 const { state } = useProjectStore();
 const api = useKernelApi();
@@ -104,8 +103,10 @@ async function loadMesh() {
   const p = glbPath.value.trim();
   if (!p) { state.error = 'choose a .glb mesh first'; return; }
   state.busy = true; state.error = null; note.value = '';
-  // The list locks and shows the decompose phase while the kernel parses +
-  // clusters; it unlocks (selectable) once the settled joint map arrives.
+  // The 3D view and knobs lock and the phase reads 'decompose' while the kernel
+  // parses + clusters. Staged discovery then keeps its OWN lock (`refine:start` sets
+  // `discovering` for stage 1, and `discover:stage` drops it when stage 2 begins —
+  // stage 2 captures no frames, so there is no camera to collide with).
   state.discovering = true; state.phase = 'decompose';
   try {
     const r = await api.loadProject(p);
@@ -118,9 +119,19 @@ async function loadMesh() {
     state.viewer = r.viewer;
     state.validation = null;
     note.value = `discovered ${r.joints.length} joint units · ${r.stats.count} nodes`;
-    if (r.joints.length) await selectJoint(r.joints[0].id);
+    // Discovery is staged: at load every record is still a CANDIDATE (the battery is
+    // deferred to stage 2), so there is nothing trustworthy to highlight yet. Select
+    // the first joint that has actually been checked, and otherwise let the viewer
+    // stay empty until stage 2 settles one — auto-selecting a candidate would drive
+    // the preview pivot off a membership the checks may still revise.
+    const ready = r.joints.find((j) => j.status !== 'candidate');
+    if (ready) await selectJoint(ready.id);
   } catch (e) { state.error = e.message; }
-  finally { state.busy = false; state.discovering = false; state.phase = null; }
+  // Only clear the lock if discovery is not already running. The server fires
+  // autoRefine on a setImmediate, so its `refine:start` beat can reach this tab
+  // BEFORE this fetch resolves — and an unconditional clear here would unlock the
+  // 3D view in the middle of stage 1, while the render farm is driving the camera.
+  finally { state.busy = false; if (!state.refining) state.discovering = false; state.phase = null; }
 }
 
 async function browseMesh() {
@@ -174,14 +185,12 @@ async function generate() {
 
     <!-- STEP 2 — discovered joints; the 3D view is the primary process surface -->
     <section class="step">
-      <header class="step-head"><span class="num">2</span><span class="title">Controllable joints the AI found</span></header>
+      <header class="step-head"><span class="num">2</span><span class="title">Find the joints</span></header>
       <p class="hint">
-        Missing a joint? Tell the AI in the chatbot. This list is fed by TWO
-        independent producers — one reads the node hierarchy, one renders frames and
-        looks at them — and neither is shown the other's conclusions; when they land
-        on the same part it is recorded as corroboration of one joint, never as a
-        duplicate. The 3D view on the left shows the process as it happens; this list
-        becomes selectable once both settle.
+        Follow the AI assistant in the chatbot to verify each joint's scope: it must
+        contain every part that belongs to it, and nothing that doesn't. Joints
+        appear as dimmed candidates first and become clickable one by one as each
+        one's checks pass.
       </p>
       <p v-if="expectReadout" class="expect" :class="expectReadout.ok ? 'good' : 'warn'"
          :title="'A category guess, checked against what was actually grounded. The guess aims the camera and checks a count; it can never itself become a joint.'">
@@ -195,9 +204,8 @@ async function generate() {
 
     <!-- STEP 3 — verify motion with the knobs (preview pivot; needs no controller) -->
     <section class="step">
-      <header class="step-head"><span class="num">3</span><span class="title">Verify each joint's controller</span></header>
-      <p class="hint">Select each joint and watch the 3D mesh on the left. If something looks wrong, message or screenshot the chatbot to ask the AI for a fix.</p>
-      <VerdictBar />
+      <header class="step-head"><span class="num">3</span><span class="title">Control the joints</span></header>
+      <p class="hint">Follow the AI assistant in the chatbot to drive each joint's motion: confirm it moves as expected and that nothing is broken.</p>
       <KnobPanel />
     </section>
 

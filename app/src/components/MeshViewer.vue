@@ -4,7 +4,7 @@
 // joint's own nodes (rotor spin w/ CCW-CW direction, gimbal pitch/yaw, hinge
 // angle) and publish readouts back to the store. Also renders the active
 // joint's viewer-overlay slot (spin-axis marker at the joint anchor).
-import { onMounted, onBeforeUnmount, ref, watch } from 'vue';
+import { nextTick, onMounted, onBeforeUnmount, ref, watch } from 'vue';
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
@@ -23,6 +23,8 @@ const api = useKernelApi();
 const container = ref(null);
 const status = ref('');
 const hover = ref(null);   // marker tooltip { id,label,type,status,x,y }
+const inkRef = ref(null);  // 2D annotation canvas layered over the WebGL view
+const textInput = ref(null);
 
 let renderer, scene, camera, orbit, clock, raf = 0;
 let drone = null, center = new THREE.Vector3(), radius = 1;
@@ -85,6 +87,7 @@ function resize() {
   renderer.setSize(w, h);
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
+  sizeInk();   // the annotation layer tracks the panel; marks stay put (normalised)
 }
 
 function tick() {
@@ -102,7 +105,161 @@ function tick() {
 function captureFrame() {
   if (!renderer) return null;
   renderer.render(scene, camera);
-  return renderer.domElement.toDataURL('image/png');
+  const gl = renderer.domElement;
+  // The human's pen rides along: composite the annotation layer over the WebGL
+  // buffer so a screenshot shows exactly what the human was pointing at. The AI's
+  // own frames (captureAt / captureMotion) read the buffer directly and stay
+  // clean — a human's mark is a message, not evidence.
+  const ink = inkRef.value;
+  if (!ink || !marks.value.length) return gl.toDataURL('image/png');
+  const out = document.createElement('canvas');
+  out.width = gl.width; out.height = gl.height;
+  const ctx = out.getContext('2d');
+  ctx.drawImage(gl, 0, 0);
+  ctx.drawImage(ink, 0, 0, out.width, out.height);
+  return out.toDataURL('image/png');
+}
+
+// ---- human annotation layer: pens over the 3D view --------------------------
+// Marks live on a 2D canvas layered ABOVE the WebGL view, stored in NORMALISED
+// coordinates so they survive a panel resize, and are composited into the
+// screenshot the chat attaches (captureFrame). With a pen armed the layer takes
+// the pointer (orbit stays untouched underneath); with none it is click-through.
+// Icons are inline SVG paths on a 20x20 grid so every pen reads at the same visual
+// weight as the colour swatch beside it — unicode glyphs rendered too small next
+// to the solid block, and the rectangle glyph was a flat bar, not the near-square
+// the tool actually draws.
+const TOOLS = [
+  { id: 'arrow', path: 'M3 10 H16 M16 10 L11 5.5 M16 10 L11 14.5', title: 'Arrow — drag from tail to head' },
+  { id: 'rect', path: 'M4 4 H16 V16 H4 Z', title: 'Rectangle — drag corner to corner' },
+  { id: 'curve', path: 'M3 13 C6 3, 8 17, 11 9 C13 4, 15 6, 17 8', title: 'Free curve — drag to draw' },
+  { id: 'text', path: 'M5 5 H15 M10 5 V16', title: 'Text — click, type, Enter places it' },
+];
+const tool = ref(null);            // armed pen, or null = orbit as usual
+const inkColor = ref('#ff3b30');
+const marks = ref([]);             // committed marks, normalised 0..1
+let draft = null;                  // the mark currently being drawn
+const textAt = ref(null);          // { x, y } css px where a text mark is typed
+const textDraft = ref('');
+
+function sizeInk() {
+  const c = inkRef.value;
+  if (!c || !container.value) return;
+  const dpr = window.devicePixelRatio || 1;
+  const w = container.value.clientWidth, h = container.value.clientHeight;
+  c.width = Math.max(1, Math.round(w * dpr));
+  c.height = Math.max(1, Math.round(h * dpr));
+  c.style.width = `${w}px`; c.style.height = `${h}px`;
+  redrawInk();
+}
+
+function drawMark(ctx, m, w, h) {
+  ctx.strokeStyle = m.color; ctx.fillStyle = m.color;
+  ctx.lineWidth = 2.5; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  if (m.kind === 'arrow') {
+    const x0 = m.x0 * w, y0 = m.y0 * h, x1 = m.x1 * w, y1 = m.y1 * h;
+    ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+    const ang = Math.atan2(y1 - y0, x1 - x0);
+    const head = 12;
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x1 - head * Math.cos(ang - 0.42), y1 - head * Math.sin(ang - 0.42));
+    ctx.lineTo(x1 - head * Math.cos(ang + 0.42), y1 - head * Math.sin(ang + 0.42));
+    ctx.closePath(); ctx.fill();
+  } else if (m.kind === 'rect') {
+    ctx.strokeRect(
+      Math.min(m.x0, m.x1) * w, Math.min(m.y0, m.y1) * h,
+      Math.abs(m.x1 - m.x0) * w, Math.abs(m.y1 - m.y0) * h,
+    );
+  } else if (m.kind === 'curve') {
+    if ((m.pts || []).length < 2) return;
+    ctx.beginPath();
+    m.pts.forEach(([px, py], i) => (i ? ctx.lineTo(px * w, py * h) : ctx.moveTo(px * w, py * h)));
+    ctx.stroke();
+  } else if (m.kind === 'text') {
+    ctx.font = `${m.px}px ui-monospace, monospace`;
+    ctx.textBaseline = 'top';
+    ctx.fillText(m.text, m.x * w, m.y * h);
+  }
+}
+
+function redrawInk() {
+  const c = inkRef.value;
+  const ctx = c ? c.getContext('2d') : null;
+  if (!c || !ctx) return;
+  const dpr = window.devicePixelRatio || 1;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, c.width / dpr, c.height / dpr);
+  const w = c.width / dpr, h = c.height / dpr;
+  for (const m of marks.value) drawMark(ctx, m, w, h);
+  if (draft) drawMark(ctx, draft, w, h);
+}
+
+function inkPos(ev) {
+  const r = inkRef.value.getBoundingClientRect();
+  return {
+    x: (ev.clientX - r.left) / r.width, y: (ev.clientY - r.top) / r.height,
+    cx: ev.clientX - r.left, cy: ev.clientY - r.top,
+  };
+}
+
+function inkDown(ev) {
+  if (!tool.value) return;
+  ev.preventDefault();
+  const p = inkPos(ev);
+  if (tool.value === 'text') {
+    textAt.value = { x: p.cx, y: p.cy };
+    textDraft.value = '';
+    nextTick(() => textInput.value?.focus());
+    return;
+  }
+  draft = tool.value === 'curve'
+    ? { kind: 'curve', pts: [[p.x, p.y]], color: inkColor.value }
+    : { kind: tool.value, x0: p.x, y0: p.y, x1: p.x, y1: p.y, color: inkColor.value };
+  inkRef.value.setPointerCapture?.(ev.pointerId);
+  redrawInk();
+}
+
+function inkMove(ev) {
+  if (!draft) return;
+  const p = inkPos(ev);
+  if (draft.kind === 'curve') draft.pts.push([p.x, p.y]);
+  else { draft.x1 = p.x; draft.y1 = p.y; }
+  redrawInk();
+}
+
+function inkUp() {
+  if (!draft) return;
+  const m = draft;
+  draft = null;
+  // A click that barely moved is a slip, not a mark: drop it.
+  const real = m.kind === 'curve' ? m.pts.length > 2 : Math.hypot(m.x1 - m.x0, m.y1 - m.y0) > 0.01;
+  if (real) marks.value = [...marks.value, m];
+  redrawInk();
+}
+
+function commitText() {
+  const at = textAt.value;
+  const t = textDraft.value.trim();
+  textAt.value = null;
+  textDraft.value = '';
+  if (!at || !t || !inkRef.value) return;
+  const r = inkRef.value.getBoundingClientRect();
+  marks.value = [...marks.value, { kind: 'text', x: at.x / r.width, y: at.y / r.height, text: t, px: 14, color: inkColor.value }];
+  redrawInk();
+}
+
+function toggleTool(id) {
+  tool.value = tool.value === id ? null : id;
+  draft = null;
+  textAt.value = null;
+  redrawInk();
+}
+
+function clearMarks() {
+  marks.value = [];
+  draft = null;
+  redrawInk();
 }
 
 // ---- phase-3 pose-driven capture --------------------------------------------
@@ -678,10 +835,9 @@ function publishGimbal(pitch, yaw, now) {
 function applyPreview(dt) {
   const now = performance.now();
   const j = state.joints.find((x) => x.id === state.activeJointId);
-  if (!j || !drone) { teardownPivot(); endSweep(); return; }
+  if (!j || !drone) { teardownPivot(); return; }
   ensurePivot(j);
   if (!pivot) { publishGimbal(0, 0, now); return; }
-  if (applySweep(now)) return;   // a fan sweep owns the pivot while it runs
   const kv = state.knobValues;
 
   if (j.type === 'rotor') {
@@ -703,54 +859,6 @@ function applyPreview(dt) {
     pivot.rotation.z = Number(kv.angle || 0) * DEG2RAD;
     publishGimbal(0, 0, now);
   }
-}
-
-// ---- fan sweep: answer "which parts spin" by watching, not by reading -------
-// The knobs drive the pivot from human input; a sweep drives the SAME pivot once
-// through the joint's range on its own, so the membership claim (these nodes move
-// together, about this axis) is verified by eye in one gesture. It owns the pivot
-// for its duration (applyPreview defers), then hands it back at rest pose.
-let sweepJointId = null;
-let sweepStart = 0;
-let sweepUntil = 0;
-const SWEEP_SEC = 2.6;
-
-const sweepAmplitude = (j) => (j.type === 'gimbal' ? 25 : 35);   // degrees, there-and-back
-
-function startSweep(id) {
-  const j = state.joints.find((x) => x.id === id);
-  if (!j || !drone || state.discovering) return;
-  ensurePivot(j);
-  if (!pivot) return;
-  sweepJointId = id;
-  sweepStart = performance.now();
-  sweepUntil = sweepStart + SWEEP_SEC * 1000;
-  status.value = `sweeping ${j.label}…`;
-}
-
-function endSweep() {
-  if (!sweepJointId) return;
-  sweepJointId = null; sweepUntil = 0;
-  teardownPivot();
-  status.value = '';
-}
-
-// Returns true while it owns the pivot. Rotor = one full slow revolution (its
-// claim is continuous spin); gimbal/hinge = one sinusoidal there-and-back fan.
-function applySweep(now) {
-  if (!sweepJointId) return false;
-  const j = state.joints.find((x) => x.id === sweepJointId);
-  if (!j || !pivot || now >= sweepUntil) { endSweep(); return false; }
-  const t = (now - sweepStart) / 1000;
-  if (j.type === 'rotor') {
-    pivot.rotation.z = ((t / SWEEP_SEC) * 360) * DEG2RAD;
-  } else if (j.type === 'gimbal') {
-    pivot.rotation.x = sweepAmplitude(j) * Math.sin((t / SWEEP_SEC) * Math.PI * 2) * DEG2RAD;
-    pivot.rotation.z = 0;
-  } else {
-    pivot.rotation.z = sweepAmplitude(j) * Math.sin((t / SWEEP_SEC) * Math.PI * 2) * DEG2RAD;
-  }
-  return true;
 }
 
 // Viewer-overlay slot: a small axes marker at the active joint's anchor.
@@ -1013,7 +1121,6 @@ let liveGroup = null;
 let liveGlyph = null;
 let liveStops = new Map();     // viewId -> { eyeV, targetV }
 let liveMarks = new Map();     // proposal id -> mesh (a claim, drawn dashed)
-const liveNote = ref('');      // one-line narration for the overlay banner
 let liveCursor = 0;            // visionFeed beats already animated
 let liveClearTimer = 0;
 
@@ -1024,7 +1131,6 @@ function clearLive() {
     liveGroup.traverse?.((c) => { c.geometry?.dispose?.(); c.material?.dispose?.(); });
   }
   liveGroup = null; liveGlyph = null; liveStops = new Map(); liveMarks = new Map();
-  liveNote.value = '';
 }
 
 function ensureLive() {
@@ -1100,20 +1206,15 @@ function liveVerdict(msg) {
 
 function handleVision(msg) {
   switch (msg.kind) {
-    case 'vision:start': clearLive(); liveNote.value = 'vision is looking…'; break;
-    case 'vision:round': liveNote.value = `vision round ${(msg.round ?? 0) + 1}/${msg.maxRounds ?? 1}`; break;
-    case 'vision:plan': livePlan(msg.views || []); liveNote.value = `camera path planned · ${(msg.views || []).length} view(s)`; break;
-    case 'vision:frame': liveFrame(msg); liveNote.value = `frame ${msg.id} drawn (${msg.mode})`; break;
-    case 'vision:ask': liveNote.value = `asking the model with ${msg.frames} frame(s)…`; break;
-    case 'vision:reply': liveNote.value = `model replied${msg.model ? ` · ${msg.model}` : ''}`; break;
-    case 'vision:propose': livePropose(msg.entries || []); liveNote.value = `${(msg.entries || []).length} proposal(s) grounded`; break;
-    case 'vision:verdict': liveVerdict(msg); liveNote.value = `battery: +${msg.added ?? 0} accepted · ${(msg.rejected || []).length} disposed`; break;
+    case 'vision:start': clearLive(); break;
+    case 'vision:plan': livePlan(msg.views || []); break;
+    case 'vision:frame': liveFrame(msg); break;
+    case 'vision:propose': livePropose(msg.entries || []); break;
+    case 'vision:verdict': liveVerdict(msg); break;
     case 'vision:end':
-      liveNote.value = msg.ok ? `vision done · +${msg.added ?? 0} joint(s)` : `vision stopped · ${msg.reason || msg.code || ''}`;
       liveClearTimer = setTimeout(clearLive, 4000);
       break;
     case 'vision:skip':
-      liveNote.value = `vision skipped · ${msg.error || msg.code || ''}`;
       liveClearTimer = setTimeout(clearLive, 4000);
       break;
     default: break;
@@ -1176,7 +1277,6 @@ function flashVerdict(f) {
 }
 
 watch(() => state.verdictFlash, (f) => { if (f) flashVerdict(f); });
-watch(() => state.sweepReq, (r) => { if (r?.id) startSweep(r.id); });
 
 async function reload() {
   try {
@@ -1205,6 +1305,7 @@ watch(() => state.discovering, (d) => {
 onMounted(() => {
   initScene();
   tick();
+  sizeInk();
   addEventListener('resize', resize);
   registerViewerCapture(captureFrame);
   registerViewerCaptureAt(captureAt);
@@ -1233,15 +1334,35 @@ onBeforeUnmount(() => {
 <template>
   <div class="viewer">
     <div ref="container" class="canvas"></div>
+    <!-- annotation layer: click-through unless a pen is armed -->
+    <canvas
+      ref="inkRef" class="ink" :class="{ on: !!tool }"
+      @pointerdown="inkDown" @pointermove="inkMove" @pointerup="inkUp" @pointercancel="inkUp"
+    ></canvas>
+    <div class="pens">
+      <button
+        v-for="t in TOOLS" :key="t.id" type="button"
+        :class="{ on: tool === t.id }" :title="t.title" @click="toggleTool(t.id)"
+      >
+        <svg
+          class="pic" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.9"
+          stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"
+        ><path :d="t.path" /></svg>
+      </button>
+      <input type="color" v-model="inkColor" title="Ink colour" />
+      <button v-if="marks.length" type="button" class="clear" title="Clear every mark" @click="clearMarks">✕</button>
+    </div>
+    <input
+      v-if="textAt" ref="textInput" v-model="textDraft" class="inktext"
+      :style="{ left: textAt.x + 'px', top: textAt.y + 'px', color: inkColor }"
+      placeholder="type… Enter places · Esc cancels"
+      @keydown.enter.prevent="commitText"
+      @keydown.escape.prevent="textAt = null"
+      @blur="commitText"
+    />
     <div v-if="status" class="status">{{ status }}</div>
     <div v-if="hover" class="tip" :style="{ left: hover.x + 12 + 'px', top: hover.y + 12 + 'px' }">
       {{ hover.label }} · {{ hover.type }} · {{ hover.status }}
-    </div>
-    <!-- live vision-campaign theater: the AI narrates its own look-around -->
-    <div v-if="state.visionActive" class="livebar">
-      <span class="ldot"></span>
-      <span class="lnote">{{ liveNote || 'vision is looking…' }}</span>
-      <span class="llock">input locked</span>
     </div>
     <div v-if="!state.viewer.glb" class="hint">Load a mesh to begin</div>
   </div>
@@ -1264,15 +1385,30 @@ onBeforeUnmount(() => {
   border-radius: 6px; padding: 3px 7px; font-family: ui-monospace, monospace; font-size: 11px;
 }
 
-/* vision-round camera tour filmstrip: the exact frames the model was handed */
-.livebar {
+/* annotation layer + pens: the human's markup over the 3D view */
+.ink { position: absolute; inset: 0; z-index: 5; pointer-events: none; }
+.ink.on { pointer-events: auto; cursor: crosshair; }
+.pens {
   position: absolute; top: 8px; left: 50%; transform: translateX(-50%); z-index: 20;
-  display: flex; align-items: center; gap: 8px; max-width: 92%;
+  display: flex; align-items: center; gap: 3px;
   background: var(--overlay-bg); border: 1px solid var(--border-2); border-radius: 8px;
-  padding: 5px 10px; font-family: ui-monospace, monospace; font-size: 11px;
+  padding: 4px 6px;
 }
-.livebar .ldot { width: 8px; height: 8px; border-radius: 50%; background: #b58900; animation: lpulse 1.1s infinite; flex: none; }
-@keyframes lpulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
-.livebar .lnote { color: var(--fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.livebar .llock { color: var(--muted); flex: none; }
+.pens button {
+  width: 26px; height: 24px; border: 1px solid transparent; border-radius: 6px;
+  background: transparent; color: var(--text-dim); cursor: pointer; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.pens button .pic { width: 18px; height: 18px; display: block; }
+.pens button:hover { background: var(--surface-3); }
+.pens button.on { border-color: var(--accent-2); color: var(--text); background: var(--item-active); }
+.pens button.clear { color: var(--muted); font-size: 12px; }
+.pens input[type='color'] {
+  width: 26px; height: 24px; padding: 0; border: none; background: transparent; cursor: pointer;
+}
+.inktext {
+  position: absolute; z-index: 30; min-width: 150px;
+  background: var(--overlay-bg); border: 1px dashed currentColor; border-radius: 4px;
+  padding: 2px 5px; font-family: ui-monospace, monospace; font-size: 14px; outline: none;
+}
 </style>

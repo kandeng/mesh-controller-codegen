@@ -426,6 +426,17 @@ export function createDshAgent(kernel) {
     isBusy() { return running || waiting > 0; },
     queueDepth() { return waiting; },
 
+    // Boundary yield for the staged discovery orchestrator: resolves once no turn
+    // is running and no send is chained behind one. Ordering never needed this —
+    // the FIFO chain already guarantees a queued user turn completes before the
+    // next lane prompt — what this buys the orchestrator is a moment where the
+    // assistant has the floor to ITSELF (so a served request can reshape the plan)
+    // before the next stage's prompt is issued.
+    async idle() {
+      await chain;
+      while (running || waiting > 0) await new Promise((r) => setTimeout(r, 100));
+    },
+
     async dispose() {
       disposed = true;
       try { muxWs?.close(); } catch { /* ignore */ }
