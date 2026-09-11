@@ -59,6 +59,13 @@ export function useAgentSocket() {
         if (cur) cur.text += msg.text;
         else { streaming = true; state.transcript.push({ role: 'assistant', text: msg.text, ts: Date.now(), streaming: true }); }
       } else if (msg.type === 'tool') {
+        // One line of the agent's own tool activity, pushed as its own transcript
+        // entry so it appears in the order it happened. ChatPanel groups a RUN of
+        // these into one foldable log block (first TOOL_LINES open, the rest behind
+        // a toggle): a single turn can run 50+ commands, and a raw
+        // `bash {"command":…}` line is longer than the answer it produced, so an
+        // unfolded log would push that answer off the screen. Kept rather than
+        // dropped because it is the only evidence of what the agent actually did.
         const label = typeof msg.view === 'string' && msg.view ? msg.view : `${msg.kind}${msg.name ? ` ${msg.name}` : ''}`;
         state.transcript.push({ role: 'tool', text: label, ts: Date.now() });
       } else if (msg.type === 'transcript') {

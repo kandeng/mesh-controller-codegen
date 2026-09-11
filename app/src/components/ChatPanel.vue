@@ -24,24 +24,43 @@ const lightbox = ref(null);   // { url, name } of the image shown full-size
 const taRef = ref(null);      // composer textarea
 const userH = ref(null);      // manual composer height in px; null = auto-grow
 
-// ---- folding: screenshot stacks + over-long messages -------------------------
+// ---- folding: screenshot stacks + over-long messages + the tool log ----------
 // A vision campaign posts one assistant message PER rendered frame, so a round
 // lands as a vertical run of near-identical thumbnails. Those runs are grouped
 // into a STACK that shows only its first frame until opened; and any message
 // longer than LONG_LINES lines is clipped to a readable block. Both are pure
 // presentation — the transcript itself is untouched, so nothing is lost.
+//
+// The agent's TOOL LOG gets the same treatment and the same reason. One turn ran
+// 54 commands on this project, each a raw `bash {"command":"cd … && grep -n …"}`
+// argument longer than the sentence it produced — unfolded, the log buries the
+// answer. So a run of tool lines becomes ONE block showing its first TOOL_LINES,
+// with the rest behind the very ⌄/⌃ toggle the long-message fold uses. It is
+// deliberately shown rather than hidden: it is the only evidence of what the
+// agent actually did, and a human debugging a wrong answer needs it reachable.
 const LONG_LINES = 10;
+const TOOL_LINES = 5;
 const openStacks = ref(new Set());   // stack keys currently expanded
 const openLong = ref(new Set());     // message keys currently expanded
+const openTools = ref(new Set());    // tool-log blocks currently expanded
 
 // Group the transcript into render rows: a maximal run of consecutive assistant
-// messages carrying screenshots becomes one `stack` row; everything else stays a
-// plain `msg` row. Keys are the transcript index of the row's first message, so
-// they are stable as the transcript grows.
+// messages carrying screenshots becomes one `stack` row, a maximal run of
+// consecutive tool-activity entries becomes one `tools` row, and everything else
+// stays a plain `msg` row. Keys are the transcript index of the row's first
+// message, so they are stable as the transcript grows.
 const rows = computed(() => {
   const out = [];
   let stack = null;
+  let tools = null;
   state.transcript.forEach((m, i) => {
+    if (m.role === 'tool') {
+      stack = null; // a tool line ends a screenshot run, as any other row does
+      if (!tools) { tools = { type: 'tools', key: `t${i}`, items: [] }; out.push(tools); }
+      tools.items.push({ m, i });
+      return;
+    }
+    tools = null;
     const isShot = m.role === 'assistant' && (m.attachments || []).length > 0;
     if (isShot) {
       if (!stack) { stack = { type: 'stack', key: `s${i}`, items: [] }; out.push(stack); }
@@ -62,9 +81,15 @@ function toggleIn(set, key) {
 }
 function toggleStack(key) { toggleIn(openStacks.value, key); }
 function toggleLong(key) { toggleIn(openLong.value, key); }
+function toggleTools(key) { toggleIn(openTools.value, key); }
 function maybeToggleLong(m, key) { if (isLong(m)) toggleLong(key); }
 
 const visibleShots = (row) => (openStacks.value.has(row.key) ? row.items : row.items.slice(0, 1));
+const visibleTools = (row) => (openTools.value.has(row.key) ? row.items : row.items.slice(0, TOOL_LINES));
+// The persisted half of the same log: an assistant entry restored from the session
+// store carries its turn's commands in `tools` (a resume has no live rows to show).
+// Same cap, keyed by the row, so the two renderings never share one toggle.
+const visibleToolList = (list, key) => (openTools.value.has(key) ? list : list.slice(0, TOOL_LINES));
 
 // Click semantics for a stacked frame: EVERY thumbnail (first, middle, last alike)
 // zooms to the lightbox — a picture is for looking at. Folding / expanding the
@@ -201,7 +226,13 @@ onBeforeUnmount(() => { removeEventListener('keydown', onKeydown); });
         Tip: paste (Ctrl+V) or upload a viewer screenshot to report a visual bug.
       </div>
       <template v-for="row in rows" :key="row.key">
-        <div v-if="row.type === 'msg' && row.m.role === 'tool'" class="tool-line" :title="row.m.text">⚙ {{ row.m.text }}</div>
+        <!-- the agent's tool log: first TOOL_LINES lines open, the rest folded -->
+        <div v-if="row.type === 'tools'" class="toolblock">
+          <div v-for="it in visibleTools(row)" :key="it.i" class="tool-line" :title="it.m.text">⚙ {{ it.m.text }}</div>
+          <button v-if="row.items.length > TOOL_LINES" type="button" class="foldtoggle" @click="toggleTools(row.key)">
+            {{ openTools.has(row.key) ? '⌃ collapse' : `⌄ show all ${row.items.length} lines` }}
+          </button>
+        </div>
         <div v-else-if="row.type === 'msg'" class="msg" :class="[row.m.role, { streaming: row.m.streaming, cmd: row.m.command }]">
           <div class="bubble">
             <div v-if="row.m.attachments?.length" class="shots">
@@ -209,7 +240,10 @@ onBeforeUnmount(() => { removeEventListener('keydown', onKeydown); });
             </div>
             <div v-if="row.m.text" class="txt" :class="{ foldable: isLong(row.m) }" @click="maybeToggleLong(row.m, row.key)"><span class="txtbody" :class="{ clamped: isLong(row.m) && !openLong.has(row.key) }">{{ row.m.text }}</span><span v-if="isLong(row.m)" class="foldhint">{{ openLong.has(row.key) ? '⌃ collapse' : `⌄ show all ${lineCount(row.m)} lines` }}</span></div>
             <div v-if="row.m.tools?.length && !row.m.streaming" class="tools">
-              <div v-for="(t, k) in row.m.tools" :key="k" class="tool-line">⚙ {{ t }}</div>
+              <div v-for="(t, k) in visibleToolList(row.m.tools, row.key)" :key="k" class="tool-line" :title="t">⚙ {{ t }}</div>
+              <button v-if="row.m.tools.length > TOOL_LINES" type="button" class="foldtoggle" @click="toggleTools(row.key)">
+                {{ openTools.has(row.key) ? '⌃ collapse' : `⌄ show all ${row.m.tools.length} lines` }}
+              </button>
             </div>
           </div>
         </div>
@@ -309,8 +343,18 @@ onBeforeUnmount(() => { removeEventListener('keydown', onKeydown); });
 .shotnote { font-size: 12px; color: var(--muted); margin-top: 3px; }
 .stacktoggle { display: block; width: 100%; margin-top: 6px; background: transparent; border: 1px dashed var(--border-2); color: var(--muted); border-radius: 6px; font-size: 11px; padding: 3px 6px; cursor: pointer; }
 .stacktoggle:hover { color: var(--text); border-color: var(--border-accent); }
+/* Tool log. One command per line, CLIPPED rather than wrapped: a raw
+   `bash {"command":…}` argument is one long token, and wrapping it would spend
+   exactly the vertical space the fold exists to save. The full line stays on the
+   title attribute, so hovering still reads it end to end. The block is full width
+   (not a `.msg` flex row) because that width is what the ellipsis clips against. */
+.toolblock { margin: 4px 0; }
 .tool-line { color: var(--muted); font-family: ui-monospace, monospace; font-size: 11px; padding: 1px 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tools { margin-top: 6px; border-top: 1px dashed var(--border-2); padding-top: 4px; }
+/* Same words, same glyph, same weight as the long-message `.foldhint`, so the
+   three folds in this panel read as one behaviour rather than three. */
+.foldtoggle { display: block; background: transparent; border: 0; padding: 2px 8px; color: var(--muted); font-size: 11px; font-style: italic; cursor: pointer; }
+.foldtoggle:hover { color: var(--text); }
 .thumbs { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; padding: 6px 0 0; }
 .thumb { position: relative; }
 .thumb img { width: 52px; height: 52px; object-fit: cover; border-radius: 6px; border: 1px solid var(--border-2); display: block; }
