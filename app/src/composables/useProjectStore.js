@@ -305,7 +305,7 @@ function connectEvents() {
           ? `DSH is asking the remote ${state.model} AI model to detect the joints — one producer reads the node hierarchy while another looks at rendered frames. Please wait …`
           : `DSH is asking the remote ${msg.lanes?.vision === false ? state.model : state.visionModel} AI model to detect the joints. Please wait …`);
         notify(msg.lanes?.text !== false && msg.lanes?.vision !== false
-          ? 'two independent producers are looking at the mesh now — one reads the node hierarchy, one renders frames and looks at them. They will agree on a CANDIDATE list first, which appears in step (2) dimmed; each candidate is then checked one at a time, and the chat is served between them'
+          ? 'Two independent producers are looking at the mesh now — one extracts the embedded glTF JSON to read the internal node hierarchy, the other renders frames and looks at them. They will agree on a CANDIDATE list first, which appears in step (2) dimmed; each candidate is then checked one at a time, and the chat is served between them.\n\nThe whole process takes a few minutes — please wait patiently; I will report here as each step lands.'
           : `refinement started with ${msg.lanes?.vision === false ? 'the semantic lane only' : 'the vision lane only'}`);
       } else if (msg.kind === 'discover:look') {
         // The steered second look starting. `discovering` is still true, so the
