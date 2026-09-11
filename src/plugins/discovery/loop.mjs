@@ -813,7 +813,9 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
           const et = await propose(ep.text, ep.images);
           expReply = et?.reply ?? null;
           expModel = et?.model ?? null;
-          const parsedExp = parseExpectation(expReply, { frameIds: (ep.frames || []).map((f) => f.id) });
+          // The SAME viewport the prompt was built with, so a regionBox the model
+          // drew in pixels is divided by the frame it was actually drawn on.
+          const parsedExp = parseExpectation(expReply, { frameIds: (ep.frames || []).map((f) => f.id), viewport });
           expWarnings.push(...parsedExp.warnings.map((w) => `category turn: ${w}`));
           expectation = parsedExp.expectation;
           // parseExpectation hands back an empty sentinel for a reply it could not

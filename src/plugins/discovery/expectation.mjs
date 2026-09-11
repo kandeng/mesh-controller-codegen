@@ -29,6 +29,7 @@
 //
 // Pure: builds a prompt, parses a reply, compares counts. The transport is the
 // same `propose` effect the discovery turn uses, so this is testable headless.
+import { normBox } from './grounding.mjs';
 import { TYPES } from './propose-core.mjs';
 import { frameLine, sceneFacts, sceneHeader } from './vision-prompt.mjs';
 
@@ -173,16 +174,32 @@ export const isExpectationPrompt = (text) => String(text || '').includes(EXPECTA
 const str = (v, max) => (typeof v === 'string' && v.trim() ? v.trim().slice(0, max) : '');
 const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);
 
-// A box is only usable if it is a real, ordered, in-frame rectangle. Anything
-// else is dropped rather than repaired: a box we "fixed" would aim a camera at a
-// place the model never indicated.
-function normInstanceBox(v) {
-  const a = Array.isArray(v) ? v : (Array.isArray(v?.box) ? v.box : null);
-  if (!a || a.length !== 4) return null;
-  const [x0, y0, x1, y1] = a.map(Number);
-  if (![x0, y0, x1, y1].every(Number.isFinite)) return null;
-  if (x0 < 0 || y0 < 0 || x1 > 1 || y1 > 1 || x1 <= x0 || y1 <= y0) return null;
-  return [x0, y0, x1, y1];
+// A box is only usable if it is a real, ordered, in-frame rectangle — but
+// "in-frame" is a UNIT question before it is a value question. Models switch
+// between 0..1 fractions and pixel counts without warning, so the convention is
+// inferred by the same `normBox` the discovery turn already uses, and which
+// `regionsFromExpectations` will apply to this very box again downstream: the
+// two conventions are decidable because their ranges barely overlap, no fraction
+// exceeds 2 and no pixel box exceeds the frame it was drawn on. Normalizing is
+// idempotent, so the second pass sees fractions and changes nothing.
+//
+// Normalizing instead of dropping matters here because a dropped instance is not
+// a no-op. It removes a place from round 2's close-up plan and a term from the
+// expected-vs-found count, so the campaign quietly stops looking for a part it
+// was explicitly told about — and the human sees one warning line where a
+// hypothesis used to be.
+//
+// What is still refused, and deliberately: a box beyond the frame it was drawn
+// on is NEITHER convention, and repairing it would aim a camera at a place the
+// model never indicated. `normBox` returns null for that, and so do we. Mild
+// overshoot is a different case — a VLM's 10% slop is normal — so it is clamped,
+// exactly as the discovery turn clamps it.
+function normInstanceBox(v, viewport) {
+  const raw = Array.isArray(v) ? v : (Array.isArray(v?.box) ? v.box : null);
+  if (!raw || raw.length !== 4) return null;
+  const b = normBox(raw, viewport);
+  if (!b) return null;
+  return { box: [b.x0, b.y0, b.x1, b.y1], pixels: !!b.pixels };
 }
 
 // Parse + validate the reply. Everything malformed is DROPPED WITH A WARNING and
@@ -193,7 +210,14 @@ function normInstanceBox(v) {
 // `frameIds` is the set of frames actually sent. An instance pointing at a frame
 // that was never attached is unresolvable by construction, so it is dropped here
 // rather than becoming an unresolved region later.
-export function parseExpectation(reply, { frameIds = null } = {}) {
+//
+// `viewport` is the size those frames were drawn at, and it is only needed to
+// read a regionBox the model gave in pixels. Omit it and `normBox` falls back to
+// VIEWPORT, which is what the campaign renders at; pass it (as loop.mjs does,
+// from the same value it handed buildExpectationPrompt) when the round was
+// planned at a different size, so the prompt and the parser agree about what one
+// pixel means.
+export function parseExpectation(reply, { frameIds = null, viewport } = {}) {
   const warnings = [];
   const empty = { category: '', confidence: 0, summary: '', instances: [], doubts: [], alternatives: [] };
   const text = String(reply == null ? '' : reply);
@@ -238,8 +262,13 @@ export function parseExpectation(reply, { frameIds = null } = {}) {
       warnings.push(`instance[${i}] (${type}) names frame "${frameId || '(none)'}", which was not sent — dropped`);
       return;
     }
-    const regionBox = normInstanceBox(ins.regionBox ?? ins.box ?? null);
-    if (!regionBox) { warnings.push(`instance[${i}] (${type}) has no usable regionBox in 0..1 — dropped`); return; }
+    const boxed = normInstanceBox(ins.regionBox ?? ins.box ?? null, viewport);
+    if (!boxed) { warnings.push(`instance[${i}] (${type}) has no usable regionBox — dropped`); return; }
+    // A repair is announced, never absorbed: the same reply read as pixels or as
+    // fractions aims the camera at different places, and which one the model
+    // meant is the one thing we inferred rather than were told.
+    if (boxed.pixels) warnings.push(`instance[${i}] (${type}) drew regionBox in pixels — normalized to fractions`);
+    const regionBox = boxed.box;
     const count = Math.max(1, Math.min(MAX_INSTANCE_COUNT, Math.round(num(ins.count ?? ins.instances ?? 1) ?? 1)));
     if (Number(ins.count) > MAX_INSTANCE_COUNT) warnings.push(`instance[${i}] (${type}) claimed ${ins.count}; capped to ${MAX_INSTANCE_COUNT}`);
     instances.push({

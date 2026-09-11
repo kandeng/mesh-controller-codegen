@@ -1364,7 +1364,7 @@ function makeFakes(replyOf) {
     instances: [
       { type: 'track', count: 2, frameId: surveyFrames[0].id, regionBox: [0, 0, 1, 1] },
       { type: 'rotor', count: 4, frameId: 'v999.photo', regionBox: [0, 0, 0.5, 0.5] },
-      { type: 'rotor', count: 4, frameId: surveyFrames[0].id, regionBox: [0.8, 0.8, 0.2, 0.2] },
+      { type: 'rotor', count: 4, frameId: surveyFrames[0].id, regionBox: [0, 0, 5000, 5000] },
       { type: 'gimbal', count: 99, frameId: surveyFrames[0].id, regionBox: [0.1, 0.1, 0.4, 0.4] },
       'not an object',
     ],
@@ -1374,8 +1374,9 @@ function makeFakes(replyOf) {
     && bad.warnings.some((w) => /track/.test(w) && /not rotor\|gimbal\|hinge/.test(w)), J(bad.warnings));
   ok('G9: an instance naming a frame that was never sent is dropped - it could not be aimed at anyway',
     bad.warnings.some((w) => /v999\.photo/.test(w) && /was not sent/.test(w)));
-  ok('G9: an inverted or out-of-frame box is dropped rather than repaired into a place nobody indicated',
-    bad.warnings.some((w) => /no usable regionBox/.test(w)));
+  ok('G9: a box beyond the frame it was drawn on is STILL dropped - it is neither convention, and repairing it would aim a camera at a place nobody indicated',
+    bad.warnings.some((w) => /no usable regionBox/.test(w))
+    && bad.expectation.instances.every((i) => (i.regionBox || []).every((v) => v >= 0 && v <= 1)), J(bad.warnings));
   ok('G9: an absurd count is capped and a non-object instance is dropped, each with its own warning',
     bad.expectation.instances.find((i) => i.type === 'gimbal')?.count === MAX_INSTANCE_COUNT
     && bad.warnings.some((w) => /capped to/.test(w)) && bad.warnings.some((w) => /was not an object/.test(w)),
@@ -1385,6 +1386,42 @@ function makeFakes(replyOf) {
   ok('G9: a reply that is not JSON at all degrades to NO prior, with the reason recorded',
     (() => { const p = parseExpectation('I think it is probably a drone.', { frameIds: sentIds }); return p.expectation.category === '' && p.expectation.instances.length === 0 && p.warnings.length > 0; })(),
     J(parseExpectation('I think it is probably a drone.', { frameIds: sentIds }).warnings));
+
+  // UNITS. The category turn was the one place where a model slipping between
+  // fractions and pixels used to cost something: its box was dropped outright,
+  // and a dropped instance is not a no-op - it removes a place from round 2's
+  // close-up plan and a term from the expected-vs-found count. The discovery
+  // turn has always inferred the convention through normBox; now both do,
+  // through the SAME function, so the inference cannot drift between them.
+  const units = parseExpectation(J({
+    category: 'quadrotor drone', confidence: 0.9,
+    instances: [
+      { type: 'rotor', count: 4, frameId: surveyFrames[0].id, regionBox: [205, 256, 410, 461] },
+      { type: 'gimbal', count: 1, frameId: surveyFrames[0].id, regionBox: [0.6, 0.7, 0.2, 0.3] },
+    ],
+  }), { frameIds: sentIds, viewport: VIEWPORT });
+  ok('G9: a regionBox drawn in PIXELS is normalized to fractions instead of dropped - and the repair is announced, never absorbed',
+    units.expectation.instances.length === 2
+    && units.expectation.instances[0].regionBox[0] === 205 / VIEWPORT.w
+    && units.expectation.instances[0].regionBox[2] === 410 / VIEWPORT.w
+    && units.expectation.instances[0].regionBox.every((v) => v >= 0 && v <= 1)
+    && units.warnings.some((w) => /in pixels/.test(w) && /normalized to fractions/.test(w)),
+    `${J(units.expectation.instances.map((i) => i.regionBox))} ${J(units.warnings)}`);
+  ok('G9: an inverted box is SORTED rather than dropped - the same leniency the discovery turn has always had',
+    J(units.expectation.instances[1].regionBox) === J([0.2, 0.3, 0.6, 0.7])
+    && !units.warnings.some((w) => /no usable regionBox/.test(w)),
+    J(units.expectation.instances[1].regionBox));
+  ok('G9: a fraction reply is left exactly alone - normalization is idempotent, because grounding applies normBox to this same box again downstream',
+    (() => {
+      const p = parseExpectation(goodReply, { frameIds: sentIds, viewport: VIEWPORT });
+      return J(p.expectation.instances[0].regionBox) === J(box0) && p.warnings.length === 0;
+    })(),
+    J(parseExpectation(goodReply, { frameIds: sentIds, viewport: VIEWPORT }).expectation.instances[0].regionBox));
+  ok('G9: pixels are divided by the frame they were drawn on, so a round planned at another size normalizes to a different place',
+    parseExpectation(J({
+      category: 'quadrotor drone', confidence: 0.9,
+      instances: [{ type: 'rotor', count: 4, frameId: surveyFrames[0].id, regionBox: [205, 256, 410, 461] }],
+    }), { frameIds: sentIds, viewport: { w: 512, h: 512 } }).expectation.instances[0].regionBox[0] === 205 / 512);
 
   ok('G9: a low-confidence, nameless or empty prior is NOT usable - and then the campaign behaves exactly as it did before this lane existed',
     expectationIsUsable(parsed.expectation) === true
