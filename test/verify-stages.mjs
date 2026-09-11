@@ -828,10 +828,47 @@ const freshStage = () => {
   // session each; mux events and cancel are addressed to the turn's own session.
   const dshSrc = readFileSync(new URL('../server/dsh-agent.mjs', import.meta.url), 'utf8');
   ok('S9: lane sends prompt a stateless session of their own — the human session stays purely human',
-    /const sid = opts\?\.origin === 'user' \? sessionId : await createLaneSession\(\);/.test(dshSrc)
+    /const human = opts\?\.origin === 'user';/.test(dshSrc)
+      && /const sid = human \? sessionId : await createLaneSession\(\);/.test(dshSrc)
       && /rpc\('session\.prompt', \{ sessionId: sid, mode: 'queue', content \}\)/.test(dshSrc)
       && /f\.sessionId !== \(turnSid \|\| sessionId\)/.test(dshSrc)
       && /rpc\('session\.cancel', \{ sessionId: turnSid \|\| sessionId \}, 5_000\)/.test(dshSrc));
+  // Thinking is switched off ONLY for a machine turn that carries screenshots.
+  // The condition is pinned here because getting it wrong is silent and costly
+  // in both directions: including a human send with an attachment would cost the
+  // human their reasoned answer, and including a lane turn WITHOUT images would
+  // keep paying ~244s of reasoning on the text lane, which never had the
+  // problem. Omitting the effort is not neutral either — DSH then falls back to
+  // the route default, which is thinking ON (see bailian.patch.yml), so the
+  // effort must also be part of what selectModel caches.
+  ok('S9: thinking is turned off ONLY for a machine turn that carries screenshots — a human attachment and the text lane both keep it',
+    /const effort = \(!human && images\.length\) \? 'off' : null;/.test(dshSrc)
+      && /await selectModel\(model, sid, effort\);/.test(dshSrc)
+      && /\.\.\.\(effort \? \{ reasoningEffort: effort \} : \{\}\)/.test(dshSrc)
+      && /modelBySession\.set\(sid, key\)/.test(dshSrc));
+  // The patch file is the other half of the same decision, and it broke once
+  // already. Declaring reasoningEfforts makes pi-ai treat the model as
+  // reasoning-capable, and pi-ai then sends the SYSTEM PROMPT with role
+  // `developer` (openai-completions.js:787,
+  // `useDeveloperRole = model.reasoning && compat.supportsDeveloperRole`).
+  // This gateway rejects that role outright --
+  //   400 invalid_parameter_error: developer is not one of
+  //       ['system','assistant','user','tool','function']
+  // -- so every turn died before the model saw it, human session and lanes
+  // alike. Nothing in the app named it as a configuration fault; the refinement
+  // simply produced no proposals, which looks exactly like a model that found
+  // nothing. `supportsDeveloperRole: false` keeps the role `system`, and it is
+  // load-bearing ONLY because the efforts are declared -- so the guard is
+  // written as that implication, not as two unrelated facts about the file.
+  const patchSrc = readFileSync(new URL('../bailian.patch.yml', import.meta.url), 'utf8');
+  const declaresEfforts = /^\s+reasoningEfforts:/m.test(patchSrc);
+  ok('S9: the bailian route declares the qwen thinking dialect AND a route default of high — omitting an effort means thinking ON, never "no opinion"',
+    /thinkingFormat:\s*qwen/.test(patchSrc) && /^\s+reasoning:\s*high\s*$/m.test(patchSrc));
+  ok('S9: declaring reasoning efforts REQUIRES supportsDeveloperRole:false — without it this gateway 400s on the `developer` role and EVERY turn dies',
+    !declaresEfforts || /supportsDeveloperRole:\s*false/.test(patchSrc),
+    `reasoningEfforts declared=${declaresEfforts}`);
+  ok('S9: the `off` level is quoted — a bare off: is a YAML 1.1 boolean, and one invalid model invalidates the whole route',
+    /"off":/.test(patchSrc) && !/^\s+off:\s*$/m.test(patchSrc));
   const sockSrc = readFileSync(new URL('../app/src/composables/useAgentSocket.js', import.meta.url), 'utf8');
   const stopFn = sockSrc.slice(sockSrc.indexOf('function stop()'), sockSrc.indexOf('function stop()') + 400);
   ok('S9: the red button sends ONE stop for every case — no discovery special case left',

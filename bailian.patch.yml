@@ -26,6 +26,54 @@
         apiKeyEnv: BAILIAN_API_KEY
         defaultContextWindow: 262144
         defaultMaxTokens: 32768
+        # --- thinking: all three settings below are load-bearing, not decoration --
+        #
+        # This gateway's URL is one pi-ai cannot recognize, so it cannot infer
+        # how the route spells "think". Declaring the dialect is what makes
+        # `enable_thinking` reachable at all — without it there is no way to ask
+        # a turn NOT to think, and the screenshot turns cannot be made fast.
+        compat:
+          thinkingFormat: qwen
+          # Declaring the efforts below makes `model.reasoning` true, and pi-ai
+          # then computes the system role as
+          #   useDeveloperRole = model.reasoning && compat.supportsDeveloperRole
+          # (openai-completions.js:787). This gateway only accepts the roles
+          # system/assistant/user/tool/function, so a `developer` system message
+          # is rejected outright:
+          #   400 invalid_parameter_error: developer is not one of
+          #       ['system','assistant','user','tool','function']
+          # That is not a warning — EVERY turn on the route dies before the model
+          # sees it, which is exactly what happened when these efforts were
+          # declared without this line. `false` is an explicit override: getCompat
+          # does `model.compat.supportsDeveloperRole ?? detected`, so it wins over
+          # whatever pi-ai guesses from the URL. Remove it and the whole agent
+          # goes silent again.
+          supportsDeveloperRole: false
+        # Declaring the dialect makes pi-ai send the parameter UNCONDITIONALLY:
+        # `enable_thinking = !!reasoningEffort`, with no "leave it to the
+        # gateway" case. A route with no default level would therefore silence
+        # thinking for every session that does not name one — the human chat
+        # included. `high` is that default, and it preserves today's behaviour;
+        # a session overrides it per call (dsh-llm-pi-ai resolves
+        # `options.reasoningEffort ?? profile.reasoning`), which is how the
+        # vision turns ask for `off`.
+        reasoning: high
+        # WHAT `off` COSTS, measured — it is a real trade, not a free win. The
+        # same category-prior turn, same mesh (samples/drone_dji_inspire3.glb),
+        # same 6 frames, same prompt scene:
+        #   thinking ON   276.9s   rotor regionBox [0.18,0.25,0.37,0.46] = one rotor
+        #   thinking OFF   29.0s   rotor regionBox [0.15,0.22,0.85,0.78] = the airframe
+        # Everything else was preserved: the category, the confidence, both
+        # instance counts, the expected-vs-found gaps, all 5 uncertainties, and
+        # the reply length (3244 -> 2921 chars) — and the boxes stayed in 0..1
+        # fractions both times. So the one thing `off` costs is AIM: a prior
+        # that points a round-2 close-up at the whole machine rather than at the
+        # part. That is a weaker look, never a wrong manifest entry — an
+        # expectation admits nothing, and the only route into the manifest is a
+        # proposal grounding resolved and the physics battery scored. The units
+        # slip `off` does sometimes cause is handled on the other side:
+        # expectation.mjs normalizes a regionBox drawn in pixels instead of
+        # dropping it, so the instance survives and the repair is announced.
         models:
           # qwen3.8-max is natively multimodal (text + image + video upstream).
           # DSH under-claims text-only unless a model declares its input
@@ -34,6 +82,26 @@
           # there is no video content part on the wire.)
           - id: qwen3.8-max
             input: [text, image]
+            # The thinking levels this model offers. Key = selectable level,
+            # value = the wire spelling; `off` is the ONE level allowed to leave
+            # the value empty, which keeps it out of pi-ai's level map. pi-ai
+            # reads an absent key as "supported, send nothing", and for qwen not
+            # thinking IS the parameter being false. A level beyond `off` is
+            # mandatory or the entry is rejected outright.
+            #
+            # Quoted, because a bare `off:` is a YAML 1.1 boolean: a key that
+            # parses as `false` fails the level enum, and one invalid model
+            # invalidates the whole route — which takes every model on it out of
+            # every picker.
+            #
+            # NOTE: `reasoning: high` above is route-wide, but only a model that
+            # declares these efforts reports any level beyond `off`. Selecting
+            # one of the models below that does NOT declare them makes DSH refuse
+            # the turn with UNSUPPORTED_REASONING_EFFORT — so copy this block
+            # onto any model you switch agent-default-model to.
+            reasoningEfforts:
+              "off":
+              high: high
           - id: qwen3.8-flash
           - id: kimi-k3
           - id: glm-5.3

@@ -255,10 +255,28 @@ export function createDshAgent(kernel) {
     });
   }
 
-  async function selectModel(model, sid = sessionId) {
-    if (!model || modelBySession.get(sid) === model) return;
-    try { await rpc('session.selectModel', { sessionId: sid, provider: 'bailian', model }); modelBySession.set(sid, model); }
-    catch (e) { log('selectModel failed:', e.message); }
+  // `effort` is the per-session THINKING level. It exists only because the
+  // bailian route declares the qwen thinking dialect (bailian.patch.yml): once
+  // it does, pi-ai sends `enable_thinking` on every turn of a reasoning-capable
+  // model, so the level has to be chosen deliberately rather than left to the
+  // gateway. Omitting `effort` is NOT "no opinion" — DSH then applies the route
+  // default, `high`, i.e. thinking on, which is what the human chat and the
+  // text lane want.
+  //
+  // The effort joins the cache key because it is part of what was selected: a
+  // session whose model is unchanged but whose effort is not would otherwise be
+  // skipped, and would keep thinking after we asked it not to.
+  async function selectModel(model, sid = sessionId, effort = null) {
+    if (!model) return;
+    const key = effort ? `${model}\u0000${effort}` : model;
+    if (modelBySession.get(sid) === key) return;
+    try {
+      await rpc('session.selectModel', {
+        sessionId: sid, provider: 'bailian', model,
+        ...(effort ? { reasoningEffort: effort } : {}),
+      });
+      modelBySession.set(sid, key);
+    } catch (e) { log('selectModel failed:', e.message); }
   }
 
   // A STATELESS session for one kernel lane call (vision producer, category
@@ -330,12 +348,24 @@ export function createDshAgent(kernel) {
     // qwen3.8-max (the default) is multimodal, so image turns run on it unless
     // an explicit vision_model override is configured.
     const model = (images.length && cfg.visionModel) ? cfg.visionModel : cfg.model;
+    const human = opts?.origin === 'user';
+    // A MACHINE turn that carries screenshots is the only one worth not thinking
+    // on. Measured against the real 12-frame discovery prompt: the reasoning
+    // stream was 10,771 tokens and ~244s of a 280s call, while the reply itself
+    // was 1,452 tokens — dropping thinking took that turn from 319s (agentic) to
+    // 36s, and the transport was never the cost.
+    //
+    // A HUMAN turn keeps thinking even with an attachment: the human asked a
+    // question and wants the reasoned answer, and one attachment does not make
+    // it a batch vision job. The text lane keeps it too — it carries no images,
+    // so it never had the cost we are removing.
+    const effort = (!human && images.length) ? 'off' : null;
     // Session isolation (see createLaneSession): a human send prompts the
     // persistent human session; anything else prompts a session minted for
     // this one call, so neither history ever sees the other's contract.
-    const sid = opts?.origin === 'user' ? sessionId : await createLaneSession();
+    const sid = human ? sessionId : await createLaneSession();
     turnSid = sid;
-    await selectModel(model, sid);
+    await selectModel(model, sid, effort);
 
     const content = [{ type: 'text', text }];
     for (const img of images) content.push({ type: 'image', mediaType: img.mediaType, data: img.dataBase64, ...(img.name ? { name: img.name } : {}) });
