@@ -12,6 +12,9 @@ runs/
 sessions/
 *.log
 
+# verified joint scopes remembered across runs (local knowledge, not code)
+scope-memory.json
+
 # dev dumps
 gltf.json
 nodes.txt

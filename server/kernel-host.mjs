@@ -3,7 +3,9 @@
 // This facade wraps src/pipeline.mjs so routes stay thin, caches the last
 // discovery (glb stats / dump / THREE) so validate+generate don't re-parse the
 // 23MB GLB, and keeps the kernel as the system-of-record for work state.
-import { mkdirSync, copyFileSync, readFileSync } from 'node:fs';
+import { mkdirSync, copyFileSync, readFileSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import { resolve, dirname } from 'node:path';
 import { createHost } from '../src/core/host.mjs';
 import { CATEGORY } from '../src/core/registry.mjs';
@@ -27,6 +29,19 @@ import { createSessionStore } from './session-store.mjs';
 import { attachmentsDir, readImages } from './attachments.mjs';
 
 const TS = () => new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+
+// Scope memory: verified joint scopes keyed by GLB content hash, persisted
+// OUTSIDE runs/ so a server restart — which mints a fresh run dir — does not
+// throw away what a human already confirmed on the viewer. Best-effort by
+// design: an unreadable or unwritable memory file must never break a load or
+// a verdict, it only costs the head start.
+const SCOPE_MEMORY_PATH = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'scope-memory.json');
+function scopeMemoryRead() {
+  try { return JSON.parse(readFileSync(SCOPE_MEMORY_PATH, 'utf8')) || {}; } catch { return {}; }
+}
+function scopeMemoryWrite(mem) {
+  try { writeFileSync(SCOPE_MEMORY_PATH, JSON.stringify(mem, null, 2) + '\n'); } catch { /* head start lost, not a failure */ }
+}
 
 // The next free observation round. Rounds are DIRECTORIES, so the numbering has
 // to come from disk rather than from a counter a server restart would reset —
@@ -139,6 +154,10 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
       const d = await discoverJoints(host, glbPath);
       current.glbPath = d.glbPath;
       current.glb = d.stats;
+      // Content hash, not path: scope memory is knowledge about THIS mesh's
+      // geometry, so the same file copied elsewhere keeps its scopes and a
+      // different file never inherits another's.
+      try { current.glbSha = createHash('sha256').update(readFileSync(d.glbPath)).digest('hex').slice(0, 16); } catch { current.glbSha = null; }
       current.dump = d.dump;
       current.joints = d.joints;
       current.spec = d.spec;
@@ -152,6 +171,31 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
       try {
         current.manifest = runDiscoveryLoop(current.glb, current.joints, { runDir, score: false }).manifest;
         commitRevision('discovery loop (project load) — candidates, battery deferred to stage 2');
+        // Scope memory: a node set a human or the assistant already verified
+        // for THIS glb is knowledge about the file, not about one run. Without
+        // it every boot rediscovers the auto scope and every circled-region
+        // turn re-derives from scratch what was already confirmed — minutes of
+        // remote round-trips per restart. Re-applied as an ordinary edit
+        // verdict with actor 'scope-memory': the battery re-scores it and the
+        // joint lands at needs-verdict, so memory is a head start, never a
+        // belief — the human still confirms it on the viewer.
+        const remembered = scopeMemoryRead()[current.glbSha] || {};
+        let reapplied = 0;
+        for (const [jid, entry] of Object.entries(remembered)) {
+          const rec = current.manifest.find((r) => r.id === jid);
+          const nodes = Array.isArray(entry?.nodes) ? entry.nodes : null;
+          if (!rec || !nodes || !nodes.length) continue;
+          if (JSON.stringify([...rec.nodes].sort()) === JSON.stringify([...nodes].sort())) continue;
+          const ar = applyJointVerdict(current.glb, current.joints, current.manifest, {
+            id: jid, decision: 'edit', edits: { nodes }, actor: 'scope-memory',
+            note: `scope remembered from ${entry.at || 'an earlier run'} (actor ${entry.actor || 'unknown'})`,
+          });
+          if (ar.ok) reapplied += 1;
+        }
+        if (reapplied) {
+          saveManifest(runDir, current.manifest);
+          commitRevision(`scope memory re-applied ${reapplied} verified joint scope(s)`);
+        }
       } catch (e) {
         host.diagnostics.note('discovery loop failed — serving raw joints', { error: e.message });
         current.manifest = null;
@@ -1159,6 +1203,18 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
       // rather than as two revisions a reader would have to diff to see one act.
       saveManifest(runDir, current.manifest);
       commitRevision(`verdict ${decision} on ${id}${amortized?.applied?.length ? ` (+${amortized.applied.length} amortized)` : ''}`);
+      // Scope memory: a landed edit/accept is a verified statement about THIS
+      // glb — remember it so the next run of the same file starts where the
+      // human left off instead of at the auto scope.
+      if (current.glbSha && (decision === 'edit' || decision === 'accept')) {
+        const rec = (current.manifest || []).find((x) => x.id === id);
+        if (rec && Array.isArray(rec.nodes) && rec.nodes.length) {
+          const mem = scopeMemoryRead();
+          const bucket = mem[current.glbSha] || (mem[current.glbSha] = {});
+          bucket[id] = { label: rec.label, nodes: [...rec.nodes], actor, at: new Date().toISOString() };
+          scopeMemoryWrite(mem);
+        }
+      }
 
       // The joint list the UI reads is mutated in place by applyManifest, so the
       // resumable work state has to be refreshed too — otherwise a restart would
