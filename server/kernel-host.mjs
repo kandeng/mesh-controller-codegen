@@ -690,6 +690,7 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
         // for steering of it.
         const guidanceMark = sessionStore.seq();
         let vision = null;
+        let visionCampaign = false; // opened by vision:start, closed by vision:end
         if (wantVision) {
           // Give the assistant host and a browser renderer the same grace period
           // the one-shot lane had: right after a load the tab may not have
@@ -697,6 +698,10 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
           // refuse a lane that would have been live two seconds later.
           await Promise.all([boot, renderer]);
           if (reloaded()) return endReloaded();
+          // Opening beat of the vision campaign: the 3D theater clears whatever
+          // a previous campaign left and starts drawing this one's camera path.
+          emit('vision:start', { look: 1 });
+          visionCampaign = true;
           const cloneM = current.manifest.map((r) => ({
             ...r, nodes: [...(r.nodes || [])], evidence: [...(r.evidence || [])],
             tests: [...(r.tests || [])], history: [...(r.history || [])],
@@ -854,6 +859,11 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
             });
           }
         }
+        // Closing beat of the vision campaign: every look has returned, so the
+        // viewer may retire the camera glyphs. The abort and reload paths skip
+        // this beat on purpose — discovering flips false there, and the viewer's
+        // safety net retires the props on that signal instead.
+        if (visionCampaign) emit('vision:end', { steered: !!steered });
         if (reloaded()) return endReloaded();
         if (refineAbort) {
           // A stop landing HERE is not the pre-commit stop above: the candidate

@@ -1231,6 +1231,16 @@ function livePlan(views) {
   // Only the travelling glyph is drawn, never the connecting polyline: the camera
   // trajectory over the machine reads as clutter and the filmstrip already shows
   // where each stop looked.
+  // One glyph per CAMPAIGN, not per look: a second vision:plan re-aims the same
+  // cone instead of stacking another one in the sky — a glyph left behind by an
+  // earlier look has no owner left to retire it, which is exactly how two cones
+  // ended up parked over the mesh after a two-look campaign.
+  if (liveGlyph) {
+    liveGroup.remove(liveGlyph);
+    liveGlyph.geometry?.dispose?.();
+    liveGlyph.material?.dispose?.();
+    liveGlyph = null;
+  }
   liveGlyph = new THREE.Mesh(new THREE.ConeGeometry(radius * 0.03, radius * 0.09, 12), new THREE.MeshBasicMaterial({ color: 0x7aa5c9 }));
   liveGroup.add(liveGlyph);
   if (pts.length) liveGlyph.position.copy(pts[0]);
@@ -1371,6 +1381,14 @@ watch(() => themeState.mode, applySceneTheme);   // re-tint the 3D scene on them
 watch(() => state.discovering, (d) => {
   if (orbit) orbit.enabled = !d;
   if (d) { hover.value = null; if (renderer) renderer.domElement.style.cursor = ''; }
+  else {
+    // Safety net: the props retire on the vision:end beat, but a campaign that
+    // died without its closing beat (abort, reload, a wedged turn) must not
+    // leave camera cones parked in the sky forever — discovering going false is
+    // the one signal every exit path guarantees.
+    clearTimeout(liveClearTimer);
+    liveClearTimer = setTimeout(clearLive, 4000);
+  }
 });
 
 onMounted(() => {
