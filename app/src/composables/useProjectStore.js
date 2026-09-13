@@ -131,6 +131,13 @@ function connectEvents() {
       if (msg.type === 'validate:done') state.readouts.lastValidate = msg.data.pass ? 'PASS' : 'FAIL';
     } else if (msg.kind === 'round') {
       pushEvent({ type: 'generate:round', ts: Date.now(), data: { round: msg.round, pass: msg.pass } });
+    } else if (msg.kind === 'joint:verdict') {
+      // A verdict landed from ANY writer — the DSH agent posting from its
+      // sandbox, another tab, a curl. This tab's copy of the joint list is now
+      // stale, and a stale list is worse than no list: the 3D view keeps
+      // highlighting the PRE-verdict scope, so a correct edit reads as "did
+      // nothing". Re-read the server's list; it is the only writer.
+      refreshJoints();
     } else if (typeof msg.kind === 'string' && msg.kind.startsWith('vision:')) {
       if (msg.kind === 'vision:start') {
         // Inside a parallel refinement the orchestrator has already reset the feed

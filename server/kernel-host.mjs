@@ -1141,6 +1141,17 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
       // resumable work state has to be refreshed too — otherwise a restart would
       // hand back the pre-verdict joints.
       sessionStore.setWork({ joints: current.joints.map((j) => ({ id: j.id, label: j.label, type: j.type, nodeCount: (j.nodes || []).length })) });
+      // Every open tab holds its OWN copy of the joint list, and until now the
+      // only writers that refreshed a tab were the tabs themselves (VerdictBar
+      // and ObservationPanel re-read the list after their own POST). An
+      // out-of-band writer — the DSH agent posting a verdict from its sandbox,
+      // a second tab, a curl — left every open tab showing the PRE-verdict node
+      // set: the human clicks the joint and sees the old scope, which reads as
+      // "the edit did nothing". One broadcast closes that gap for all writers.
+      broadcast({
+        kind: 'joint:verdict', id, decision, status: r.status, actor,
+        applied: r.applied || [], amortized: amortized?.applied || [],
+      });
       host.diagnostics.note('joint verdict', {
         id, decision, status: r.status, edited: r.applied.length,
         amortizedTo: amortized?.applied?.length ?? 0,
