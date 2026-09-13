@@ -946,6 +946,18 @@ const freshStage = () => {
     /args\.join\(','\)/.test(wsSrc) && /Waste traps measured on real turns/.test(wsSrc));
   ok('S12: kernel-cli answers connectivity in one call (chain) so floater questions never become node -e archaeology',
     /cmd === 'chain'/.test(wsSrc) && /chain <name,…>/.test(wsSrc));
+  // ---- S13: the vision theater closes its own lifecycle --------------------
+  // A two-look campaign once left two camera cones parked in the sky: livePlan
+  // stacked a glyph per look, and no beat ever retired them because the kernel
+  // never emitted vision:end. The theater now opens and closes itself, re-aims
+  // one glyph, and has a safety net on the one signal every exit guarantees.
+  const viewerSrc = readFileSync(new URL('../app/src/components/MeshViewer.vue', import.meta.url), 'utf8');
+  ok('S13: the kernel opens and closes the vision campaign with start/end beats',
+    /emit\('vision:start', \{ look: 1 \}\)/.test(kernelSrc) && /if \(visionCampaign\) emit\('vision:end'/.test(kernelSrc));
+  ok('S13: livePlan re-aims one camera glyph per campaign instead of stacking cones per look',
+    /if \(liveGlyph\) \{/.test(viewerSrc) && /liveGroup\.remove\(liveGlyph\)/.test(viewerSrc));
+  ok('S13: discovering going false retires the theater props even when the end beat never arrives',
+    /Safety net: the props retire on the vision:end beat/.test(viewerSrc) && /liveClearTimer = setTimeout\(clearLive, 4000\);/.test(viewerSrc));
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);
