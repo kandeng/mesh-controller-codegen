@@ -905,6 +905,25 @@ const freshStage = () => {
   const loopSrc = readFileSync(new URL('../src/plugins/discovery/loop.mjs', import.meta.url), 'utf8');
   ok('S10: an edit may name only nodes the mesh contains — applyJointVerdict hands the parsed name set to applyVerdict',
     /knownNodes/.test(manifestSrc) && /knownNodes/.test(loopSrc) && /unknown node name\(s\)/.test(manifestSrc));
+
+  // S11 — the removal surface. "Take this joint off the list" had no expression
+  // at all: dropCandidate refuses refined records, a reject verdict leaves the
+  // row in the list, JointList renders state.joints unfiltered. So a remove ask
+  // became a 15-step improvisation that never removed anything. Four wires make
+  // it one call — kernel method, route, cli verb, docs — plus the slash
+  // fallthrough so a human /discovery drop on a refined row also removes it.
+  const jointsRouteSrc = readFileSync(new URL('../server/routes/joints.mjs', import.meta.url), 'utf8');
+  const slashSrc = readFileSync(new URL('../server/slash-commands.mjs', import.meta.url), 'utf8');
+  ok('S11: the kernel can remove a refined joint — delete the record, commit a revision, broadcast so tabs drop the row',
+    /removeJoint\(id, actor = 'human'\)/.test(flatKernel) && /decision: 'remove'/.test(flatKernel));
+  ok('S11: POST /api/joints/:id/remove exposes removal to the agent and any other writer',
+    jointsRouteSrc.includes('/api/joints/:id/remove') && /kernel\.removeJoint\(req\.params\.id/.test(jointsRouteSrc));
+  ok('S11: kernel-cli carries the drop verb — removal is one call, not an investigation',
+    /cmd === 'drop'/.test(wsSrc) && /\/remove'/.test(wsSrc));
+  ok('S11: AGENTS.md forbids turning a removal into a controller investigation',
+    /## Removing a joint/.test(wsSrc) && /kernel-cli\.mjs drop <jointId>/.test(wsSrc));
+  ok('S11: /discovery drop on a refined joint falls through to removal instead of refusing with dead-end advice',
+    /code === 'ALREADY_REFINED' && kernel\.removeJoint/.test(slashSrc));
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

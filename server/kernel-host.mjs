@@ -959,6 +959,29 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
       return { ok: true, postponed: rec.id };
     },
 
+    // A refined joint could be edited or verdicted, but NOTHING could make its
+    // row disappear: dropCandidate refuses anything past candidate status, a
+    // reject verdict leaves the row in the list, and JointList renders
+    // state.joints unfiltered. So the most ordinary human ask — "remove this
+    // joint" — had no expression at all, and an agent with no verb for it
+    // improvises scope edits and validate-warning chases instead of removing.
+    // Removal deletes the record, commits a revision first (the audit trail
+    // keeps every node list the record ever held, so nothing is lost), and
+    // broadcasts on the verdict kind so every open tab drops the row at once.
+    removeJoint(id, actor = 'human') {
+      const rec = (current.manifest || []).find((r) => r.id === id || r.label === id);
+      if (!rec) return { ok: false, code: 'NO_SUCH_JOINT', error: `no joint named "${id}"` };
+      current.manifest = current.manifest.filter((r) => r !== rec);
+      current.joints = current.joints.filter((j) => j.id !== rec.id);
+      saveManifest(runDir, current.manifest);
+      commitRevision(`joint ${rec.id} removed from the list by ${actor}`);
+      broadcast({
+        kind: 'joint:verdict', id: rec.id, decision: 'remove', status: 'removed', actor,
+        applied: [], amortized: [],
+      });
+      return { ok: true, removed: rec.id, remaining: current.joints.length };
+    },
+
     // Phase 3 task 17: the symmetry peers of one joint, i.e. the joints a verdict
     // on it may be OFFERED to. Read-only, so the panel can render the checkboxes
     // before the human has decided anything.

@@ -121,7 +121,16 @@ export const COMMANDS = [
       if (verb === 'drop') {
         if (!id) return 'Usage: /discovery drop <joint id or label>';
         const r = kernel.dropCandidate?.(id) || { ok: false, error: 'not available on this kernel' };
-        return r.ok ? `Dropped ${r.dropped} from the plan — ${r.remaining} candidate(s) left.` : `Could not drop: ${r.error}`;
+        if (r.ok) return `Dropped ${r.dropped} from the plan — ${r.remaining} candidate(s) left.`;
+        // A refined joint is not plan any more, so dropCandidate refuses it —
+        // but a human saying "drop it" about a row in the list means REMOVE the
+        // row, whatever its status. Fall through to the removal surface instead
+        // of answering with advice nobody can act on.
+        if (r.code === 'ALREADY_REFINED' && kernel.removeJoint) {
+          const r2 = kernel.removeJoint(id, 'human');
+          return r2.ok ? `Removed ${r2.removed} from the joint list — ${r2.remaining} joint(s) left.` : `Could not remove: ${r2.error}`;
+        }
+        return `Could not drop: ${r.error}`;
       }
       if (verb === 'postpone') {
         if (!id) return 'Usage: /discovery postpone <joint id or label>';

@@ -76,8 +76,15 @@ if (cmd === 'validate') {
     const inside = nodes.filter((n) => n.mesh && n.wb && n.wb.c[0] >= lo[0] && n.wb.c[0] <= hi[0] && n.wb.c[1] >= lo[1] && n.wb.c[1] <= hi[1] && n.wb.c[2] >= lo[2] && n.wb.c[2] <= hi[2]);
     console.log(JSON.stringify({ box: lo.concat(hi), meshCount: inside.length, meshes: inside.map((n) => ({ name: n.name, i: n.i, parent: byI[n.parent] ? byI[n.parent].name : null, wext: n.wext })) }, null, 2));
   }
+} else if (cmd === 'drop') {
+  // Remove a joint from the list entirely — the whole job when the human says a
+  // proposal is wrong or a duplicate. One call, any status; the kernel commits a
+  // revision first, so the removed record's node lists stay recoverable.
+  const id = args[0];
+  if (!id) { console.log('usage: node kernel-cli.mjs drop <jointId>'); process.exit(1); }
+  console.log(JSON.stringify(await post('/api/joints/' + encodeURIComponent(id) + '/remove', { actor: 'assistant' }), null, 2));
 } else {
-  console.log('usage: node kernel-cli.mjs validate [file] | rig <jointId> | joints | state | edit <jointId> --nodes a,b [--add c] [--drop d] [--note t] | subtree <name|index> | region <x0,y0,z0,x1,y1,z1>');
+  console.log('usage: node kernel-cli.mjs validate [file] | rig <jointId> | joints | state | edit <jointId> --nodes a,b [--add c] [--drop d] [--note t] | subtree <name|index> | region <x0,y0,z0,x1,y1,z1> | drop <jointId>');
 }
 `;
 
@@ -101,6 +108,11 @@ SCRIPT in this directory (default: controller.js) so the rig animates correctly.
   against the current list, \`--note\` for provenance) — the ONLY write path for
   a joint's node set. Posts a verdict with actor=assistant; the kernel validates
   every name and re-runs the physics battery.
+- \`node kernel-cli.mjs drop <jointId>\` — remove a joint from the list entirely
+  (a wrong or duplicate vision proposal). One call, any status. No
+  investigation, no scope edit, no reading of test sources: removal is not a
+  controller problem. The kernel commits a revision first, so the removed
+  record's node lists stay recoverable.
 - \`node kernel-cli.mjs subtree <name|index>\` — every node under a hierarchy
   root, meshes listed separately. \`node kernel-cli.mjs region
   <x0,y0,z0,x1,y1,z1>\` — the mesh nodes whose world-box centre falls inside a
@@ -159,6 +171,14 @@ The viewer refreshes itself the moment a verdict lands: the kernel broadcasts
 joint:verdict and every open tab re-reads the joint list. Never modify app code
 to make the UI update, and never conclude an edit "did nothing" from evidence
 older than your own POST.
+
+## Removing a joint (the human says a proposal is wrong)
+When the human asks to REMOVE a joint from the list — "the scope of X is wrong,
+take it off", "delete the duplicate" — the whole job is ONE call:
+\`node kernel-cli.mjs drop <jointId>\`, then \`node kernel-cli.mjs joints\` to
+confirm the row is gone. Do NOT chase validate warnings, do NOT read tier-0 or
+tier-1 sources, do NOT edit the remaining joints' scopes: none of that removes
+a row, and every step of it is a remote round-trip the human is waiting out.
 
 ## Capability gaps (standing orders)
 When a task needs a capability you do not hold, never give up and never guess —

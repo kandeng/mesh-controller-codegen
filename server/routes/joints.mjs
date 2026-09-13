@@ -187,6 +187,18 @@ export function jointRoutes(app, kernel) {
     return r;
   });
 
+  // Remove a joint from the list entirely — the expression of "this proposal is
+  // wrong, take it off the list", which neither a verdict (row stays) nor
+  // dropCandidate (refuses refined records) could say. One call, any status;
+  // the kernel commits a revision first so the removed node list survives in
+  // the audit trail, and broadcasts so every open tab drops the row.
+  app.post('/api/joints/:id/remove', async (req, reply) => {
+    if (!kernel.removeJoint) return reply.code(501).send({ ok: false, error: 'remove is not available on this kernel' });
+    const r = kernel.removeJoint(req.params.id, (req.body && req.body.actor) || 'human');
+    if (!r.ok) return reply.code(r.code === 'NO_SUCH_JOINT' ? 404 : 400).send(r);
+    return r;
+  });
+
   // Phase 3 task 18: drive ONE joint through its motion and ask a multimodal model
   // a SEMANTIC-ONLY question — "what is this moving thing, is the motion sensible".
   // Which nodes move and by how much is already measured exactly by the rigidity
