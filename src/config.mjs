@@ -25,6 +25,7 @@ export function loadConfig(explicitPath) {
     apiKey: raw.api_key || process.env.BAILIAN_API_KEY || '',
     model: raw.model || 'qwen3.8-max',
     visionModel: raw.vision_model || '', // optional override; empty = image turns use `model` (qwen3.8-max is multimodal)
+    humanReasoningPolicy: raw.human_reasoning_policy || 'half', // half = first run of a human turn thinks, later runs off; 'full'/'off' override
     // Which transport carries a vision round. 'dsh' routes through the existing
     // supervisor (the only implemented one); 'http' is the declared seam for a
     // direct call to a model DSH does not front (SAM/DINOv2/video).

@@ -118,6 +118,12 @@ export function createDshAgent(kernel) {
   }
   let responding = new Set();
   let turnTools = [];     // per-turn tool activity lines (persisted with the reply)
+  // Half thinking policy (see send()): the first model run of a human turn
+  // thinks, every later run of that turn does not. These three carry the
+  // switch across the event stream, which is where step boundaries arrive.
+  let halfArmed = false;    // this turn is a human turn under the half policy
+  let halfSwitched = false; // the switch to 'off' already happened
+  let turnModel = null;     // model selected for the turn in flight
   const emit = (frame) => { try { agent.onEvent?.(frame); } catch { /* listener went away */ } };
 
   // f is the MuxFrame (msg.payload). Only session/event frames carry agent events,
@@ -150,6 +156,15 @@ export function createDshAgent(kernel) {
       const callId = msg?.source?.callId || ev.data?.callId || null;
       const isError = !!msg?.content?.[0]?.isError;
       emit({ type: 'tool', kind, name: '', callId, isError, view: isError ? 'tool error' : 'tool result' });
+    } else if (kind === 'step/end') {
+      // Half policy: drop to thinking-off between steps. The effort is injected
+      // per REQUEST (installModelSelection hooks agent/request), so the next
+      // model run of this turn already runs off. Losing the race with the next
+      // request degrades to one extra thinking step, never to a fault.
+      if (halfArmed && !halfSwitched) {
+        halfSwitched = true;
+        selectModel(turnModel, turnSid, 'off');
+      }
     } else if (kind === 'turn/end') {
       // Only a PROMPTED turn may be settled by an event: a late turn/end from
       // a cancelled/timed-out predecessor must not kill the next turn that is
@@ -350,21 +365,28 @@ export function createDshAgent(kernel) {
     const model = (images.length && cfg.visionModel) ? cfg.visionModel : cfg.model;
     const human = opts?.origin === 'user';
     // A MACHINE turn that carries screenshots is the only one worth not thinking
-    // on. Measured against the real 12-frame discovery prompt: the reasoning
-    // stream was 10,771 tokens and ~244s of a 280s call, while the reply itself
-    // was 1,452 tokens — dropping thinking took that turn from 319s (agentic) to
-    // 36s, and the transport was never the cost.
+    // on at all: measured against the real 12-frame discovery prompt, the
+    // reasoning stream was 10,771 tokens and ~244s of a 280s call while the
+    // reply itself was 1,452 tokens — dropping thinking took that turn from
+    // 319s (agentic) to 36s, and the transport was never the cost.
     //
-    // A HUMAN turn keeps thinking even with an attachment: the human asked a
-    // question and wants the reasoned answer, and one attachment does not make
-    // it a batch vision job. The text lane keeps it too — it carries no images,
-    // so it never had the cost we are removing.
-    const effort = (!human && images.length) ? 'off' : null;
+    // A HUMAN turn runs the HALF policy by default: its FIRST model run thinks
+    // (route default high) — that run reads the request, and its reply is what
+    // shows the human the request was understood — while every later run of the
+    // same turn runs with thinking off, because measured human turns spent
+    // 90-170s of thinking PER STEP on recipe-following work (joints -> subtree
+    // -> edit) where the thinking added latency, not quality. 'full' restores
+    // thinking on every run; 'off' skips it entirely, including run one.
+    const policy = cfg.humanReasoningPolicy || 'half';
+    const effort = (!human && images.length) ? 'off' : (human && policy === 'off') ? 'off' : null;
     // Session isolation (see createLaneSession): a human send prompts the
     // persistent human session; anything else prompts a session minted for
     // this one call, so neither history ever sees the other's contract.
     const sid = human ? sessionId : await createLaneSession();
     turnSid = sid;
+    turnModel = model;
+    halfSwitched = false;
+    halfArmed = human && policy === 'half' && effort === null;
     await selectModel(model, sid, effort);
 
     const content = [{ type: 'text', text }];
