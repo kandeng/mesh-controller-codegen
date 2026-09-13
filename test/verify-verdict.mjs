@@ -136,6 +136,24 @@ const fakeJoint = (id, over = {}) => ({
     badVec.ok === false && badVec.code === 'NO_EDITS' && vec.anchor.x === 0);
   const badNodes = applyVerdict(buildManifest([fakeJoint('w')])[0], { decision: 'edit', edits: { nodes: [] } });
   ok('A: emptying the node list is refused', badNodes.ok === false);
+
+  // A node list the mesh does not contain is the one edit that looks fine at
+  // the door and reads as catastrophe everywhere else: the battery re-runs over
+  // an empty drive set and the viewer highlights nothing, while every downstream
+  // reader trusts the list. With the mesh's name set in hand the refusal happens
+  // here, at the door, naming the offending entry.
+  const meshNames = new Set(['k_a', 'k_b', 'k_c']);
+  const krec = buildManifest([fakeJoint('k')])[0];
+  const unk = applyVerdict(krec, { decision: 'edit', edits: { nodes: ['k_a', 'ghost_9'] }, knownNodes: meshNames });
+  ok('A: a node name the mesh does not contain is refused and named',
+    unk.ok === false && unk.refused.some((r) => r.field === 'nodes' && r.why.includes('ghost_9')),
+    JSON.stringify(unk.refused));
+  ok('A: that refusal left the record byte-identical', krec.nodes.join() === 'k_a,k_b' && krec.retestNeeded === false);
+  const kall = applyVerdict(krec, { decision: 'edit', edits: { nodes: ['k_c', 'k_a'] }, knownNodes: meshNames });
+  ok('A: names the mesh knows still apply', kall.ok === true && krec.nodes.join() === 'k_c,k_a');
+  const noMesh = applyVerdict(buildManifest([fakeJoint('z')])[0], { decision: 'edit', edits: { nodes: ['anything'] } });
+  ok('A: without a mesh in hand the name check stays out of the way', noMesh.ok === true,
+    'record-level callers (and these tests) have no parsed glb to consult');
 }
 
 // ---- B) deriveStatus is verdict-aware ---------------------------------------

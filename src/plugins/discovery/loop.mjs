@@ -1388,7 +1388,12 @@ export function applyJointVerdict(g, joints, manifest, {
   const rec = (manifest || []).find((r) => r.id === id);
   if (!rec) return { ok: false, code: 'NO_RECORD', error: `no manifest record with id "${id}"` };
 
-  const r = applyVerdict(rec, { decision, edits, note, actor, amortizedFrom });
+  // The parsed mesh is the only authority on which node names exist. Handing
+  // its name set to applyVerdict is what turns a typo (or a hallucinated name)
+  // in an edit into a refusal instead of a silently empty drive set.
+  const knownNodes = g && g.names instanceof Set ? g.names
+    : (Array.isArray(g?.nodes) ? new Set(g.nodes.map((n) => n.name)) : null);
+  const r = applyVerdict(rec, { decision, edits, note, actor, amortizedFrom, knownNodes });
   // A refusal from applyVerdict already left the record untouched, so there is
   // nothing to roll back — that is the whole reason the validation lives there.
   if (!r.ok) return r;

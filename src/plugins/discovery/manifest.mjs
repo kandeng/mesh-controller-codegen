@@ -52,14 +52,24 @@ const vec3ish = (v) => !!v && typeof v === 'object' && ['x', 'y', 'z'].every((k)
 // Returns null when the edit is acceptable, else the reason it is not. Kept as a
 // function of one field so `applyVerdict` can report every refusal at once
 // instead of stopping at the first — same shape as the kernel's `unmet` list.
-function checkEdit(field, value) {
+function checkEdit(field, value, known = null) {
   if (!EDITABLE.has(field)) return `not an editable field (allowed: ${[...EDITABLE].join(', ')})`;
   if (field === 'label') return typeof value === 'string' && value.trim() ? null : 'must be a non-empty string';
-  if (field === 'type') return JOINT_TYPES.has(value) ? null : `must be one of ${[...JOINT_TYPES].join(' / ')}`;
+  if (field === 'type') return JOINT_TYPES.has(value) ? null : `must be one of ${[...JOINT_TYPES].join(', ')}`;
   if (field === 'nodes') {
     if (!Array.isArray(value) || !value.length) return 'must be a non-empty array of node names';
     const bad = value.filter((n) => typeof n !== 'string' || !n.trim());
-    return bad.length ? `${bad.length} entry/entries are not non-empty strings` : null;
+    if (bad.length) return `${bad.length} entry/entries are not non-empty strings`;
+    // Names the mesh does not contain are a silent catastrophe: the edit
+    // applies, the battery re-runs over an empty drive set, and the viewer
+    // highlights nothing — every downstream reader trusts the list. Refusing
+    // them here is the only place the claim can be checked against the mesh.
+    // `known` is optional: pure record-level callers (tests) have no mesh.
+    if (known) {
+      const unknown = [...new Set(value.map((n) => String(n).trim()))].filter((n) => !known.has(n));
+      if (unknown.length) return `unknown node name(s): ${unknown.slice(0, 6).join(', ')}${unknown.length > 6 ? ` (+${unknown.length - 6} more)` : ''}`;
+    }
+    return null;
   }
   return vec3ish(value) ? null : 'must be {x,y,z} of finite numbers';
 }
@@ -135,7 +145,7 @@ export function reopen(rec, failingTest, note = null) {
 // Returns { ok:false, code, error } on a refusal WITHOUT touching the record, so
 // a bad request can never leave a half-edited joint behind.
 export function applyVerdict(rec, {
-  decision, edits = null, note = null, actor = 'human', amortizedFrom = null, at = null,
+  decision, edits = null, note = null, actor = 'human', amortizedFrom = null, at = null, knownNodes = null,
 } = {}) {
   if (!rec) return { ok: false, code: 'NO_RECORD', error: 'no such record' };
   if (!VERDICTS.has(decision)) {
@@ -153,7 +163,7 @@ export function applyVerdict(rec, {
   const refused = [];
   if (wantEdits) {
     for (const [field, value] of Object.entries(edits)) {
-      const why = checkEdit(field, value);
+      const why = checkEdit(field, value, knownNodes);
       if (why) { refused.push({ field, why }); continue; }
       rec[field] = field === 'nodes' ? [...new Set(value.map((n) => String(n).trim()))]
         : field === 'label' ? String(value).trim()
