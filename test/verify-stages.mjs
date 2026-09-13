@@ -878,6 +878,33 @@ const freshStage = () => {
   ok('S9: the kernel exposes abortGenerate() and it goes to the dsh bridge\'s abort hook',
     /abortGenerate\(\) \{/.test(kernelSrc) && /host\.registry\.get\(CATEGORY\.BRIDGE, 'dsh'\)/.test(kernelSrc)
       && /bridge\?\.api\?\.abort\?\.\(\)/.test(kernelSrc));
+
+  // S10 — the out-of-band verdict loop. A circled-scope turn died at the 15-min
+  // cap after 45 tool calls: ~5 min of source archaeology to discover the write
+  // path (kernel-cli had no edit verb, AGENTS.md never named the verdict route),
+  // then more at the end for the UI-refresh path — which did not exist: setVerdict
+  // broadcast nothing, so the open tab kept the PRE-edit node list and the human
+  // clicking the joint saw the old scope. Three wires close that loop, plus the
+  // validation that made a bogus node list apply silently during the probe.
+  const flatKernel = kernelSrc.replace(/\s+/g, ' ');
+  ok('S10: a landed verdict broadcasts joint:verdict — an out-of-band writer (the agent, a second tab, curl) must reach every open tab',
+    /broadcast\(\{ kind: 'joint:verdict',/.test(flatKernel));
+  const storeSrc = readFileSync(new URL('../app/src/composables/useProjectStore.js', import.meta.url), 'utf8');
+  const verdictBranch = storeSrc.slice(storeSrc.indexOf("msg.kind === 'joint:verdict'"));
+  ok('S10: the store re-reads the joint list on joint:verdict — a stale list makes a correct edit read as "did nothing"',
+    verdictBranch.includes('refreshJoints()')
+    && verdictBranch.indexOf('refreshJoints()') < verdictBranch.indexOf('} else if'));
+  const wsSrc = readFileSync(new URL('../server/agent-workspace.mjs', import.meta.url), 'utf8');
+  ok('S10: kernel-cli carries the edit verb — the only write path, so the agent never archaeologizes it again',
+    /cmd === 'edit'/.test(wsSrc) && /decision: 'edit', edits: \{ nodes \}, actor: 'assistant'/.test(wsSrc));
+  ok('S10: kernel-cli carries the deterministic set builders (subtree / region) that replace hand-rolled python over /api/state',
+    /cmd === 'subtree' \|\| cmd === 'region'/.test(wsSrc));
+  ok('S10: AGENTS.md names the scope-rectify recipe and the broadcast, so a circled region is a 4-step job, not a 38-step improvisation',
+    /## Rectifying a joint's scope/.test(wsSrc) && /kernel-cli\.mjs edit <jointId>/.test(wsSrc) && /joint:verdict/.test(wsSrc));
+  const manifestSrc = readFileSync(new URL('../src/plugins/discovery/manifest.mjs', import.meta.url), 'utf8');
+  const loopSrc = readFileSync(new URL('../src/plugins/discovery/loop.mjs', import.meta.url), 'utf8');
+  ok('S10: an edit may name only nodes the mesh contains — applyJointVerdict hands the parsed name set to applyVerdict',
+    /knownNodes/.test(manifestSrc) && /knownNodes/.test(loopSrc) && /unknown node name\(s\)/.test(manifestSrc));
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);
