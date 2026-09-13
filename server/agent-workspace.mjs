@@ -33,8 +33,51 @@ if (cmd === 'validate') {
   console.log(JSON.stringify(await j('/api/joints'), null, 2));
 } else if (cmd === 'state') {
   console.log(JSON.stringify(await j('/api/state'), null, 2));
+} else if (cmd === 'edit') {
+  // The ONE write path for a joint's membership: a verdict with decision=edit.
+  // The kernel validates every name, refuses the whole edit rather than accept
+  // a part of it, and re-runs the physics battery over the new set. A refusal
+  // leaves the manifest byte-identical, so this verb is safe to retry.
+  const id = args[0];
+  const flags = {};
+  for (let i = 1; i < args.length; i += 2) flags[args[i]] = args[i + 1];
+  const list = (s) => String(s == null ? '' : s).split(',').map((x) => x.trim()).filter(Boolean);
+  const cur = await j('/api/joints');
+  const rec = (cur.joints || []).find((x) => x.id === id);
+  if (!rec) { console.log('no joint with id ' + id); process.exit(1); }
+  let nodes = flags['--nodes'] != null ? list(flags['--nodes']) : [...(rec.nodes || [])];
+  if (flags['--add']) nodes = nodes.concat(list(flags['--add']));
+  if (flags['--drop']) { const drop = new Set(list(flags['--drop'])); nodes = nodes.filter((n) => !drop.has(n)); }
+  nodes = [...new Set(nodes)];
+  const body = { decision: 'edit', edits: { nodes }, actor: 'assistant', note: flags['--note'] || 'scope rectified by the assistant' };
+  console.log(JSON.stringify(await post('/api/joints/' + encodeURIComponent(id) + '/verdict', body), null, 2));
+} else if (cmd === 'subtree' || cmd === 'region') {
+  // Deterministic set builders: name the nodes under a hierarchy root, or the
+  // mesh nodes whose world-box centre falls inside a world-space box. These
+  // replace hand-rolled python over /api/state — one call, no arithmetic drift.
+  const st = await j('/api/state');
+  const nodes = st.stats.nodes;
+  const byI = {};
+  const kids = {};
+  for (const n of nodes) { byI[n.i] = n; (kids[n.parent] = kids[n.parent] || []).push(n.i); }
+  const sub = (i) => { const out = []; const s = [i]; while (s.length) { const c = s.pop(); out.push(c); for (const k of kids[c] || []) s.push(k); } return out; };
+  if (cmd === 'subtree') {
+    const q = args[0];
+    const root = nodes.find((n) => n.name === q) || nodes.find((n) => String(n.i) === String(q));
+    if (!root) { console.log('no node named or indexed ' + q); process.exit(1); }
+    const idx = sub(root.i);
+    const meshes = idx.filter((i) => byI[i].mesh);
+    console.log(JSON.stringify({ root: root.name, index: root.i, nodeCount: idx.length, nodes: idx.map((i) => byI[i].name), meshCount: meshes.length, meshes: meshes.map((i) => byI[i].name) }, null, 2));
+  } else {
+    const b = String(args[0] || '').split(',').map(Number);
+    if (b.length !== 6 || b.some(Number.isNaN)) { console.log('usage: node kernel-cli.mjs region <x0,y0,z0,x1,y1,z1>'); process.exit(1); }
+    const lo = [Math.min(b[0], b[3]), Math.min(b[1], b[4]), Math.min(b[2], b[5])];
+    const hi = [Math.max(b[0], b[3]), Math.max(b[1], b[4]), Math.max(b[2], b[5])];
+    const inside = nodes.filter((n) => n.mesh && n.wb && n.wb.c[0] >= lo[0] && n.wb.c[0] <= hi[0] && n.wb.c[1] >= lo[1] && n.wb.c[1] <= hi[1] && n.wb.c[2] >= lo[2] && n.wb.c[2] <= hi[2]);
+    console.log(JSON.stringify({ box: lo.concat(hi), meshCount: inside.length, meshes: inside.map((n) => ({ name: n.name, i: n.i, parent: byI[n.parent] ? byI[n.parent].name : null, wext: n.wext })) }, null, 2));
+  }
 } else {
-  console.log('usage: node kernel-cli.mjs validate [file] | rig <jointId> | joints | state');
+  console.log('usage: node kernel-cli.mjs validate [file] | rig <jointId> | joints | state | edit <jointId> --nodes a,b [--add c] [--drop d] [--note t] | subtree <name|index> | region <x0,y0,z0,x1,y1,z1>');
 }
 `;
 
@@ -54,6 +97,15 @@ SCRIPT in this directory (default: controller.js) so the rig animates correctly.
   cousin/sibling warnings.
 - \`node kernel-cli.mjs joints\` / \`node kernel-cli.mjs state\` — catalog and
   current project state.
+- \`node kernel-cli.mjs edit <jointId> --nodes a,b\` (or \`--add\` / \`--drop\`
+  against the current list, \`--note\` for provenance) — the ONLY write path for
+  a joint's node set. Posts a verdict with actor=assistant; the kernel validates
+  every name and re-runs the physics battery.
+- \`node kernel-cli.mjs subtree <name|index>\` — every node under a hierarchy
+  root, meshes listed separately. \`node kernel-cli.mjs region
+  <x0,y0,z0,x1,y1,z1>\` — the mesh nodes whose world-box centre falls inside a
+  world-space box. Both are deterministic set builders: use them instead of
+  hand-rolled scripts over /api/state.
 
 ## Workflow (repeat until tier-1 passes)
 1. Reproduce: \`node kernel-cli.mjs validate\` and read every failure line.
@@ -83,6 +135,30 @@ floating away from a hub = wrong rotation origin; a static blade at max speed =
 node not in the spin set or wrong axis; mirrored/identical diagonal rpm =
 differential bug. Translate what you see into a validate-able hypothesis, then
 follow the workflow above.
+
+## Rectifying a joint's scope (the human circled a region)
+When the human attaches a screenshot with a drawn circle or box and says which
+joint the marked parts belong to, the job is a MEMBERSHIP edit, not a controller
+fix. Do not read app source to find a write path — there is exactly one, and it
+is a verb:
+1. \`node kernel-cli.mjs joints\` — the joint's current node list and tests.
+2. Name the marked set deterministically: \`node kernel-cli.mjs subtree
+   <name|index>\` for each hierarchy root under the circle (the named nodes are
+   the roots; their unnamed Object_N children are the meshes), and/or
+   \`node kernel-cli.mjs region <x0,y0,z0,x1,y1,z1>\` with a world-space box
+   read off \`state\` to catch meshes that sit inside the circle but hang under
+   another root. Listing a ROOT in the edit is enough — the viewer highlights a
+   node's whole subtree.
+3. \`node kernel-cli.mjs edit <jointId> --nodes <comma-separated names>\`. The
+   kernel refuses the whole edit if any name is unknown, so a refusal means fix
+   the names and retry, never patch files by hand.
+4. \`node kernel-cli.mjs joints\` again and read the tests. A failing test is
+   evidence about the set you chose. The manifest on disk is rebuilt from the
+   joints on every load, so hand-editing it is a dead letter.
+The viewer refreshes itself the moment a verdict lands: the kernel broadcasts
+joint:verdict and every open tab re-reads the joint list. Never modify app code
+to make the UI update, and never conclude an edit "did nothing" from evidence
+older than your own POST.
 
 ## Capability gaps (standing orders)
 When a task needs a capability you do not hold, never give up and never guess —
