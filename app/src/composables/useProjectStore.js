@@ -254,11 +254,22 @@ function connectEvents() {
           text: `I asked the vision model with ${msg.frames} frame(s):\n\n${msg.prompt}`,
           ts: Date.now(),
         });
+      } else if (msg.kind === 'vision:retry') {
+        // The strict-schema retry: the answer was prose (or otherwise
+        // unparseable) where the grounding gate needs a JSON array. Narrated
+        // with the REAL reason instead of letting the round end silently with
+        // "the model proposed nothing".
+        setStatus(`DSH could not read ${state.visionModel}'s answer as proposals and is asking again, strictly. Please wait …`);
+        state.transcript.push({
+          role: 'assistant',
+          text: `The vision model's answer contained no parseable proposal (${msg.reason || 'unparseable reply'}) — prose where the grounding gate needs a JSON array of proposals, so nothing in it could be grounded on the mesh. That is a FORMAT failure, not a finding, so I am asking once more over the same frames with the schema restated. This is the only retry the round gets.`,
+          ts: Date.now(),
+        });
       } else if (msg.kind === 'vision:reply' && msg.reply) {
         setStatus(`DSH got ${state.visionModel}'s answer and is grounding each named part on the mesh. Please wait …`);
         state.transcript.push({
           role: 'assistant',
-          text: `The vision model answered:\n\n${msg.reply}`,
+          text: `${msg.retry ? 'The vision model answered the strict retry' : 'The vision model answered'}:\n\n${msg.reply}`,
           ts: Date.now(),
         });
       }
@@ -343,6 +354,7 @@ function connectEvents() {
           const parts = [`${msg.count} candidate joint(s) in step (2)`];
           parts.push(msg.added ? `the second look added ${msg.added}` : 'the second look added nothing new');
           if (msg.agreed) parts.push(`and independently re-found ${msg.agreed} part(s) already listed — corroboration of one joint, never a duplicate`);
+          if (!msg.added && msg.visionReason) parts.push(`why: ${msg.visionReason}${msg.visionRetried ? ' (after one strict-schema retry)' : ''}`);
           notify(`your instruction was folded in — ${parts.join(', ')}.`);
         } else if (msg.dropped) {
           notify(`dropped ${msg.dropped} from the plan — ${msg.remaining ?? 0} candidate(s) left to check`);
@@ -353,6 +365,7 @@ function connectEvents() {
           const parts = [`${msg.count} candidate joint(s) listed in step (2)`];
           if (msg.added) parts.push(`the vision lane added ${msg.added}`);
           if (msg.agreed) parts.push(`and both producers independently found the same ${msg.agreed} part(s) — recorded as corroboration of one joint, never as a duplicate`);
+          if (!msg.added && msg.visionReason) parts.push(`the vision lane grounded nothing: ${msg.visionReason}${msg.visionRetried ? ' (after one strict-schema retry)' : ''}`);
           if (msg.category) parts.unshift(`I read the machine as ${msg.category}`);
           notify(`stage 1 settled — ${parts.join(', ')}. Candidates are not clickable yet: each one is checked in turn, and I will answer your messages between them.`);
         }

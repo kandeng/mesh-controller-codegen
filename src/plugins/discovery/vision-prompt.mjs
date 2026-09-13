@@ -380,3 +380,34 @@ export function buildVisionPrompt({
     warnings,
   };
 }
+
+// The ONE strict retry a discovery turn gets when its reply carried no
+// parseable proposals at all (prose essay, empty text, broken JSON). A format
+// failure is not a judgement: the model often read the machine perfectly and
+// then answered the wrong QUESTION — an essay about what it saw instead of the
+// array the grounding gate reads. Appended to the SAME prompt over the SAME
+// frames, so nothing is re-rendered and no new evidence is invented; the reply
+// is quoted back to the model because "here is what you said" is the cheapest
+// possible proof that the format, not the content, was the problem.
+export function strictSchemaReminder(previousReply) {
+  const excerpt = String(previousReply || '').trim().slice(0, 600);
+  const lines = [
+    '',
+    '--- STRICT FORMAT RETRY ---',
+    'Your previous reply could not be used: it did not contain a parseable JSON array of proposals,',
+    'so nothing in it could be grounded on the mesh and the round was about to end empty-handed.',
+  ];
+  if (excerpt) {
+    lines.push('Your previous reply began:');
+    lines.push('"""');
+    lines.push(excerpt);
+    lines.push('"""');
+  }
+  lines.push(
+    'Answer again for the SAME frames, with ONLY the JSON array the schema above asks for —',
+    'no prose before or after it. Keep every part you identified: each one becomes an object with',
+    '{"op":"new","type":...,"frameId":...,"regionBox":[x0,y0,x1,y1] as fractions,...} exactly as specified.',
+    'If you truly see no moving parts at all, reply with an empty array: []',
+  );
+  return lines.join('\n');
+}

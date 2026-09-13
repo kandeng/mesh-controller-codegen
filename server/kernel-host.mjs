@@ -761,6 +761,11 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
           agreed: reconciled.agreed.length,
           category: vision?.expectation?.category || null,
           gaps: vision?.gaps || null,
+          // Why the vision lane grounded nothing, in the lane's own words (a
+          // format failure reads differently from an honest empty answer) — the
+          // chat says this instead of leaving a human to guess.
+          visionReason: vision?.reason || null,
+          visionRetried: !!vision?.retried,
         });
 
         // ---- STEERED SECOND LOOK — only when the human said something ----------
@@ -842,6 +847,8 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
               images: extraImages.length,
               category: v2?.expectation?.category || vision?.expectation?.category || null,
               gaps: v2?.gaps || null,
+              visionReason: v2?.reason || null,
+              visionRetried: !!v2?.retried,
             });
             host.diagnostics.note('steered second look', {
               notes: notes.length, images: extraImages.length,

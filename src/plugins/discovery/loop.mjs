@@ -20,7 +20,7 @@ import {
 import { attachmentSanity, discCoherence, isolation } from './tests.mjs';
 import { buildProposalPrompt } from './context.mjs';
 import { aiPropose } from './ai-propose.mjs';
-import { MAX_VISION_FRAMES, buildVisionPrompt } from './vision-prompt.mjs';
+import { MAX_VISION_FRAMES, buildVisionPrompt, strictSchemaReminder } from './vision-prompt.mjs';
 import { visionPropose } from './vision-propose.mjs';
 import {
   buildExpectationPrompt, expectationBrief, expectationGap, expectationIsUsable,
@@ -918,9 +918,57 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
   say('vision:reply', { model: turn?.model ?? null, reply: turn?.reply ?? null });
 
   // 5. GROUND + VALIDATE --------------------------------------------------
-  const parsed = visionPropose({
+  let parsed = visionPropose({
     reply: turn?.reply || '', g, manifest, frames: captured, plan, viewport, independent,
   });
+  // STRICT-SCHEMA RETRY — one shot, format failures only. A reply that carried
+  // no extractable proposal items at all (a prose essay about the machine, an
+  // empty text, broken JSON) is not the model's JUDGEMENT that nothing moves;
+  // it is the model answering the wrong question. Measured on a real Porsche
+  // run: the category turn read "sports car / coupe" perfectly and the
+  // discovery turn answered in prose, so a machine with obvious moving parts
+  // landed zero candidates and the chat could only say "the model proposed
+  // nothing". The retry re-asks over the SAME frames with the schema restated
+  // and the offending reply quoted back. A reply that parsed but was rejected
+  // downstream (grounding, the gate, the battery) never comes here — that is a
+  // judgement, and round 2's close-ups are its remedy, not a re-ask.
+  let formatFailure = null;
+  let retry = null;
+  const PARSE_FAIL = /no JSON array found in reply|parsed value is not an array|JSON parse failed/;
+  if (!parsed.records.length && !parsed.confirms.length && parsed.warnings.some((w) => PARSE_FAIL.test(w))
+    && !(typeof abort === 'function' && abort())) {
+    const why = parsed.warnings.find((w) => PARSE_FAIL.test(w));
+    formatFailure = `the model answered in a format the grounding gate cannot read (${why}), so no proposal was extractable`;
+    warnings.push(`${formatFailure} — asking once more with the schema restated`);
+    say('vision:retry', { reason: why, replyExcerpt: String(turn?.reply || '').slice(0, 400) });
+    const retryText = prompt.text + strictSchemaReminder(turn?.reply);
+    const t1r = Date.now();
+    try {
+      const turn2 = await propose(retryText, prompt.images);
+      retry = {
+        prompt: { text: retryText, frames: prompt.frames, images: prompt.images.length },
+        reply: turn2?.reply ?? null, model: turn2?.model ?? null, ms: Date.now() - t1r,
+      };
+      const parsed2 = visionPropose({ reply: turn2?.reply || '', g, manifest, frames: captured, plan, viewport, independent });
+      if (parsed2.records.length || parsed2.confirms.length) {
+        parsed = parsed2;
+        retry.recovered = true;
+        formatFailure = null; // recovered: the round reads as if the first reply had behaved
+        warnings.push('the strict-schema retry recovered the round — its proposals replace the unparseable first reply');
+      } else {
+        retry.recovered = false;
+        warnings.push(...parsed2.warnings.map((w) => `retry: ${w}`));
+        warnings.push('the strict-schema retry also produced nothing parseable — the round keeps the first attempt\'s empty result');
+      }
+    } catch (e) {
+      retry = { error: e.message, ms: Date.now() - t1r };
+      warnings.push(`the strict-schema retry itself failed: ${e.message}`);
+    }
+    // Both turns persist into the one reply.json — the prose and the retry sit
+    // beside each other in the audit trail instead of one overwriting the other.
+    persist?.reply?.({ ...replyRecord, retry });
+    if (retry && retry.reply != null) say('vision:reply', { model: retry.model ?? null, reply: retry.reply, retry: true });
+  }
   warnings.push(...parsed.warnings);
   say('vision:propose', {
     entries: (parsed.records || []).map((r) => ({
@@ -955,7 +1003,9 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
       confirms: parsed.confirms.length,
       confirmList: parsed.confirms,
       retested: 0,
-      reason: parsed.records.length ? null : 'the model proposed nothing',
+      reason: parsed.records.length ? null : (formatFailure || 'the model proposed nothing'),
+      retried: !!retry,
+      formatFailure,
       views: plan.views.length,
       shots: shots.length,
       frames: captured.length,
@@ -1011,8 +1061,11 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
     confirms: parsed.confirms.length,
     retested: merged.retested,
     // An empty answer is a valid answer — the prompt says so explicitly, and
-    // pretending otherwise would push the model toward invention.
-    reason: merged.added || parsed.confirms.length ? null : 'the model proposed nothing',
+    // pretending otherwise would push the model toward invention. A FORMAT
+    // failure is different: it is reported as what it was, even after the retry.
+    reason: merged.added || parsed.confirms.length ? null : (formatFailure || 'the model proposed nothing'),
+    retried: !!retry,
+    formatFailure,
     views: plan.views.length,
     shots: shots.length,
     frames: captured.length,

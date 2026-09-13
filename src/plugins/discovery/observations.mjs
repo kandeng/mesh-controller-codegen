@@ -226,12 +226,15 @@ export function loadMotion(runDir, round) { return readJson(resolve(roundDir(run
 
 // The prompt/reply pair, verbatim. Kept even when validation rejects every
 // proposal — a rejected proposal is still evidence about what the model saw.
-export function saveReply(runDir, round, { prompt = null, reply = null, model = null, ms = null, warnings = null } = {}) {
+// `retry` is the strict-schema second turn (loop.mjs step 5): when the first
+// reply carried nothing parseable, BOTH exchanges belong in the one file, so a
+// reader sees the prose and the recovery beside each other.
+export function saveReply(runDir, round, { prompt = null, reply = null, model = null, ms = null, warnings = null, retry = null } = {}) {
   if (!runDir) return null;
   const dir = ensure(roundDir(runDir, round));
   const file = resolve(dir, 'reply.json');
   writeJson(file, {
-    ts: new Date().toISOString(), model, ms, warnings, prompt, reply,
+    ts: new Date().toISOString(), model, ms, warnings, prompt, reply, retry,
   });
   return file;
 }
