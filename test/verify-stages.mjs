@@ -46,7 +46,7 @@
 import { readFileSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { parseGlb } from '../src/lib/gltf.mjs';
-import { geometryDiscovery } from '../src/plugins/discovery/geometry.mjs';
+import { geometryDiscovery, spinAxleAxis, wheelUnits } from '../src/plugins/discovery/geometry.mjs';
 import { claimedNodeSet } from '../src/plugins/discovery/manifest.mjs';
 import { planViews, renderTargets, nodeBox, namedIndex } from '../src/plugins/discovery/views.mjs';
 import { frameKey } from '../src/plugins/discovery/observations.mjs';
@@ -958,6 +958,87 @@ const freshStage = () => {
     /if \(liveGlyph\) \{/.test(viewerSrc) && /liveGroup\.remove\(liveGlyph\)/.test(viewerSrc));
   ok('S13: discovering going false retires the theater props even when the end beat never arrives',
     /Safety net: the props retire on the vision:end beat/.test(viewerSrc) && /liveClearTimer = setTimeout\(clearLive, 4000\);/.test(viewerSrc));
+  // ---- S14: generality — wheels by shape+repetition, prose answers by retry ----
+  // Both failures of one real Porsche 911 run: the geometry heuristics read a
+  // drone vocabulary (blades, gimbal names) so a car produced ZERO candidates,
+  // and the vision lane read the car correctly but answered in prose instead of
+  // the schema, so the chat could only say "the model proposed nothing".
+  const geomSrc = readFileSync(new URL('../src/plugins/discovery/geometry.mjs', import.meta.url), 'utf8');
+  const promptSrc = readFileSync(new URL('../src/plugins/discovery/vision-prompt.mjs', import.meta.url), 'utf8');
+  const obsSrc = readFileSync(new URL('../src/plugins/discovery/observations.mjs', import.meta.url), 'utf8');
+  ok('S14: the wheel lane reads shape + repetition (disc symmetry, duplicate family, near ground), never a name vocabulary',
+    /export function wheelUnits/.test(geomSrc) && /disc-symmetry/.test(geomSrc) && /duplicate-family/.test(geomSrc) && /near-ground/.test(geomSrc));
+  ok('S14: spinAxleAxis reads the odd axis of a rotationally symmetric box — thin for one disc, wide for a fused axle',
+    spinAxleAxis([0.12, 0.66, 0.66])?.axis === 0 && spinAxleAxis([0.12, 0.66, 0.66])?.kind === 'thin'
+      && spinAxleAxis([1.78, 0.66, 0.66])?.axis === 0 && spinAxleAxis([1.78, 0.66, 0.66])?.kind === 'wide'
+      && spinAxleAxis([2, 1.1, 4.6]) === null && spinAxleAxis([0.72, 0.72, 0.73]) === null);
+  const box14 = (c, h) => ({ min: [c[0] - h[0], c[1] - h[1], c[2] - h[2]], max: [c[0] + h[0], c[1] + h[1], c[2] + h[2]], c: [...c] });
+  const carG = { nodes: [
+    { i: 0, name: 'body', parent: -1, wb: box14([0, -0.05, 0], [1, 0.55, 2.3]) },
+    { i: 1, name: 'Cylinder.000', parent: 0, wb: box14([0, -0.3, -1.2], [0.9, 0.33, 0.33]) },
+    { i: 2, name: 'Cylinder.000_0', parent: 1, wb: box14([0, -0.3, -1.2], [0.88, 0.26, 0.26]) },
+    { i: 3, name: 'Cylinder.001', parent: 0, wb: box14([0, -0.3, 1.2], [0.9, 0.33, 0.33]) },
+    { i: 4, name: 'Cylinder.001_0', parent: 3, wb: box14([0, -0.3, 1.2], [0.88, 0.26, 0.26]) },
+  ] };
+  const wu = wheelUnits(carG);
+  ok('S14: a car-like table becomes one joint per axle — up inferred, front/rear from the long axis, container + fused children one node set',
+    wu.length === 2 && wu[0].tag === 'rear' && wu[1].tag === 'front'
+      && wu[0].axis[0] === 1 && J(wu[0].nodes) === J(['Cylinder.000', 'Cylinder.000_0']),
+    J(wu.map((w) => `${w.tag}:${w.label}:${w.nodes.length}`)));
+  ok('S14: the wheel lane never steals a part the rotor/gimbal lanes claimed',
+    wheelUnits(carG, new Set(['Cylinder.000'])).length === 0);
+  ok('S14: the drone sample is untouched by the new lane — same 4 rotors + gimbal, zero wheel joints',
+    raw.joints.length === 5 && raw.joints.every((j) => !j.id.startsWith('wheel_')),
+    J(raw.joints.map((j) => j.id)));
+
+  // The retry, behaved not just grepped: a prose first answer must trigger ONE
+  // strict re-ask over the SAME frames, and the round must report the truth —
+  // recovery when the retry parsed, the format failure when it did not.
+  const prose14 = 'This is a sports car, a rear-engine coupe. It has four wheels, two doors and a steering wheel.';
+  const lane14 = () => clone(geo.manifest).map((r) => ({ ...r, history: [...(r.history || [])] }));
+  const texts14 = []; let calls14 = 0;
+  const fA = fakes((loc) => {
+    calls14 += 1;
+    return calls14 === 1 ? prose14 : (loc ? J([{ op: 'new', type: 'hinge', frameId: loc.frameId, regionColors: [loc.color], axis: [0, 0, 1] }]) : '[]');
+  });
+  const beatsA = [];
+  const vA = await runVisionCampaign(g, clone(joints0), lane14(), {
+    plan: fA.plan, capture: fA.capture, persist: fA.persist,
+    propose: async (text, images) => { texts14.push(text); return fA.propose(text, images); },
+    frames: preset, rounds: 1, expectation: false, independent: true,
+    stopAfter: 'proposals', emit: (k) => beatsA.push(k),
+  });
+  ok('S14: a prose reply triggers exactly one strict-schema retry over the same frames, and a parseable retry reply becomes the round\'s proposals',
+    vA.ok && calls14 === 2 && (vA.proposals || []).length === 1
+      && vA.rounds[0].retried === true && vA.rounds[0].formatFailure === null
+      && beatsA.includes('vision:retry')
+      && texts14[1].includes('STRICT FORMAT RETRY') && texts14[1].includes(prose14.slice(0, 40))
+      && fA.state.saved[0].reply === 2,
+    `calls=${calls14} proposals=${(vA.proposals || []).length} beats=${J(beatsA.filter((k) => k.startsWith('vision:')))}`);
+  const textsB = [];
+  const fB = fakes(() => prose14);
+  const vB = await runVisionCampaign(g, clone(joints0), lane14(), {
+    plan: fB.plan, capture: fB.capture, persist: fB.persist,
+    propose: async (text, images) => { textsB.push(text); return fB.propose(text, images); },
+    frames: preset, rounds: 1, expectation: false, independent: true,
+    stopAfter: 'proposals', emit: () => {},
+  });
+  ok('S14: a retry that is ALSO prose reports the real reason — a format the grounding gate cannot read, never "the model proposed nothing"',
+    vB.ok && (vB.proposals || []).length === 0 && textsB.length === 2
+      && vB.rounds[0].retried === true
+      && /format the grounding gate cannot read/.test(vB.rounds[0].reason || '')
+      && vB.rounds[0].formatFailure != null,
+    `reason=${J(vB.rounds[0]?.reason)}`);
+  ok('S14: only a reply with NO parseable items retries — a parsed-but-rejected answer is a judgement and stays one',
+    /PARSE_FAIL = \/no JSON array found in reply\|parsed value is not an array\|JSON parse failed\//.test(loopSrc)
+      && /say\('vision:retry'/.test(loopSrc) && /export function strictSchemaReminder/.test(promptSrc));
+  ok('S14: both turns persist into the one reply.json, and the kernel hands the lane\'s real reason to the chat for both looks',
+    /warnings = null, retry = null/.test(obsSrc)
+      && /persist\?\.reply\?\.\(\{ \.\.\.replyRecord, retry \}\)/.test(loopSrc)
+      && /visionReason: vision\?\.reason \|\| null/.test(kernelSrc)
+      && /visionReason: v2\?\.reason \|\| null/.test(kernelSrc));
+  ok('S14: the chat narrates the retry live and says WHY the vision lane grounded nothing',
+    /msg\.kind === 'vision:retry'/.test(storeSrc) && /visionReason/.test(storeSrc) && /answered the strict retry/.test(storeSrc));
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);
