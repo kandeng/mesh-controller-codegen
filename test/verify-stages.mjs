@@ -841,11 +841,13 @@ const freshStage = () => {
   // problem. Omitting the effort is not neutral either — DSH then falls back to
   // the route default, which is thinking ON (see bailian.patch.yml), so the
   // effort must also be part of what selectModel caches.
-  ok('S9: thinking is turned off ONLY for a machine turn that carries screenshots — a human attachment and the text lane both keep it',
-    /const effort = \(!human && images\.length\) \? 'off' : null;/.test(dshSrc)
+  ok('S9: thinking is off for machine image turns, and for every run after the first of a human turn under the half policy — the text lane keeps it',
+    /const effort = \(!human && images\.length\) \? 'off' : \(human && policy === 'off'\) \? 'off' : null;/.test(dshSrc)
       && /await selectModel\(model, sid, effort\);/.test(dshSrc)
       && /\.\.\.\(effort \? \{ reasoningEffort: effort \} : \{\}\)/.test(dshSrc)
       && /modelBySession\.set\(sid, key\)/.test(dshSrc));
+  ok('S9: the half switch lands on a step boundary and only once per turn — the first run thinks, the rest do not',
+    /kind === 'step\/end'/.test(dshSrc) && /halfArmed && !halfSwitched/.test(dshSrc) && /selectModel\(turnModel, turnSid, 'off'\)/.test(dshSrc));
   // The patch file is the other half of the same decision, and it broke once
   // already. Declaring reasoningEfforts makes pi-ai treat the model as
   // reasoning-capable, and pi-ai then sends the SYSTEM PROMPT with role
@@ -924,6 +926,26 @@ const freshStage = () => {
     /## Removing a joint/.test(wsSrc) && /kernel-cli\.mjs drop <jointId>/.test(wsSrc));
   ok('S11: /discovery drop on a refined joint falls through to removal instead of refusing with dead-end advice',
     /code === 'ALREADY_REFINED' && kernel\.removeJoint/.test(slashSrc));
+
+  // S12 — the efficiency wires. A circled-scope turn on the new recipe still
+  // spent ~90s of remote THINKING per step plus two wasted calls (an
+  // inaccessible /tmp spill grep, a 725-node whole-airframe subtree), and every
+  // server boot threw verified scopes away — the next circled turn re-derived
+  // from scratch what a human had already confirmed. Scope memory makes a
+  // restart start where the human left off; the config dial lets a human image
+  // turn trade deliberation for latency; the measured traps stay named.
+  const agentSrc = readFileSync(new URL('../server/dsh-agent.mjs', import.meta.url), 'utf8');
+  const configSrc = readFileSync(new URL('../src/config.mjs', import.meta.url), 'utf8');
+  ok('S12: verified scopes persist outside runs/ and are re-applied on load as scope-memory edits',
+    /scope-memory\.json/.test(kernelSrc) && /actor: 'scope-memory'/.test(kernelSrc) && /current\.glbSha/.test(kernelSrc));
+  ok('S12: a landed edit/accept records its node set into scope memory keyed by glb content hash',
+    /scopeMemoryWrite\(mem\)/.test(kernelSrc) && /bucket\[id\] = \{ label: rec\.label/.test(kernelSrc));
+  ok('S12: the thinking policy for human turns is a config knob defaulting to half (first run thinks, the rest do not)',
+    /cfg\.humanReasoningPolicy/.test(agentSrc) && /humanReasoningPolicy: raw\.human_reasoning_policy \|\| 'half'/.test(configSrc));
+  ok('S12: kernel-cli region accepts both arg styles and AGENTS.md names the measured waste traps',
+    /args\.join\(','\)/.test(wsSrc) && /Waste traps measured on real turns/.test(wsSrc));
+  ok('S12: kernel-cli answers connectivity in one call (chain) so floater questions never become node -e archaeology',
+    /cmd === 'chain'/.test(wsSrc) && /chain <name,…>/.test(wsSrc));
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);
