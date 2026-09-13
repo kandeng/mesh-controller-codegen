@@ -51,7 +51,7 @@ if (cmd === 'validate') {
   nodes = [...new Set(nodes)];
   const body = { decision: 'edit', edits: { nodes }, actor: 'assistant', note: flags['--note'] || 'scope rectified by the assistant' };
   console.log(JSON.stringify(await post('/api/joints/' + encodeURIComponent(id) + '/verdict', body), null, 2));
-} else if (cmd === 'subtree' || cmd === 'region') {
+} else if (cmd === 'subtree' || cmd === 'region' || cmd === 'chain') {
   // Deterministic set builders: name the nodes under a hierarchy root, or the
   // mesh nodes whose world-box centre falls inside a world-space box. These
   // replace hand-rolled python over /api/state — one call, no arithmetic drift.
@@ -61,7 +61,24 @@ if (cmd === 'validate') {
   const kids = {};
   for (const n of nodes) { byI[n.i] = n; (kids[n.parent] = kids[n.parent] || []).push(n.i); }
   const sub = (i) => { const out = []; const s = [i]; while (s.length) { const c = s.pop(); out.push(c); for (const k of kids[c] || []) s.push(k); } return out; };
-  if (cmd === 'subtree') {
+  if (cmd === 'chain') {
+    // Ancestor chains, one call. A measured turn burned FIVE calls and ~7 min
+    // of thinking gaps on hand-rolled node -e over state dumps to answer
+    // "what hangs off what" — the exact question attachment-sanity floaters
+    // provoke. Print each name's chain up to the root instead.
+    const names = String(args.join(',')).split(',').map((x) => x.trim()).filter(Boolean);
+    if (!names.length) { console.log('usage: node kernel-cli.mjs chain <name,name,…>'); process.exit(1); }
+    const out = {};
+    for (const q of names) {
+      const n = nodes.find((x) => x.name === q) || nodes.find((x) => String(x.i) === String(q));
+      if (!n) { out[q] = null; continue; }
+      const chain = [];
+      let cur = n;
+      while (cur) { chain.push({ i: cur.i, name: cur.name, mesh: !!cur.mesh }); cur = byI[cur.parent]; }
+      out[q] = chain;
+    }
+    console.log(JSON.stringify(out, null, 2));
+  } else if (cmd === 'subtree') {
     const q = args[0];
     const root = nodes.find((n) => n.name === q) || nodes.find((n) => String(n.i) === String(q));
     if (!root) { console.log('no node named or indexed ' + q); process.exit(1); }
@@ -69,7 +86,7 @@ if (cmd === 'validate') {
     const meshes = idx.filter((i) => byI[i].mesh);
     console.log(JSON.stringify({ root: root.name, index: root.i, nodeCount: idx.length, nodes: idx.map((i) => byI[i].name), meshCount: meshes.length, meshes: meshes.map((i) => byI[i].name) }, null, 2));
   } else {
-    const b = String(args[0] || '').split(',').map(Number);
+    const b = String(args.join(',')).split(',').map((x) => x.trim()).filter(Boolean).map(Number);
     if (b.length !== 6 || b.some(Number.isNaN)) { console.log('usage: node kernel-cli.mjs region <x0,y0,z0,x1,y1,z1>'); process.exit(1); }
     const lo = [Math.min(b[0], b[3]), Math.min(b[1], b[4]), Math.min(b[2], b[5])];
     const hi = [Math.max(b[0], b[3]), Math.max(b[1], b[4]), Math.max(b[2], b[5])];
@@ -84,7 +101,7 @@ if (cmd === 'validate') {
   if (!id) { console.log('usage: node kernel-cli.mjs drop <jointId>'); process.exit(1); }
   console.log(JSON.stringify(await post('/api/joints/' + encodeURIComponent(id) + '/remove', { actor: 'assistant' }), null, 2));
 } else {
-  console.log('usage: node kernel-cli.mjs validate [file] | rig <jointId> | joints | state | edit <jointId> --nodes a,b [--add c] [--drop d] [--note t] | subtree <name|index> | region <x0,y0,z0,x1,y1,z1> | drop <jointId>');
+  console.log('usage: node kernel-cli.mjs validate [file] | rig <jointId> | joints | state | edit <jointId> --nodes a,b [--add c] [--drop d] [--note t] | subtree <name|index> | region <x0,y0,z0,x1,y1,z1> | chain <name,…> | drop <jointId>');
 }
 `;
 
@@ -116,8 +133,9 @@ SCRIPT in this directory (default: controller.js) so the rig animates correctly.
 - \`node kernel-cli.mjs subtree <name|index>\` — every node under a hierarchy
   root, meshes listed separately. \`node kernel-cli.mjs region
   <x0,y0,z0,x1,y1,z1>\` — the mesh nodes whose world-box centre falls inside a
-  world-space box. Both are deterministic set builders: use them instead of
-  hand-rolled scripts over /api/state.
+  world-space box. \`node kernel-cli.mjs chain <name,…>\` — each name's ancestor
+  chain to the root (what hangs off what). All three are deterministic set /
+  structure builders: use them instead of hand-rolled scripts over /api/state.
 
 ## Workflow (repeat until tier-1 passes)
 1. Reproduce: \`node kernel-cli.mjs validate\` and read every failure line.
@@ -167,6 +185,14 @@ is a verb:
 4. \`node kernel-cli.mjs joints\` again and read the tests. A failing test is
    evidence about the set you chose. The manifest on disk is rebuilt from the
    joints on every load, so hand-editing it is a dead letter.
+Waste traps measured on real turns: never grep /tmp spill or subprocess logs —
+they live outside your sandbox and the call always fails; re-run the verb
+instead. Never \`subtree\` a root you have not size-checked: \`state\` lists
+every root, and a subtree in the hundreds of nodes is the whole airframe, not
+a part. \`region\` takes one comma-separated box (six space-separated numbers
+are accepted too). For connectivity questions ("what hangs off what", why a
+floater is flagged) use \`chain <name,…>\` — never hand-rolled \`node -e\` over
+state dumps; a measured turn burned five calls and ~7 minutes on exactly that.
 The viewer refreshes itself the moment a verdict lands: the kernel broadcasts
 joint:verdict and every open tab re-reads the joint list. Never modify app code
 to make the UI update, and never conclude an edit "did nothing" from evidence
