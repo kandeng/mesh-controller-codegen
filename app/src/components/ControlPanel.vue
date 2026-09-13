@@ -139,7 +139,7 @@ async function generate() {
 
     <!-- STEP 2 — discovered joints; the 3D view is the primary process surface -->
     <section class="step">
-      <header class="step-head"><span class="num">2</span><span class="title">Find the joints</span></header>
+      <header class="step-head"><span class="num">2</span><span class="title">Find the actuators</span></header>
       <p class="hint">
         Follow the AI assistant in the chatbot to verify each joint's scope: it must
         contain every part that belongs to it, and nothing that doesn't. Joints
@@ -153,7 +153,7 @@ async function generate() {
 
     <!-- STEP 3 — verify motion with the knobs (preview pivot; needs no controller) -->
     <section class="step">
-      <header class="step-head"><span class="num">3</span><span class="title">Control the joints</span></header>
+      <header class="step-head"><span class="num">3</span><span class="title">Control the actuators</span></header>
       <p class="hint">Follow the AI assistant in the chatbot to drive each joint's motion: confirm it moves as expected and that nothing is broken.</p>
       <KnobPanel />
     </section>
