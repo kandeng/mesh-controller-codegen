@@ -106,6 +106,7 @@ export function sceneHeader(facts, { unknownMachine = true } = {}) {
 
 const MODE_EXPLAINS = {
   photo: 'an ordinary opaque render — what a photograph of the assembly would show',
+  clay: 'every part in ONE bright neutral matte material — real colours and textures are hidden on purpose so SHAPE and silhouette are easier to read. Judge by form only; nothing is discoloured or broken',
   ghost: 'the enclosing shell made TRANSLUCENT on purpose, so interior parts become visible. Nothing is broken or missing; see through the hull',
   solo: 'ONLY the focused sub-assembly drawn, everything else hidden — this is the full extent of that group',
   colorId: 'a flat unlit segmentation mask: every part painted one unique colour, listed in the LEGEND below. Report these colours to identify parts exactly',

@@ -348,8 +348,111 @@ function applyPoseUp(pose) {
   camera.up.set(up[0], up[1], up[2]);
 }
 
+// ---- persistent view modes ---------------------------------------------------
+// The panel can wear the model four ways (the switcher at the top). This is a
+// VIEWING convenience only: the capture paths below are the vision lane's
+// evidence and contract for the model AS AUTHORED, so they force the original
+// materials on before applying their own mode, and re-apply the view mode on
+// the way out — a clay panel must never leak into a frame labelled "photo".
+const VIEW_MODES = [
+  { id: 'original', label: 'Original', title: 'the model as authored — its own colours and textures' },
+  { id: 'clay', label: 'Clay', title: 'one neutral matte material on every part — shape only, no colour or texture' },
+  { id: 'xray', label: 'X-Ray', title: 'semi-transparent shell — peek at the interior parts' },
+  { id: 'wire', label: 'Wire', title: 'triangle edges only, no faces — inspect mesh structure (best on low-poly models)' },
+];
+const viewMode = ref('original');
+// mesh -> the material loadModel found (single or array): the one true restore
+// target. Everything a mode puts on is derived and disposable.
+let origMats = new Map();
+// mesh -> the override material it currently wears (empty in 'original').
+const viewOverride = new Map();
+let viewMats = [];          // override materials pending disposal on the next swap
+
+// The model's meshes wherever they currently LIVE: while a joint preview runs,
+// that joint's nodes are re-parented under `pivot` (a scene child, not a drone
+// child), and a drone-only traverse would silently skip them.
+function eachModelMesh(fn) {
+  if (drone) drone.traverse((o) => { if (o.isMesh) fn(o); });
+  if (pivot) pivot.traverse((o) => { if (o.isMesh) fn(o); });
+}
+
+function snapshotOriginals() {
+  origMats = new Map();
+  eachModelMesh((o) => origMats.set(o, o.material));
+}
+
+function disposeViewMats() {
+  for (const d of viewMats) { try { d.dispose(); } catch { /* ignore */ } }
+  viewMats = [];
+  viewOverride.clear();
+}
+
+// Same recipes as captureAt's clay/ghost branches, so the panel shows exactly
+// what the vision lane's frames show.
+const makeViewClay = () => new THREE.MeshStandardMaterial({
+  color: 0xd9d4c8, roughness: 0.95, metalness: 0, side: THREE.DoubleSide,
+});
+
+function makeViewXray(m) {
+  const orig = origMats.get(m);
+  const src = Array.isArray(orig) ? orig[0] : orig;
+  return new THREE.MeshStandardMaterial({
+    color: src?.color ? src.color.clone() : new THREE.Color(0x8899aa),
+    transparent: true, opacity: 0.18, depthWrite: false, side: THREE.DoubleSide,
+    roughness: 0.6, metalness: 0,
+  });
+}
+
+// Unlit and tone-map-free: lines carry no shading, and the colour must survive
+// both panel themes — a mid slate that reads on near-black and near-white. On a
+// dense mesh (hundreds of thousands of triangles) this is a fuzzy mass by the
+// triangle count, which the button's own tooltip warns about.
+const makeViewWire = () => new THREE.MeshBasicMaterial({
+  color: 0x7f8ca0, wireframe: true, toneMapped: false, fog: false,
+});
+
+// The override recipe per mode. 'original' is absent on purpose: no factory IS
+// the original path.
+const VIEW_FACTORIES = { clay: makeViewClay, xray: makeViewXray, wire: makeViewWire };
+
+// What a mesh SHOULD wear right now: its override when a view mode is on, its
+// authored material otherwise. Highlight restore reads this rather than a
+// banked material, so a mode switch while a joint is highlighted can neither
+// resurrect a disposed override nor bank the highlight tint as "original".
+function viewMaterialOf(m) {
+  return viewOverride.get(m) || origMats.get(m) || m.material;
+}
+
+function applyViewMaterials() {
+  disposeViewMats();
+  const factory = VIEW_FACTORIES[viewMode.value];
+  if (factory) {
+    eachModelMesh((m) => {
+      const mat = factory(m);
+      viewMats.push(mat);
+      viewOverride.set(m, mat);
+    });
+  }
+  eachModelMesh((m) => { m.material = viewMaterialOf(m); });
+}
+
+// The model as authored on every mesh — the capture paths' clean slate.
+function forceOriginals() {
+  eachModelMesh((m) => { if (origMats.has(m)) m.material = origMats.get(m); });
+}
+
+function setViewMode(id) {
+  if (!VIEW_MODES.some((m) => m.id === id) || viewMode.value === id) return;
+  viewMode.value = id;
+  applyViewMaterials();
+  updateHighlight();        // re-tint the active joint over the new base
+}
+
 // Draw ONE frame from a planned pose. Modes:
 //   photo    the model as it is — what a human would photograph
+//   clay     every part in ONE bright neutral LIT matte material: colour and
+//            texture hidden on purpose so scoping reads shape only — a
+//            gloss-black hull photographs as a silhouette, clay does not
 //   ghost    shell translucent, focus opaque: reaches the parts the planner
 //            reported as interior-only, which no opaque pose can ever see
 //   solo     ONLY the focus draws: the cheapest way to ground what a sub-assembly
@@ -399,7 +502,7 @@ function captureAt(view, { mode = 'photo', focusNodes = null, viewport = null } 
   };
 
   const meshes = [];
-  drone.traverse((o) => { if (o.isMesh) meshes.push(o); });
+  eachModelMesh((o) => meshes.push(o));
   const savedMats = new Map();
   const savedVis = new Map();
   const disposables = [];
@@ -422,6 +525,20 @@ function captureAt(view, { mode = 'photo', focusNodes = null, viewport = null } 
         savedMats.set(m, m.material);
         // Unlit and tone-mapping-free: the pixel must be EXACTLY the id colour.
         const mat = new THREE.MeshBasicMaterial({ color: ids.get(nm), toneMapped: false, fog: false });
+        disposables.push(mat);
+        m.material = mat;
+      }
+      return;
+    }
+    if (mode === 'clay') {
+      // LIT, not unlit: a flat unlit fill would erase the shading gradients the
+      // shape reading itself depends on. DoubleSide because the thin shells
+      // scoping looks at (hulls, covers) must not vanish from outside.
+      for (const m of meshes) {
+        savedMats.set(m, m.material);
+        const mat = new THREE.MeshStandardMaterial({
+          color: 0xd9d4c8, roughness: 0.95, metalness: 0, side: THREE.DoubleSide,
+        });
         disposables.push(mat);
         m.material = mat;
       }
@@ -472,6 +589,7 @@ function captureAt(view, { mode = 'photo', focusNodes = null, viewport = null } 
     orbit.target.copy(saved.orbitTarget);
     orbit.enabled = saved.orbitEnabled;
     orbit.update();
+    applyViewMaterials();
   };
 
   try {
@@ -487,6 +605,10 @@ function captureAt(view, { mode = 'photo', focusNodes = null, viewport = null } 
     if (markersGroup) markersGroup.visible = false;
     if (tourGroup) tourGroup.visible = false;
     clearHighlight();
+    // Evidence isolation: a capture contracts for the model AS AUTHORED, never
+    // for the panel's current view mode — originals on first, then the capture
+    // mode replaces them on top if it has one.
+    forceOriginals();
 
     applyMode();
 
@@ -643,7 +765,7 @@ function captureMotion(joint, { view, angles = null, mode = 'photo', focusNodes 
   const savedVis = new Map();
   const applySolo = () => {
     if (mode !== 'solo') return;
-    drone.traverse((o) => { if (o.isMesh && !inFocus(o)) { savedVis.set(o, o.visible); o.visible = false; } });
+    eachModelMesh((o) => { if (!inFocus(o)) { savedVis.set(o, o.visible); o.visible = false; } });
   };
   const restoreVis = () => { for (const [o, v] of savedVis) o.visible = v; savedVis.clear(); };
 
@@ -660,6 +782,7 @@ function captureMotion(joint, { view, angles = null, mode = 'photo', focusNodes 
     if (markersGroup) markersGroup.visible = false;
     if (tourGroup) tourGroup.visible = false;
     clearHighlight();
+    forceOriginals();
     applySolo();
 
     renderer.setPixelRatio(1);
@@ -728,6 +851,7 @@ function captureMotion(joint, { view, angles = null, mode = 'photo', focusNodes 
     orbit.target.copy(saved.orbitTarget);
     orbit.enabled = saved.orbitEnabled;
     orbit.update();
+    applyViewMaterials();
     updateHighlight();
   }
 }
@@ -762,11 +886,14 @@ async function loadModel(url) {
   if (!url || url === loadedGlb) return;
   teardownPivot();
   if (drone) { scene.remove(drone); drone = null; }
+  disposeViewMats();          // the OLD model's overrides die with it
+  origMats.clear();
   loadedGlb = url;
   status.value = `loading mesh…`;
   const gltf = await new Promise((res, rej) => new GLTFLoader().load(url, res, undefined, rej));
   drone = gltf.scene;
   scene.add(drone);
+  snapshotOriginals();
   nodeByName = new Map();
   drone.traverse((o) => { if (o.name) nodeByName.set(o.name, o); });
   const box = new THREE.Box3().setFromObject(drone);
@@ -803,6 +930,7 @@ async function loadModel(url) {
   // Markers depend on center/radius, so (re)build them once the model is placed.
   makeHighlightMaterial();
   rebuildMarkers();
+  applyViewMaterials();       // a chosen view mode survives a model swap
   updateHighlight();
   // Announce LAST: the farm may pick this tab the instant it hears "model
   // loaded", and every part of the scene must already be in its rest state.
@@ -1029,7 +1157,7 @@ function rebuildMarkers() {
 // dark craft gets a bright mask and a light craft a deep one. A fixed blue can
 // vanish into a blue-ish model; a computed contrast cannot.
 let highlightMat = null;
-let highlighted = new Map();   // mesh -> its original material
+let highlighted = new Map();   // mesh -> true: membership only — the restore target is COMPUTED by viewMaterialOf, never banked
 
 function modelAverageColor() {
   const acc = { r: 0, g: 0, b: 0 }; let n = 0;
@@ -1052,7 +1180,7 @@ function makeHighlightMaterial() {
 }
 
 function clearHighlight() {
-  for (const [mesh, mat] of highlighted) mesh.material = mat;
+  for (const m of highlighted.keys()) m.material = viewMaterialOf(m);
   highlighted.clear();
 }
 
@@ -1063,15 +1191,11 @@ function updateHighlight() {
   if (!j) return;
   if (!highlightMat) makeHighlightMaterial();
   // A drive set can contain a node AND its descendant, so traverse would visit a
-  // mesh twice; saving its (already-tinted) material the second time would make
-  // clearHighlight re-apply the mask to the old joint. Dedupe so each mesh stores
-  // its TRUE original and switching joints restores cleanly.
-  const seen = new Set();
+  // mesh twice; `highlighted` membership itself is the dedupe.
   for (const o of driveSet(j)) {
     o.traverse((m) => {
-      if (!m.isMesh || seen.has(m)) return;
-      seen.add(m);
-      highlighted.set(m, m.material);
+      if (!m.isMesh || highlighted.has(m)) return;
+      highlighted.set(m, true);
       m.material = highlightMat;
     });
   }
@@ -1432,6 +1556,12 @@ onBeforeUnmount(() => {
       ref="inkRef" class="ink" :class="{ on: !!tool }"
       @pointerdown="inkDown" @pointermove="inkMove" @pointerup="inkUp" @pointercancel="inkUp"
     ></canvas>
+    <div v-if="state.viewer.glb" class="modes">
+      <button
+        v-for="m in VIEW_MODES" :key="m.id" type="button"
+        :class="{ on: viewMode === m.id }" :title="m.title" @click="setViewMode(m.id)"
+      >{{ m.label }}</button>
+    </div>
     <div class="pens">
       <button
         v-for="t in TOOLS" :key="t.id" type="button"
@@ -1489,8 +1619,22 @@ onBeforeUnmount(() => {
 /* annotation layer + pens: the human's markup over the 3D view */
 .ink { position: absolute; inset: 0; z-index: 5; pointer-events: none; }
 .ink.on { pointer-events: auto; cursor: crosshair; }
-.pens {
+/* view-mode switcher: the three ways the model can wear its materials */
+.modes {
   position: absolute; top: 8px; left: 50%; transform: translateX(-50%); z-index: 20;
+  display: flex; align-items: center; gap: 3px;
+  background: var(--overlay-bg); border: 1px solid var(--border-2); border-radius: 8px;
+  padding: 4px 6px;
+}
+.modes button {
+  height: 24px; padding: 0 10px; border: 1px solid transparent; border-radius: 6px;
+  background: transparent; color: var(--text-dim); cursor: pointer;
+  font-family: ui-monospace, monospace; font-size: 11px;
+}
+.modes button:hover { background: var(--surface-3); }
+.modes button.on { border-color: var(--accent-2); color: var(--text); background: var(--item-active); }
+.pens {
+  position: absolute; bottom: 8px; left: 50%; transform: translateX(-50%); z-index: 20;
   display: flex; align-items: center; gap: 3px;
   background: var(--overlay-bg); border: 1px solid var(--border-2); border-radius: 8px;
   padding: 4px 6px;

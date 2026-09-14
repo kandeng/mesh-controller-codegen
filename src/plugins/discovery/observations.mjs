@@ -34,15 +34,18 @@ export const roundDir = (runDir, round) => resolve(observationsRoot(runDir), `r$
 // arrives over HTTP and lands in a path. Whitelist, then bound the length.
 const safeId = (s) => String(s ?? 'frame').replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 64) || 'frame';
 
-// The four things one pose can legitimately be drawn as:
+// The five things one pose can legitimately be drawn as:
 //   photo    the model as it is — what a human would photograph
+//   clay     every part in ONE bright neutral matte material: colour and texture
+//            hidden on purpose so scoping reads shape only — a gloss-black hull
+//            photographs as a silhouette, clay does not
 //   ghost    shell translucent, so the parts enclosed by a closed hull (which no
 //            opaque external viewpoint can ever show) become visible
 //   solo     only the focused sub-assembly draws — the cheapest way to ground
 //            what e.g. a gimbal is actually made of
 //   colorId  flat unique colour per part, giving an exact pixel->name map, so
 //            grounding needs no model inference at all
-export const FRAME_MODES = ['photo', 'ghost', 'solo', 'colorId'];
+export const FRAME_MODES = ['photo', 'clay', 'ghost', 'solo', 'colorId'];
 
 // The storage key of a frame. A frame is identified by the POSE that produced it
 // AND the mode it was drawn in, because re-saving a key REPLACES it — which is
@@ -95,7 +98,7 @@ function readIndex(dir) {
 }
 
 // Store one rendered frame. `frame`:
-//   { id, mode: 'photo'|'ghost'|'solo'|'colorId', spec, pose,
+//   { id, mode: 'photo'|'clay'|'ghost'|'solo'|'colorId', spec, pose,
 //     dataBase64, mediaType, width, height, colorMap?, focus?, note? }
 // `id` here is the STORAGE KEY (see frameKey) — callers that want mode-aware keys
 // compose them with frameKey rather than passing a bare view id.

@@ -552,9 +552,14 @@ export function reopenFromRigidity(manifest, rigidity) {
 //     colour resolves. A whole-model survey would paint all ~345 named parts and
 //     the legend would be noise. Tightest-first, because readability is what makes
 //     the exact channel actually exact in practice.
-//     THE PAIRING IS THE POINT: the mask and the photo share ONE pose, because
-//     reconcile() compares the box a model draws against the colours it reads, and
-//     that comparison means nothing across two different cameras.
+//     THE PAIRING IS THE POINT: the mask and the clay frame share ONE pose,
+//     because reconcile() compares the box a model draws against the colours it
+//     reads, and that comparison means nothing across two different cameras.
+//     The visual half of the pair is CLAY, not a photo: a tight view answers
+//     scoping questions ("how far does this part extend, what is it made of")
+//     and those are shape questions. Clay strips colour and texture — on a
+//     dark hull the difference between a readable frame and a silhouette —
+//     while the survey and orientation photos still carry the real colours.
 //  4. GHOSTS — the only route to interior-only parts, which no opaque pose can
 //     ever show. A ghost with no focus list draws everything opaque, which is an
 //     ordinary photo and not a ghost at all, so `sees` is mandatory here and a
@@ -600,7 +605,9 @@ export function selectShots(views, {
   const photographed = new Set();
   const push = (view, mode, focusNodes) => {
     if (!view || shots.length >= cap) return false;
-    if (mode === 'photo') {
+    // A pose with a full-context visual in EITHER skin is spent: the fill below
+    // must not re-shoot a clay-scoped pose as a photo and call it new evidence.
+    if (mode === 'photo' || mode === 'clay') {
       if (photographed.has(view.id)) return false;
       photographed.add(view.id);
     }
@@ -621,11 +628,11 @@ export function selectShots(views, {
     .sort((a, b) => (a.n - b.n) || (a.i - b.i))
     .slice(0, Math.max(0, maskPairs | 0));
   for (const { v } of maskable) {
-    push(v, 'photo', null);
+    push(v, 'clay', null);
     // Same rule as ghosts, for the same reason: an unfocused colorId paints EVERY
     // named part in the model, so its legend is a wall of ~345 colours and the
-    // exact channel resolves nothing. A view with no predicted visibility gets a
-    // photo only.
+    // exact channel resolves nothing. A view with no predicted visibility gets
+    // the clay frame only.
     const focus = sees(v);
     if (focus) push(v, 'colorId', focus);
   }

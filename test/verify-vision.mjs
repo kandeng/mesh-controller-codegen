@@ -534,12 +534,19 @@ const bigPlan = planViews(g, { maxViews: 8, allowGhost: true, ghostViews: 2 });
   const firstMask = shots.findIndex((s) => s.mode === 'colorId');
   ok('G: masks are actually selected out of the planned views',
     firstMask >= 0, `${of('colorId').length} masks of ${shots.length} shots`);
-  ok('G: EVERY mask is paired with a PHOTO OF THE SAME POSE',
+  ok('G: EVERY mask is paired with a CLAY FRAME OF THE SAME POSE',
     of('colorId').every((s) => {
       const i = shots.indexOf(s);
-      return i > 0 && shots[i - 1].mode === 'photo' && shots[i - 1].viewId === s.viewId;
+      return i > 0 && shots[i - 1].mode === 'clay' && shots[i - 1].viewId === s.viewId;
     }),
     J(of('colorId').map((s) => `${shots[shots.indexOf(s) - 1]?.viewId}/${shots[shots.indexOf(s) - 1]?.mode}+${s.viewId}/${s.mode}`)));
+  ok('G: clay frames sit on the TIGHTEST views and carry no focus',
+    of('clay').length > 0
+    && of('clay').every((s) => s.view.spec?.kind === 'cell' && s.focusNodes === null),
+    J(of('clay').map((s) => `${s.viewId}:${s.view.spec?.kind}:focus=${s.focusNodes}`)));
+  ok('G: a pose scoped in clay is not re-shot as a photo in the fill',
+    of('clay').every((c) => !of('photo').some((p) => p.viewId === c.viewId)),
+    J(of('clay').map((c) => c.viewId)));
   ok('G: EVERY mask carries a focus set, so its legend stays readable',
     of('colorId').every((s) => Array.isArray(s.focusNodes) && s.focusNodes.length > 0),
     J(of('colorId').map((s) => s.focusNodes?.length)));
