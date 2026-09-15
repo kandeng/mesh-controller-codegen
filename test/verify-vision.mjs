@@ -36,6 +36,11 @@
 //      NODE SET into one writer — same parts corroborate, disjoint parts coexist
 //   G9) the category prior aims the camera and supplies a count to falsify, and
 //      has NO path into the manifest: a guess can never become a joint
+//   G10) expectation HINTS: the localization turn's per-part boxes land as hinted
+//      candidates through the same gate (a missing axis is announced, never
+//      invented), the battery — not the hint — disposes of a cabin-swallowing
+//      scope, extras stay gated, and a tighter hint SUPERSEDES the geometry
+//      record it overlaps unless a human has verdicted it
 //   H) every failure path bails with the manifest provably untouched, and an
 //      empty reply counts as success rather than as a crash
 //   I) the model's reasoning and doubts survive the trip to the wire the UI reads
@@ -44,19 +49,20 @@
 import { parseGlb } from '../src/lib/gltf.mjs';
 import { makeCamera, modelRadius, namedIndex, nodeBox, planViews, rectOf, renderTargets, VIEWPORT } from '../src/plugins/discovery/views.mjs';
 import {
-  cloudAnchor, cloudAxis, visionPropose, L2_VISION_BASE_CONFIDENCE,
+  cloudAnchor, cloudAxis, HINT_GATE_PROFILE, visionPropose, L2_VISION_BASE_CONFIDENCE,
 } from '../src/plugins/discovery/vision-propose.mjs';
 import {
   buildVisionPrompt, frameLine, sceneFacts, screenAxes,
 } from '../src/plugins/discovery/vision-prompt.mjs';
 import {
-  MAX_EXTRA_VIEWS, MAX_VISION_ROUNDS, reconcileLanes, runProducerLanes,
+  isHintRecord, MAX_EXTRA_VIEWS, MAX_VISION_ROUNDS, reconcileLanes, runProducerLanes,
   runVisionCampaign, runVisionRound, selectShots, SHOT_BUDGET,
 } from '../src/plugins/discovery/loop.mjs';
 import {
   buildExpectationPrompt, expectationGap, expectationIsUsable, isExpectationPrompt,
   MAX_INSTANCE_COUNT, parseExpectation, surveyPhotos, verifiedInstances,
 } from '../src/plugins/discovery/expectation.mjs';
+import { isLocalizationPrompt } from '../src/plugins/discovery/localize.mjs';
 import { regionsFromExpectations } from '../src/plugins/discovery/grounding.mjs';
 import { frameKey } from '../src/plugins/discovery/observations.mjs';
 // The serializer that stands between a merged record and the browser. Importing
@@ -1473,19 +1479,24 @@ function makeFakes(replyOf) {
     plan: f9.plan, capture: f9.capture,
     propose: async (text) => {
       const isExp = isExpectationPrompt(text);
-      turns.push(isExp ? 'category' : 'discovery');
+      const isLoc = isLocalizationPrompt(text);
+      turns.push(isExp ? 'category' : isLoc ? 'localization' : 'discovery');
       if (isExp) return { reply: goodReply, model: 'fake-vlm', ms: 3 };
+      // The localization turn fires here: the prior is usable AND a dictionary
+      // hit. It comes back empty too, so the boundary below covers hints
+      // exactly as it covers free proposals.
+      if (isLoc) return { reply: '[]', model: 'fake-vlm', ms: 4 };
       discoveryPrompt = text;
       return { reply: '[]', model: 'fake-vlm', ms: 4 };
     },
     persist: { ...f9.persist, expectation: (e) => savedExp.push(e) },
     expectation: true, emit: (kind, payload) => beats9.push({ kind, payload }),
   });
-  ok('G9: a round asks the category turn FIRST and the discovery turn SECOND, over the SAME rendered frames',
-    J(turns) === '["category","discovery"]' && f9.calls.capture > 0, J(turns));
-  ok('G9: THE BOUNDARY - a confident prior plus an empty discovery reply produces NO joint at all',
-    res9.ok === true && res9.added === 0 && man9.length === 0 && res9.proposals.length === 0,
-    J({ ok: res9.ok, added: res9.added, manifest: man9.length }));
+  ok('G9: a round asks the category turn FIRST, the localization turn SECOND and the discovery turn THIRD, over the SAME rendered frames',
+    J(turns) === '["category","localization","discovery"]' && f9.calls.capture > 0, J(turns));
+  ok('G9: THE BOUNDARY - a confident prior whose localization AND discovery replies both come back empty produces NO joint at all',
+    res9.ok === true && res9.added === 0 && man9.length === 0 && res9.proposals.length === 0 && res9.hinted === 0,
+    J({ ok: res9.ok, added: res9.added, manifest: man9.length, hinted: res9.hinted }));
   ok('G9: the prior reaches turn B as a HYPOTHESIS TO FALSIFY, in its own words and with its own counts',
     /HYPOTHESIS TO FALSIFY/.test(discoveryPrompt || '') && /quadrotor drone/.test(discoveryPrompt || '')
     && /expects 4 x rotor/.test(discoveryPrompt || '') && /look for the missing 4/.test(discoveryPrompt || ''),
@@ -1504,10 +1515,11 @@ function makeFakes(replyOf) {
     && b9.payload.instances.length === 2 && b9.payload.instances[0].count === 4
     && Array.isArray(b9.payload.gaps) && !!b9.payload.prompt && !!b9.payload.reply,
     J(b9?.payload && { category: b9.payload.category, instances: b9.payload.instances.length, gaps: b9.payload.gaps.length }));
-  ok('G9: the beat order puts the prior between the plan and the discovery question',
+  ok('G9: the beat order puts the prior and the localization beat between the plan and the discovery question',
     (() => {
       const k = beats9.map((b) => b.kind);
-      return k.indexOf('vision:expect') > k.indexOf('vision:plan') && k.indexOf('vision:expect') < k.indexOf('vision:ask')
+      return k.indexOf('vision:expect') > k.indexOf('vision:plan') && k.indexOf('vision:expect') < k.indexOf('vision:localize')
+        && k.indexOf('vision:localize') < k.indexOf('vision:ask')
         && k.indexOf('vision:ask') < k.indexOf('vision:reply') && k.indexOf('vision:reply') < k.indexOf('vision:verdict');
     })(), J(beats9.map((b) => b.kind)));
 
@@ -1617,6 +1629,257 @@ function makeFakes(replyOf) {
   });
   ok('G9: a caller can switch the prior off and get the single-turn round back',
     J(kinds14) === '["discovery"]', J(kinds14));
+}
+
+// ---- G10) expectation hints: landing, physics, supersession --------------------
+// The localization turn asks one question PER EXPECTED PART and parses the reply
+// through the same gate as the discovery turn, under the hint profile. Three
+// disciplines keep a hint honest: it LANDS even when nobody can supply a spin
+// axis (a steered wheel's grounded cloud is too round to derive one from — the
+// gap is announced, never invented); the BATTERY, not the hint, disposes of the
+// scope the box selects; and for a part the dictionary covers, a tighter hint
+// SUPERSEDES the geometry lane's overlapping record — the geometry demotes to
+// corroboration instead of the pre-hint reverse.
+{
+  // What B proved the default gate drops — a box with no derivable axis — the
+  // hint profile must ADMIT: dropping it made the geometry lane's spinAxleAxis
+  // gate the final word on a part the dictionary says is there.
+  const hintGate = visionPropose({
+    reply: J([{ op: 'new', type: 'rotor', frameId: view.id, regionBox: subjectBox }]),
+    g, manifest: [], frames: [photoFrame], plan, profile: HINT_GATE_PROFILE,
+  });
+  ok('G10: the box the default gate drops for want of an axis LANDS under the hint profile, axis null',
+    hintGate.records.length === 1 && hintGate.records[0].axis === null, J(hintGate.warnings));
+  ok('G10: ...and the missing axis is ANNOUNCED as an uncertainty, never silently invented',
+    (hintGate.records[0]?.uncertainties || []).some((u) => u.includes('no axis')),
+    J(hintGate.records[0]?.uncertainties?.slice(-1)));
+  ok('G10: the hint profile stamps provenance onto the record itself',
+    hintGate.records[0]?.origin === 'expectation-hint' && hintGate.records[0]?.evidence?.[0] === 'expectation-hint'
+    && hintGate.records[0]?.id === 'rotor_hint_0' && isHintRecord(hintGate.records[0]),
+    `${hintGate.records[0]?.id} — ${hintGate.records[0]?.label}`);
+
+  // The supersede rule, unit-level. reconcileLanes' prefer option is the staged
+  // pipeline's copy of it; the campaign path's copy runs inside the round below.
+  const geoLane = (over = {}) => ({
+    id: 'wheel_geo_0', type: 'rotor', nodes: ['a', 'b', 'c'], origin: 'L1-geometry', verdict: null, ...over,
+  });
+  const hintLane = (nodes, over = {}) => ({
+    id: 'rotor_hint_0', type: 'rotor', nodes, hinted: true, origin: 'expectation-hint', ...over,
+  });
+  const sup = reconcileLanes([geoLane()], { records: [hintLane(['a', 'b'])] }, { prefer: isHintRecord });
+  ok('G10: a tighter hint SUPERSEDES the overlapping geometry record, which is reported with what it gave up',
+    sup.records.length === 1 && sup.records[0].id === 'rotor_hint_0' && sup.confirms.length === 0
+    && sup.superseded.length === 1 && sup.superseded[0].id === 'wheel_geo_0' && sup.superseded[0].by === 'rotor_hint_0'
+    && sup.superseded[0].origin === 'L1-geometry' && sup.superseded[0].match === 'overlap'
+    && J(sup.superseded[0].laneOnly) === '["c"]', J(sup.superseded));
+  const verdicted = reconcileLanes([geoLane({ verdict: { decision: 'reject' } })], { records: [hintLane(['a', 'b'])] }, { prefer: isHintRecord });
+  ok('G10: ...but a record carrying ANY human verdict is off-limits — a person\'s "no" ranks as high as a "yes"',
+    verdicted.superseded.length === 0 && verdicted.records.length === 0
+    && verdicted.confirms.length === 1 && verdicted.confirms[0].targetId === 'wheel_geo_0');
+  const bigger = reconcileLanes([geoLane()], { records: [hintLane(['a', 'b', 'c', 'd'])] }, { prefer: isHintRecord });
+  ok('G10: a hint LARGER than the record it overlaps corroborates instead of replacing — a sloppy box never eats a truthful scope',
+    bigger.superseded.length === 0 && bigger.records.length === 0 && bigger.confirms.length === 1);
+  const plainLane = reconcileLanes([geoLane()], { records: [{ id: 'rotor_vis_0', type: 'rotor', nodes: ['a', 'b'], origin: 'L2-vision' }] }, { prefer: isHintRecord });
+  ok('G10: a non-hint record never supersedes, prefer rule or not',
+    plainLane.superseded.length === 0 && plainLane.confirms.length === 1);
+  const noPrefer = reconcileLanes([geoLane()], { records: [hintLane(['a', 'b'])] });
+  ok('G10: with no prefer rule the lane keeps its pre-hint behaviour — agreement is corroboration',
+    noPrefer.superseded.length === 0 && noPrefer.confirms.length === 1);
+  const exactSup = reconcileLanes([geoLane()], { records: [hintLane(['a', 'b', 'c'])] }, { prefer: isHintRecord });
+  ok('G10: an exact-set hint supersedes too, reported as an exact match with nothing given up',
+    exactSup.superseded.length === 1 && exactSup.superseded[0].match === 'exact' && exactSup.superseded[0].laneOnly.length === 0);
+
+  // The round, fully faked: a car prior, five pointed boxes (four wheels and a
+  // door), and one extra the discovery turn finds on its own.
+  const sv10 = bigPlan.views.find((v) => v.spec?.kind === 'survey');
+  const cam10 = sv10.cam;
+  const frame10 = {
+    id: frameKey(sv10.id, 'photo'), viewId: sv10.id, mode: 'photo', pose: sv10.pose,
+    spec: sv10.spec, covers: sv10.covers, sees: sv10.sees,
+  };
+  const probeable10 = (sv10.sees || []).filter((nm) => nameOfMesh.has(nm));
+  // Six parts whose boxes ground to MUTUALLY DISJOINT node sets: disjointness is
+  // what keeps the battery's cross-joint isolation check clean, so the physics
+  // assertions below measure scopes, not overlaps. Grounding is deterministic, so
+  // what this picker measures is exactly what the round below will ground.
+  const pointed = [];
+  for (const nm of probeable10) {
+    if (pointed.length >= 6) break;
+    const r = rectOf(nodeBox(nameOfMesh.get(nm)), cam10);
+    if (!r) continue;
+    const box = [r.x0 / cam10.w, r.y0 / cam10.h, r.x1 / cam10.w, r.y1 / cam10.h];
+    const grounded = visionPropose({
+      reply: J([{ op: 'new', type: 'rotor', frameId: frame10.id, regionBox: box }]),
+      g, manifest: [], frames: [frame10], plan: bigPlan, profile: HINT_GATE_PROFILE,
+    }).records[0];
+    if (!grounded) continue;
+    if (pointed.some((p) => p.nodes.some((n) => grounded.nodes.includes(n)))) continue;
+    pointed.push({ nm, box, nodes: grounded.nodes });
+  }
+  ok('G10: fixture — six parts whose boxes ground to mutually disjoint node sets exist to point at',
+    pointed.length === 6, pointed.map((p) => `${p.nm}:${p.nodes.length}n`).join(', '));
+
+  const locReply = J(pointed.slice(0, 5).map((p, i) => ({
+    op: 'new', type: i < 4 ? 'rotor' : 'hinge', part: i < 4 ? 'wheel' : 'door',
+    frameId: frame10.id, regionBox: p.box,
+    reasoning: `the ${i < 4 ? `wheel ${i + 1} of 4` : 'door'} at this spot`,
+  })));
+  const carReply = J({
+    category: 'a sports car', confidence: 0.9, summary: 'four wheels at the corners, doors on the sides',
+    instances: [{ type: 'rotor', count: 4, frameId: frame10.id, regionBox: [0.1, 0.1, 0.5, 0.5], symmetry: 'one per corner', note: 'wheels' }],
+    doubts: [], alternatives: [],
+  });
+  const extraReply = J([{
+    op: 'new', type: 'rotor', part: 'turret', frameId: frame10.id, regionBox: pointed[5]?.box,
+    axis: [0, 0, 1], reasoning: 'a rotating ring on the spine that a car does not usually have',
+  }]);
+
+  const fh = makeFakes(() => '[]');
+  const beatsH = [];
+  const turnsH = [];
+  const manh = [];
+  const jh = [];
+  const resh = await runVisionRound(g, jh, manh, {
+    plan: fh.plan, capture: fh.capture, persist: fh.persist,
+    propose: async (text) => {
+      const kind = isExpectationPrompt(text) ? 'category' : isLocalizationPrompt(text) ? 'localization' : 'discovery';
+      turnsH.push(kind);
+      if (kind === 'category') return { reply: carReply, model: 'fake-vlm', ms: 3 };
+      if (kind === 'localization') return { reply: locReply, model: 'fake-vlm', ms: 4 };
+      return { reply: extraReply, model: 'fake-vlm', ms: 4 };
+    },
+    expectation: true, emit: (kind, payload) => beatsH.push({ kind, payload }),
+  });
+  ok('G10: a dictionary-backed prior runs the three turns in order — category, localization, discovery',
+    J(turnsH) === '["category","localization","discovery"]', J(turnsH));
+  ok('G10: all five pointed parts land as candidates — four wheels and a door — plus the discovery turn\'s extra',
+    resh.ok === true && resh.added === 6 && resh.hinted === 5 && manh.length === 6,
+    J({ added: resh.added, hinted: resh.hinted, manifest: manh.length, w: resh.warnings.slice(0, 2) }));
+  const wheels = manh.filter((r) => r.part === 'wheel');
+  ok('G10: the four wheels are FOUR records — one entry per instance, never one box around all four',
+    wheels.length === 4 && wheels.every((r) => r.hinted === true && r.origin === 'expectation-hint'
+      && r.type === 'rotor' && (r.evidence || []).includes('dictionary:car')),
+    J(wheels.map((r) => r.id)));
+  ok('G10: every wheel hint grounds to the part it was pointed at',
+    wheels.every((r, i) => (r.nodes || []).includes(pointed[i].nm)),
+    J(manh.map((r) => `${r.id}:${(r.nodes || []).length}n`)));
+  const door = manh.find((r) => r.part === 'door');
+  ok('G10: the hinge box grounds to the door\'s own nodes only — the pointed part, none of the wheels, capped tight',
+    !!door && door.type === 'hinge' && door.hinted === true
+    && door.nodes.includes(pointed[4].nm)
+    && pointed.slice(0, 4).every((p) => !door.nodes.includes(p.nm))
+    && door.nodes.length <= 8,
+    J(door?.nodes));
+  ok('G10: a hint whose cloud yields no axis lands anyway, with the gap announced (the steered-wheel case)',
+    manh.filter((r) => r.hinted).every((r) => r.axis !== null
+      || (r.uncertainties || []).some((u) => u.includes('no axis'))),
+    J(manh.filter((r) => r.hinted).map((r) => `${r.id}:axis=${r.axis ? 'derived' : 'null'}`)));
+  ok('G10: the battery runs on hints exactly as on any proposal — physics, not the pointing, disposes',
+    manh.every((r) => (r.tests || []).length === 4 && [0.7, 0.75, 0.8].includes(r.confidence)),
+    J(manh.map((r) => `${r.id}:${r.confidence}`)));
+  ok('G10: disjoint pointed scopes keep the isolation check clean across the whole merged set',
+    manh.every((r) => (r.tests || []).find((t) => t.name === 'isolation')?.pass === true),
+    J(manh.map((r) => (r.tests || []).find((t) => t.name === 'isolation')?.detail).filter(Boolean)));
+  ok('G10: the recognition gate lists the hints as EXPECTED parts of a car',
+    resh.recognition?.dict === 'car' && resh.recognition?.listed === 6
+    && manh.filter((r) => r.hinted).every((r) => r.listed === true && r.expected === true && r.extra === false),
+    J(resh.recognition && { dict: resh.recognition.dict, listed: resh.recognition.listed }));
+  ok('G10: ...and the extra the discovery turn found is still gated — listed, flagged, announced',
+    resh.recognition?.extras === 1 && resh.recognition?.excluded === 0
+    && manh.find((r) => r.part === 'turret')?.extra === true
+    && resh.warnings.some((w) => /recognition gate: .*turret.*EXTRA/.test(w)),
+    J(resh.recognition?.notes));
+  ok('G10: the gap check closes on the hints — the wheels the prior expected are FOUND, the turret is a surplus',
+    resh.gaps?.find((x) => x.type === 'rotor')?.expected === 4
+    && resh.gaps.find((x) => x.type === 'rotor')?.found === 5
+    && resh.gaps.find((x) => x.type === 'rotor')?.missing === 0
+    && resh.gaps.find((x) => x.type === 'rotor')?.surplus === 1,
+    J(resh.gaps));
+  ok('G10: the parts nobody pointed at stay missing — the ask list is a falsifiable count, not a rubber stamp',
+    resh.gaps?.find((x) => x.type === 'hinge')?.missing === 7
+    && resh.gaps?.find((x) => x.type === 'gimbal')?.missing === 4,
+    J(resh.gaps));
+  const locBeat = beatsH.find((b) => b.kind === 'vision:localize');
+  ok('G10: the localization beat carries the dictionary key, the ask count and the landed hints',
+    !!locBeat && locBeat.payload.dictKey === 'car' && locBeat.payload.asked === 16
+    && (locBeat.payload.hints || []).length === 5 && !!locBeat.payload.prompt && !!locBeat.payload.reply,
+    J(locBeat?.payload && { dictKey: locBeat.payload.dictKey, asked: locBeat.payload.asked, hints: locBeat.payload.hints?.length }));
+  const verdictBeatH = beatsH.find((b) => b.kind === 'vision:verdict');
+  ok('G10: the verdict beat reports no supersession when the manifest held nothing the hints overlap',
+    !!verdictBeatH && J(verdictBeatH.payload.superseded) === '[]' && resh.superseded?.length === 0,
+    J(verdictBeatH?.payload?.superseded));
+
+  // A box around the WHOLE machine is the cabin-swallowing case. The hint gate
+  // must still LAND it — gating on scope would re-blind the lane the way
+  // spinAxleAxis did — and the battery is the instrument that rejects it.
+  const fm = makeFakes(() => '[]');
+  const manm = [];
+  const resm = await runVisionRound(g, [], manm, {
+    plan: fm.plan, capture: fm.capture,
+    propose: async (text) => {
+      if (isExpectationPrompt(text)) return { reply: carReply, model: 'fake-vlm', ms: 3 };
+      if (isLocalizationPrompt(text)) {
+        return {
+          reply: J([{ op: 'new', type: 'rotor', part: 'wheel', frameId: frame10.id, regionBox: [0.02, 0.02, 0.98, 0.98], reasoning: 'a wheel, somewhere in here' }]),
+          model: 'fake-vlm', ms: 4,
+        };
+      }
+      return { reply: '[]', model: 'fake-vlm', ms: 4 };
+    },
+    expectation: true,
+  });
+  const monster = manm[0];
+  ok('G10: the cabin-swallowing hint LANDS — its scope is physics\' business, not the gate\'s',
+    resm.ok === true && resm.hinted === 1 && !!monster && monster.hinted === true,
+    J({ hinted: resm.hinted, nodes: monster?.nodes?.length }));
+  ok('G10: ...and the battery REJECTS the swallowed scope — the same ruler that kills the FR-rotor cluster',
+    monster?.tests?.find((t) => t.name === 'scope-spread')?.pass === false
+    && monster.confidence === 0.7 && monster.status === 'needs-verdict',
+    monster?.tests?.find((t) => t.name === 'scope-spread')?.detail);
+
+  // A geometry record already in the manifest, overlapping a hint the dictionary
+  // covers: the hint's per-part scope REPLACES it, and the geometry record
+  // demotes to corroboration evidence on the hint that replaced it.
+  const stray = probeable10.find((nm) => !pointed.some((p) => p.nm === nm || p.nodes.includes(nm)));
+  const geoWheel = rec({
+    id: 'wheel_geo_0', label: 'wheel (geometry)', type: 'rotor',
+    nodes: [...pointed[0].nodes, stray], origin: 'L1-geometry',
+  });
+  const fs = makeFakes(() => '[]');
+  const beatsS = [];
+  const mans = [geoWheel];
+  const js = [{ ...geoWheel }];
+  const ress = await runVisionRound(g, js, mans, {
+    plan: fs.plan, capture: fs.capture,
+    propose: async (text) => {
+      if (isExpectationPrompt(text)) return { reply: carReply, model: 'fake-vlm', ms: 3 };
+      if (isLocalizationPrompt(text)) {
+        return {
+          reply: J([{ op: 'new', type: 'rotor', part: 'wheel', frameId: frame10.id, regionBox: pointed[0].box, reasoning: 'wheel 1 of 4' }]),
+          model: 'fake-vlm', ms: 4,
+        };
+      }
+      return { reply: '[]', model: 'fake-vlm', ms: 4 };
+    },
+    expectation: true, emit: (kind, payload) => beatsS.push({ kind, payload }),
+  });
+  ok('G10: the hint SUPERSEDES the overlapping geometry record — the manifest swaps, it does not duplicate',
+    ress.ok === true && mans.length === 1 && mans[0].id === 'rotor_hint_0' && mans[0].hinted === true
+    && !mans.some((r) => r.id === 'wheel_geo_0') && !js.some((j) => j.id === 'wheel_geo_0'),
+    J({ manifest: mans.map((r) => r.id), joints: js.map((j) => j.id) }));
+  ok('G10: the supersession is reported with how the two claims matched',
+    ress.superseded?.length === 1 && ress.superseded[0].id === 'wheel_geo_0'
+    && ress.superseded[0].by === 'rotor_hint_0' && ress.superseded[0].origin === 'L1-geometry'
+    && ress.superseded[0].shared === pointed[0].nodes.length && ress.superseded[0].containment === 1,
+    J(ress.superseded));
+  ok('G10: the hint carries the demotion as evidence and history — corroboration, not disappearance',
+    mans[0].evidence.includes('supersedes:wheel_geo_0') && mans[0].evidence.includes('cross-producer:L1-geometry')
+    && (mans[0].history || []).some((h) => h.event === 'superseded' && /wheel_geo_0/.test(h.note || '')),
+    J(mans[0].evidence));
+  const beatS = beatsS.find((b) => b.kind === 'vision:verdict');
+  ok('G10: the verdict beat announces the supersession',
+    J(beatS?.payload?.superseded) === J([{ id: 'wheel_geo_0', by: 'rotor_hint_0' }]),
+    J(beatS?.payload?.superseded));
 }
 
 // ---- H) every failure path leaves the manifest untouched ----------------------

@@ -25,10 +25,31 @@
 // the deterministic battery lifts a record (see loop.mjs).
 import { VIEWPORT, namedIndex, nodeBox, renderTargets } from './views.mjs';
 import { BOX_DILATE, MAX_CANDIDATES, MIN_BOX_SCORE, groundRegion } from './grounding.mjs';
-import { createProposalGate, parseReply, vec3, TYPES } from './propose-core.mjs';
+import { createProposalGate, MAX_PROPOSALS, parseReply, vec3, TYPES } from './propose-core.mjs';
 import { normPartName } from './actuator-dictionary.mjs';
 
 export const L2_VISION_BASE_CONFIDENCE = 0.7;
+
+// The gate profile for the PER-PART LOCALIZATION turn (localize.mjs): the same
+// channel, the same grounding, the same battery — but records minted from a
+// dictionary's reference list must be TELTABLE from records the model found on
+// its own, because reconcileLanes demotes an overlapping geometry record only
+// for a hint (loop.mjs), never for a free proposal. `idTag` also keeps their
+// ids out of the discovery turn's numbering, so one round can hold both kinds
+// without a collision.
+export const HINT_GATE_PROFILE = {
+  idTag: 'hint',
+  label: (t) => `${t} (expectation hint)`,
+  evidenceTag: 'expectation-hint',
+  origin: 'expectation-hint',
+  // A hint whose spin axis nobody could supply — the model declined, and the
+  // grounded cloud was too round to derive one (a steered wheel's rounded
+  // export box is exactly this) — LANDS with axis null and the gap in its
+  // uncertainties. Dropping it would make the geometry lane's spinAxleAxis
+  // gate the final word on a part the dictionary says is there; the battery
+  // that disposes of the record never reads an axis.
+  allowNoAxis: true,
+};
 
 // A box is a COARSE hypothesis: dilated by design and depth-sorted, so its tail
 // is background. Admitting all 24 candidates as one joint would hand the battery
@@ -328,16 +349,18 @@ export function visionPropose({
   reply, g, manifest, frames = [], plan = null,
   viewport = VIEWPORT, dilate = BOX_DILATE, minScore = MIN_BOX_SCORE,
   maxResults = MAX_CANDIDATES, maxBoxNodes = MAX_BOX_NODES, independent = false,
+  maxProposals = MAX_PROPOSALS, profile = null,
 } = {}) {
   const gate = createProposalGate({
     g,
     manifest,
-    idTag: 'vis',
-    label: (t) => `${t} (vision proposal)`,
-    evidenceTag: 'l2-vision',
-    baseConfidence: L2_VISION_BASE_CONFIDENCE,
-    origin: 'L2-vision',
+    idTag: profile?.idTag || 'vis',
+    label: profile?.label || ((t) => `${t} (vision proposal)`),
+    evidenceTag: profile?.evidenceTag || 'l2-vision',
+    baseConfidence: profile?.baseConfidence ?? L2_VISION_BASE_CONFIDENCE,
+    origin: profile?.origin || 'L2-vision',
     independent,
+    allowNoAxis: profile?.allowNoAxis === true,
   });
   const opts = { viewport, dilate, minScore, maxResults };
   const byFrame = frameIndex(frames, plan);
@@ -346,7 +369,7 @@ export function visionPropose({
   const suggestViews = [];
   const admitted = [];
 
-  const { items, warnings } = parseReply(reply);
+  const { items, warnings } = parseReply(reply, maxProposals);
   gate.warnings.push(...warnings);
 
   items.forEach((p, idx) => {

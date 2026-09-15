@@ -17,17 +17,18 @@ import {
   AUTO_ACCEPT_CONFIDENCE, applyManifest, applyVerdict, buildManifest, deriveStatus,
   reopen, retireStaleEdit, saveManifest,
 } from './manifest.mjs';
-import { attachmentSanity, discCoherence, isolation } from './tests.mjs';
+import { attachmentSanity, discCoherence, isolation, scopeSpread } from './tests.mjs';
 import { buildProposalPrompt } from './context.mjs';
 import { aiPropose } from './ai-propose.mjs';
 import { MAX_VISION_FRAMES, buildVisionPrompt, strictSchemaReminder } from './vision-prompt.mjs';
-import { visionPropose } from './vision-propose.mjs';
+import { HINT_GATE_PROFILE, visionPropose } from './vision-propose.mjs';
+import { buildLocalizationPrompt } from './localize.mjs';
 import {
   buildExpectationPrompt, expectationBrief, expectationGap, expectationIsUsable,
   parseExpectation, verifiedInstances,
 } from './expectation.mjs';
 import { regionsFromExpectations } from './grounding.mjs';
-import { applyRecognitionGate, reconcileExpectation } from './actuator-dictionary.mjs';
+import { applyRecognitionGate, lookupDictionary, reconcileExpectation } from './actuator-dictionary.mjs';
 import { buildMotionPrompt, MAX_MOTION_FRAMES } from './motion-prompt.mjs';
 import { motionAssess } from './motion-propose.mjs';
 import { VIEWPORT, modelRadius, modelTarget, namedIndex, nodeBox, planCloseUps, regionsFromSuggestViews, renderTargets } from './views.mjs';
@@ -39,7 +40,13 @@ import { AMORTIZABLE, peersOf } from './symmetry.mjs';
 // and a reader could not tell which described the current membership. Evidence
 // from anywhere else — a rigidity-gate failure attached by reopen() — is
 // deliberately not in this set and survives every re-run.
-const BATTERY_TESTS = new Set(['disc-coherence', 'anchor-sphere', 'isolation', 'attachment-sanity']);
+const BATTERY_TESTS = new Set(['disc-coherence', 'anchor-sphere', 'isolation', 'attachment-sanity', 'scope-spread']);
+
+// The localization turn's grounded/admitted entries are re-indexed by this
+// offset before they join the discovery turn's lists, because both parses
+// number their items from 0 and the lists join by index. The actual value is
+// arbitrary — it only has to be larger than any reply either turn may hold.
+const HINT_INDEX_BASE = 1000;
 
 // Exported because task 17's edit verdict has to re-score a record against its
 // corrected membership, and the battery is the only thing in this codebase
@@ -52,6 +59,7 @@ export function runBattery(g, joints, recs) {
     // served joint list is still testable rather than silently skipped.
     const joint = joints.find((j) => j.id === rec.id) || rec;
     rec.tests.push(discCoherence(g, joint));
+    rec.tests.push(scopeSpread(g, joint));
     rec.tests.push({ ...iso });
     rec.tests.push(attachmentSanity(g, joint));
   }
@@ -380,7 +388,22 @@ function overlapWith(recordNodes, nodes) {
   return { shared, containment: min ? shared / min : 0 };
 }
 
-export function reconcileLanes(manifest, delta, { origin = null, tag = null, overlap = OVERLAP_MERGE } = {}) {
+// What makes a record an expectation hint, wherever the question is asked:
+// the union in runVisionRound stamps `hinted`, and the gate profile stamps
+// the origin — either alone suffices, because a stamp on the RECORD survives
+// paths gate metadata would not (a reconcile option, a persisted round).
+export const isHintRecord = (r) => r?.hinted === true || r?.origin === 'expectation-hint';
+
+// `prefer` marks the incoming records the overlap rule should be INVERTED
+// for. Default null: an incoming record that overlaps a live one corroborates
+// it, exactly as below. When the predicate holds (the expectation hints),
+// the incoming record SUPERSEDES instead: it lands as the record of the part
+// and the overlapped live record leaves the live set, reported on
+// `superseded` for the caller to retire and to move its evidence onto the
+// hint. That is Task 4's demotion rule — for a dictionary-covered part the
+// geometry lane corroborates the hint; unknown categories mint no hints, so
+// nothing there changes.
+export function reconcileLanes(manifest, delta, { origin = null, tag = null, overlap = OVERLAP_MERGE, prefer = null } = {}) {
   const key = (nodes) => [...(nodes || [])].sort().join('|');
   const bySet = new Map();
   const live = [];
@@ -388,6 +411,7 @@ export function reconcileLanes(manifest, delta, { origin = null, tag = null, ove
   const records = [];
   const confirms = [...(delta?.confirms || [])];
   const agreed = [];
+  const superseded = [];
   for (const rec of delta?.records || []) {
     if (!rec?.nodes?.length) continue;
     const exact = bySet.get(key(rec.nodes));
@@ -401,6 +425,32 @@ export function reconcileLanes(manifest, delta, { origin = null, tag = null, ove
       }
     }
     if (hit) {
+      // SUPERSEDE. Three guards keep the rule narrow: a record carrying ANY
+      // human verdict is off-limits in both directions (a person's "no" ranks
+      // exactly as high as a person's "yes"); a hint never supersedes another
+      // hint (same-turn duplicates were absorbed at the union, older ones are
+      // settled work); and the hint must not be LARGER than the record it
+      // replaces — a sloppy hint box around a truthful geometry scope
+      // corroborates instead of replacing, which is exactly the pre-hint
+      // behaviour for that case.
+      if (typeof prefer === 'function' && prefer(rec) && !prefer(hit) && hit.verdict == null
+        && rec.nodes.length <= (hit.nodes || []).length) {
+        bySet.delete(key(hit.nodes));
+        live.splice(live.indexOf(hit), 1);
+        records.push(rec);
+        bySet.set(key(rec.nodes), rec);
+        live.push(rec);
+        superseded.push({
+          id: hit.id, by: rec.id, origin: hit.origin || null,
+          match: exact ? 'exact' : 'overlap',
+          shared: stats.shared,
+          containment: Number(stats.containment.toFixed(2)),
+          // What the superseded record claimed that the hint does not — the
+          // monster's extra, reported so a human can see what was given up.
+          laneOnly: exact ? [] : (hit.nodes || []).filter((n) => !rec.nodes.includes(n)),
+        });
+        continue;
+      }
       confirms.push({
         targetId: hit.id,
         tag: tag || `cross-producer:${origin || 'unknown'}`,
@@ -431,7 +481,7 @@ export function reconcileLanes(manifest, delta, { origin = null, tag = null, ove
     bySet.set(key(rec.nodes), rec);
     live.push(rec);
   }
-  return { records, confirms, agreed };
+  return { records, confirms, agreed, superseded };
 }
 
 // Run both lanes. `text` and `vision` are async callables handed the CLONES they
@@ -716,6 +766,12 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
     // stays one turn; the campaign switches it on for round 1, which is the only
     // round with a survey tier to read a category from.
     expectation: wantExpectation = false,
+    // Ask WHERE EACH EXPECTED PART is (turn A′, localize.mjs) once the prior
+    // named a dictionary category: the reference list becomes pointed per-part
+    // hints that join the discovery proposals below. On by default because it
+    // can only fire when a usable dictionary prior already exists; a caller may
+    // switch it off to get the exact two-turn round this lane predates.
+    localize: wantLocalize = true,
     // Run this lane as an INDEPENDENT observer: the prompt withholds the other
     // producer's conclusions and the gate stops treating a geometry or text guess
     // as a claim on the parts. Two producers agreeing then reconciles into one
@@ -894,6 +950,103 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
     }
   }
 
+  // 3b. PER-PART LOCALIZATION — turn A′ --------------------------------------
+  //
+  // The category turn said WHAT this machine is; the dictionary entry that
+  // matched it says WHICH parts such a machine carries. This turn closes the
+  // gap: the model points at EVERY expected part individually (four wheels are
+  // four entries, where the category turn's were one entry with count 4), the
+  // reply parses through the SAME visionPropose channel as the discovery turn
+  // under the hint gate profile, and what survives unions into turn B's lists
+  // below. Grounding resolves the node sets and the battery disposes of them,
+  // exactly as for a free proposal — the only difference is provenance
+  // (`hinted: true`, origin 'expectation-hint'), and provenance is what the
+  // supersede rule in reconcileLanes reads.
+  //
+  // Same failure contract as the category turn: it may fail, and when it does
+  // the round carries on with no hints. A prior is an optimisation, never a
+  // dependency.
+  let hints = [];
+  let hintGrounded = [];
+  let hintAdmitted = [];
+  let hintConfirms = [];
+  if (wantExpectation && wantLocalize && expectation?.dictKey && expectationIsUsable(expectation)) {
+    const dictHit = lookupDictionary(expectation.category);
+    if (!dictHit?.entry) {
+      warnings.push('localization turn: the prior named a dictionary key whose entry is gone — no hints were asked for');
+    } else if (typeof propose !== 'function') {
+      warnings.push('localization turn: asked for, but no vision provider is wired — the round carries on with no hints');
+    } else if (typeof abort === 'function' && abort()) {
+      return bail('the project changed while the localization turn was starting', 'PROJECT_RELOADED');
+    } else {
+      const lp = buildLocalizationPrompt({
+        frames: captured, g, viewport,
+        dictKey: dictHit.key, entry: dictHit.entry, gaps: gapsAtAsk,
+      });
+      const locWarnings = lp.warnings.map((w) => `localization turn: ${w}`);
+      let locReply = null;
+      let locModel = null;
+      if (!lp.text) {
+        locWarnings.push('localization turn: there was no whole-machine photo to point at parts in, so no hints were asked for');
+      } else {
+        const l0 = Date.now();
+        try {
+          const lt = await propose(lp.text, lp.images);
+          locReply = lt?.reply ?? null;
+          locModel = lt?.model ?? null;
+          const hp = visionPropose({
+            reply: locReply || '', g, manifest, frames: captured, plan, viewport,
+            // Always an INDEPENDENT observer, whatever the round's own flag: a
+            // hint is a second producer's reading of the reference list, so an
+            // exact overlap with a settled record must corroborate that record,
+            // never be silently absorbed by it.
+            independent: true,
+            // The prompt asked for lp.asked items (one per dictionary part), so
+            // the parse cap is the same number — the shared proposal cap would
+            // silently cut a 16-part reply to 6.
+            maxProposals: lp.asked,
+            profile: HINT_GATE_PROFILE,
+          });
+          locWarnings.push(...hp.warnings.map((w) => `localization turn: ${w}`));
+          hints = hp.records;
+          hintConfirms = hp.confirms;
+          // The gate cannot know the record came from a reference list, so the
+          // provenance stamp goes on here — on the RECORD ITSELF, not on gate
+          // metadata a later merge could override.
+          for (const r of hints) {
+            r.hinted = true;
+            r.evidence = [...(r.evidence || []), `dictionary:${dictHit.key}`];
+          }
+          // Both turns number their reply items from 0 and the survivors/
+          // rejected join below works by index, so the hint half is shifted out
+          // of the discovery turn's numbering before the lists union.
+          hintGrounded = hp.grounded.map((e) => ({ ...e, index: e.index + HINT_INDEX_BASE }));
+          hintAdmitted = hp.admitted.map((a) => ({ ...a, index: a.index + HINT_INDEX_BASE }));
+        } catch (err) {
+          locWarnings.push(`localization turn: the model call failed (${err.message}) — the round carries on with no hints`);
+        }
+        // Persisted even when it failed, for the same reason the category turn
+        // is: a round whose hints left no file is indistinguishable from one
+        // that never asked.
+        persist?.localization?.({
+          prompt: { text: lp.text, frames: lp.frames, images: lp.images.length },
+          reply: locReply, model: locModel, ms: Date.now() - l0,
+          dictKey: dictHit.key, asked: lp.asked,
+          records: hints, confirms: hintConfirms, grounded: hintGrounded,
+          warnings: locWarnings,
+        });
+      }
+      warnings.push(...locWarnings);
+      say('vision:localize', {
+        dictKey: dictHit.key,
+        asked: lp.asked,
+        hints: hints.map((r) => ({ id: r.id, label: r.label || null, nodes: (r.nodes || []).slice(0, 12) })),
+        prompt: lp.text, reply: locReply, model: locModel,
+        warnings: locWarnings,
+      });
+    }
+  }
+
   // 4. PROMPT + TURN — turn B, the discovery turn ---------------------------
   const t0 = Date.now();
   const prompt = buildVisionPrompt({
@@ -998,6 +1151,49 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
     persist?.reply?.({ ...replyRecord, retry });
     if (retry && retry.reply != null) say('vision:reply', { model: retry.model ?? null, reply: retry.reply, retry: true });
   }
+  // The hints union in AFTER the strict-schema retry, never before it: the
+  // retry replaces `parsed` wholesale, so hints unioned earlier would be lost.
+  if (hints.length || hintConfirms.length) {
+    // A part pointed at TWICE is ONE part — whether the duplicate is turn B
+    // finding on its own what the reference list asked for, or the
+    // localization reply pointing two entries at the same place against its
+    // instructions. mergeProposals appends every record it is handed, and its
+    // confirms can only target records ALREADY on the books, so the absorption
+    // happens here, where both parses are in hand: under the same containment
+    // rule reconcileLanes applies between lanes, the later copy drops to an
+    // EVIDENCE TAG on the earlier one. Hints union first so the record that
+    // survives is the one carrying the dictionary's per-part provenance, and
+    // every absorption is announced, never silent.
+    const kept = [];
+    const incoming = [
+      ...hints.map((rec) => ({ rec, tag: 'expectation-hint-corroboration' })),
+      ...parsed.records.map((rec) => ({ rec, tag: 'l2-vision-confirm' })),
+    ];
+    for (const { rec, tag } of incoming) {
+      const twin = (rec.nodes || []).length
+        ? kept.find((k) => {
+          const s = overlapWith(k.nodes, rec.nodes);
+          return s.shared > 0 && s.containment >= OVERLAP_MERGE;
+        })
+        : null;
+      if (twin) {
+        twin.evidence = [...(twin.evidence || []), tag];
+        // The duplicate's recognition still counts: a name the twin lacks
+        // rides across under the same first-name-wins rule a confirm uses.
+        if (typeof rec.part === 'string' && rec.part && !twin.part) twin.part = rec.part;
+        warnings.push(`${rec.id} is the same part as ${twin.id} — it corroborates it instead of landing twice`);
+      } else {
+        kept.push(rec);
+      }
+    }
+    parsed = {
+      ...parsed,
+      records: kept,
+      confirms: [...hintConfirms, ...parsed.confirms],
+      grounded: [...hintGrounded, ...parsed.grounded],
+      admitted: [...hintAdmitted, ...parsed.admitted],
+    };
+  }
   warnings.push(...parsed.warnings);
   say('vision:propose', {
     entries: (parsed.records || []).map((r) => ({
@@ -1055,6 +1251,12 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
       gaps: expectation ? expectationGap(expectation, manifest) : null,
       expectationVerified: expectation ? verifiedInstances(expectation, parsed.grounded) : null,
       recognition,
+      // How many of the surviving proposals came from the localization turn's
+      // reference list rather than the model's own search. Provenance per
+      // record is on the record (`hinted`); this count is the one-glance
+      // version. Counted AFTER the union's absorption, so a hint a duplicate
+      // folded into is not double-counted.
+      hinted: parsed.records.filter((r) => r.hinted).length,
       model: turn?.model ?? null,
       ms: Date.now() - t0,
       manifestUntouched: true,
@@ -1063,6 +1265,49 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
   }
 
   // 6. MERGE + BATTERY ----------------------------------------------------
+  //
+  // GEOMETRY DEMOTION, campaign flavour: the same supersede rule the staged
+  // pipeline applies through reconcileLanes(prefer: isHintRecord), applied
+  // here against the manifest this round merges into, because mergeProposals
+  // only ever APPENDS. A hint that overlaps a non-verdicted geometry record
+  // REPLACES it — the geometry record retires from the manifest and the joint
+  // list, and its corroboration rides on the hint — so the battery's
+  // isolation test is never handed one part in two joints. Runs at merge
+  // time, never on the proposals-only path: stopping after step 5 must leave
+  // the manifest provably untouched (the caller's reconcileLanes owns the
+  // rule there).
+  const superseded = [];
+  if (parsed.records.some(isHintRecord)) {
+    for (const hint of parsed.records.filter((r) => isHintRecord(r) && r.nodes?.length)) {
+      let best = null;
+      let bestStats = null;
+      for (const m of manifest) {
+        if (!m?.id || isHintRecord(m) || m.verdict != null) continue;
+        if (hint.nodes.length > (m.nodes || []).length) continue;
+        const s = overlapWith(m.nodes, hint.nodes);
+        if (s.shared > 0 && s.containment >= OVERLAP_MERGE
+          && (!bestStats || s.containment > bestStats.containment)) {
+          best = m;
+          bestStats = s;
+        }
+      }
+      if (!best) continue;
+      manifest.splice(manifest.indexOf(best), 1);
+      const bj = (joints || []).findIndex((x) => x.id === best.id);
+      if (bj >= 0) joints.splice(bj, 1);
+      hint.evidence = [...(hint.evidence || []), `supersedes:${best.id}`, `cross-producer:${best.origin || 'unknown'}`];
+      hint.history = [...(hint.history || []), {
+        at: new Date().toISOString(), event: 'superseded',
+        note: `${best.id} (${(best.nodes || []).length} nodes) demoted to corroboration — the dictionary hint's scope wins for a known-category part`,
+      }];
+      superseded.push({
+        id: best.id, by: hint.id, origin: best.origin || null,
+        shared: bestStats.shared,
+        containment: Number(bestStats.containment.toFixed(2)),
+      });
+      warnings.push(`${hint.id} supersedes ${best.id} — the geometry record's ${(best.nodes || []).length} nodes move under the dictionary hint, whose per-part scope the battery re-measures below`);
+    }
+  }
   const merged = mergeProposals(g, joints, manifest, {
     records: parsed.records, confirms: parsed.confirms, confirmTag: 'l2-vision-confirm',
   });
@@ -1080,6 +1325,7 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
     added: merged.added ?? 0,
     proposals: merged.proposals || [],
     rejected: rejected.map((r) => ({ index: r.index, names: r.names })),
+    superseded: superseded.map((s) => ({ id: s.id, by: s.by })),
   });
 
   // Stamp the evidence round onto exactly the records this round added. Written
@@ -1135,6 +1381,10 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
     gaps: expectation ? expectationGap(expectation, manifest) : null,
     expectationVerified: expectation ? verifiedInstances(expectation, parsed.grounded) : null,
     recognition,
+    hinted: parsed.records.filter((r) => r.hinted).length,
+    // The geometry records dictionary hints replaced at merge time, in the
+    // same shape reconcileLanes reports for the staged pipeline.
+    superseded,
     model: turn?.model ?? null,
     ms: Date.now() - t0,
     manifestUntouched: false,
@@ -1366,6 +1616,9 @@ export async function runVisionCampaign(g, joints, manifest, effects = {}) {
       // defaults ON because a campaign is the automatic lane, where aiming is the
       // whole point; a caller may switch it off to get the single-turn round.
       expectation: r === 0 ? e.expectation !== false : false,
+      // The localization turn obeys the same round-1-only rule: it reads the
+      // same survey photos the prior was read from, and round 2 has none.
+      localize: r === 0 ? e.localize !== false : false,
       independent: e.independent === true,
       stopAfter: e.stopAfter || null,
     });

@@ -166,7 +166,7 @@ export function frameLine(frame, i) {
 
 // The colour legend for a mask frame. Kept beside the frame it belongs to so the
 // model does not have to hold one global table in mind across twelve images.
-function legendLine(frame) {
+export function legendLine(frame) {
   const map = frame.colorMap;
   // Same guard as the frames manifest: an unloaded entry carries a filename, and
   // a legend built from a string's characters would be worse than no legend — it

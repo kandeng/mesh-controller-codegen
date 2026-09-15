@@ -26,7 +26,12 @@ export const vec3 = (v) => Array.isArray(v) && v.length === 3 && v.every((x) => 
 // Fence-tolerant extraction of the JSON array from a raw model reply. Shared
 // because both producers face the same failure: a model that wraps its JSON in
 // prose or code fences despite being told not to.
-export function parseReply(reply) {
+//
+// `maxItems` defaults to the shared cap. The localization turn (localize.mjs)
+// asks for one item PER dictionary part and passes its own ask count — a cap
+// the caller set, not a cap the model talked us into.
+export function parseReply(reply, maxItems = MAX_PROPOSALS) {
+  const cap = Math.max(1, maxItems | 0) || MAX_PROPOSALS;
   const text = String(reply || '');
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
   const body = fenced ? fenced[1] : text;
@@ -37,8 +42,8 @@ export function parseReply(reply) {
     const items = JSON.parse(body.slice(a, b + 1));
     if (!Array.isArray(items)) return { items: [], warnings: ['parsed value is not an array'] };
     return {
-      items: items.slice(0, MAX_PROPOSALS),
-      warnings: items.length > MAX_PROPOSALS ? [`truncated to ${MAX_PROPOSALS} proposals`] : [],
+      items: items.slice(0, cap),
+      warnings: items.length > cap ? [`truncated to ${cap} proposals`] : [],
     };
   } catch (e) {
     return { items: [], warnings: [`JSON parse failed: ${e.message}`] };
@@ -65,10 +70,20 @@ export function parseReply(reply) {
 //                    narrowing them would mint colliding ids, re-admit an
 //                    existing joint under a new name, and turn every `confirm`
 //                    of a real record into an orphan.
+//   allowNoAxis      admit a `new` record whose axis is missing (null) instead
+//                    of dropping it. Reserved for the expectation-hint lane:
+//                    a steered wheel's grounded cloud is too round to derive
+//                    a spin axis from, and dropping the hint would make the
+//                    geometry lane's spinAxleAxis gate the final word on a
+//                    part the dictionary says is there. The record lands with
+//                    axis null and the gap rides in `uncertainties` — the
+//                    battery never reads an axis, and every consumer that
+//                    renders one tolerates null. Anchor stays mandatory: a
+//                    point the model could not place at all is not a hint.
 export function createProposalGate({
   g, manifest, idTag = 'l2', label = (t) => `${t} (AI proposal)`,
   evidenceTag = 'l2-batch', baseConfidence = 0.7, origin = 'L2-ai',
-  allowOps = ['new', 'split', 'confirm'], independent = false,
+  allowOps = ['new', 'split', 'confirm'], independent = false, allowNoAxis = false,
 } = {}) {
   const records = [];
   const confirms = [];
@@ -164,7 +179,7 @@ export function createProposalGate({
       return drop(idx, 'duplicate of an existing record (same node set)');
     }
 
-    if (!vec3(p.axis)) return drop(idx, 'axis must be [x,y,z] of finite numbers');
+    if (!vec3(p.axis) && !allowNoAxis) return drop(idx, 'axis must be [x,y,z] of finite numbers');
     if (!vec3(p.anchor)) return drop(idx, 'anchor must be [x,y,z] of finite numbers');
 
     if (p.op === 'new') {
@@ -193,7 +208,7 @@ export function createProposalGate({
       ...(extra || {}),
       nodes: [...nodes],
       anchor: { x: p.anchor[0], y: p.anchor[1], z: p.anchor[2] },
-      axis: { x: p.axis[0], y: p.axis[1], z: p.axis[2] },
+      axis: vec3(p.axis) ? { x: p.axis[0], y: p.axis[1], z: p.axis[2] } : null,
       evidence: [evidenceTag, ...extraEv, ...(p.rationale ? [String(p.rationale).slice(0, 120)] : [])],
       confidence: baseConfidence,
       origin,

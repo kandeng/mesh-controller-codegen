@@ -15,7 +15,7 @@ import {
   discoverJoints, validateController, generateController, repairWithNotes,
   loadThree, toViewerUrl, refreshView, finalizeRun,
 } from '../src/pipeline.mjs';
-import { reopenFromRigidity, runDiscoveryLoop, runL2Round, runVisionCampaign, runMotionRound, applyJointVerdict, amortizeVerdict, reconcileLanes, admitCandidates, refineJoint, MAX_EXTRA_VIEWS, MAX_VISION_ROUNDS, MOTION_ANGLES } from '../src/plugins/discovery/loop.mjs';
+import { reopenFromRigidity, runDiscoveryLoop, runL2Round, runVisionCampaign, runMotionRound, applyJointVerdict, amortizeVerdict, reconcileLanes, admitCandidates, refineJoint, isHintRecord, MAX_EXTRA_VIEWS, MAX_VISION_ROUNDS, MOTION_ANGLES } from '../src/plugins/discovery/loop.mjs';
 import { applyRecognitionGate } from '../src/plugins/discovery/actuator-dictionary.mjs';
 import { saveManifest, saveRevision, listRevisions, loadRevision, latestRevision, diffManifests } from '../src/plugins/discovery/manifest.mjs';
 import { rigidityGate } from '../src/plugins/discovery/tests.mjs';
@@ -23,7 +23,7 @@ import { focusFromManifest, modelRadius, modelTarget, panelFramingOf, planPanelV
 import { AMORTIZABLE, peersOf, symmetryGroups } from '../src/plugins/discovery/symmetry.mjs';
 import {
   MAX_FRAMES_PER_ROUND, framePath, listRounds, loadColorMap, loadRound,
-  saveExpectation, saveMotion, savePlan, saveProposals, saveReply,
+  saveExpectation, saveLocalization, saveMotion, savePlan, saveProposals, saveReply,
 } from '../src/plugins/discovery/observations.mjs';
 import { createVisionProvider } from '../src/plugins/discovery/vision-provider.mjs';
 import { createSessionStore } from './session-store.mjs';
@@ -511,6 +511,9 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
             // The category prior and its outcome, beside the frames that produced
             // it: a guess is only auditable if the guess is on the record too.
             expectation: (x) => saveExpectation(runDir, rnd, x),
+            // The per-part localization turn, beside the prior that licensed it:
+            // what the reference list asked for and where each hint landed.
+            localization: (x) => saveLocalization(runDir, rnd, x),
           };
         },
       });
@@ -735,11 +738,37 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
           return { ok: false, code: 'HUMAN_STOPPED', stopped: true, error: 'a human stopped the refinement before stage 1 settled; nothing was merged' };
         }
 
+        // Task 4's demotion rule, applied: retire each record a hint superseded
+        // and move the corroboration onto the hint that replaces it — BEFORE
+        // admission, so the battery's isolation test never sees one part in
+        // two joints. The rule itself lives in reconcileLanes (one place, both
+        // looks); this closure is just the mutation it reports.
+        const applySuperseded = (recon) => {
+          for (const s of recon.superseded || []) {
+            const idx = current.manifest.findIndex((r) => r.id === s.id);
+            if (idx < 0) continue;
+            const [dead] = current.manifest.splice(idx, 1);
+            const jdx = current.joints.findIndex((j) => j.id === s.id);
+            if (jdx >= 0) current.joints.splice(jdx, 1);
+            const hint = recon.records.find((r) => r.id === s.by);
+            if (!hint) continue;
+            hint.evidence = [...(hint.evidence || []), `supersedes:${dead.id}`, `cross-producer:${dead.origin || 'unknown'}`];
+            hint.history = [...(hint.history || []), {
+              at: new Date().toISOString(), event: 'superseded',
+              note: `${dead.id} (${(dead.nodes || []).length} nodes) demoted to corroboration — the dictionary hint's scope wins for a known-category part`,
+            }];
+          }
+        };
         const reconciled = reconcileLanes(
           current.manifest,
           { records: vision?.proposals || [], confirms: vision?.confirmList || [] },
-          { origin: 'L2-vision', tag: 'cross-producer:L2-vision' },
+          // `prefer` inverts the overlap rule for expectation hints: for a
+          // dictionary-covered part the hint's per-part scope REPLACES the
+          // geometry lane's record instead of corroborating it. Unknown
+          // categories mint no hints, so nothing there changes.
+          { origin: 'L2-vision', tag: 'cross-producer:L2-vision', prefer: isHintRecord },
         );
+        applySuperseded(reconciled);
         const admitted = admitCandidates(current.joints, current.manifest, reconciled);
         // The recognition gate re-judges the WHOLE manifest now that the new
         // candidates are in: the round's proposals-only pass marked the fresh
@@ -765,6 +794,7 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
           count: current.manifest.length,
           added: admitted.added,
           agreed: reconciled.agreed.length,
+          superseded: (reconciled.superseded || []).length,
           category: vision?.expectation?.category || null,
           gaps: vision?.gaps || null,
           recognition: recognition.dict ? recognition : null,
@@ -828,8 +858,10 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
               { records: v2.proposals || [], confirms: v2.confirmList || [] },
               // A distinct tag: the audit trail should be able to say which
               // candidates arrived because a human asked for a second look.
-              { origin: 'L2-vision', tag: 'steered:L2-vision' },
+              // The hint demotion rule is the first look's, unchanged.
+              { origin: 'L2-vision', tag: 'steered:L2-vision', prefer: isHintRecord },
             );
+            applySuperseded(rec2);
             // The tag reconcileLanes was given only lands on CONFIRMS — a record the
             // lane newly minted keeps the evidence the gate stamped on it — so the
             // steered origin is pushed here, before admission. Without it the audit
@@ -849,6 +881,7 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
               count: current.manifest.length,
               added: adm2.added,
               agreed: rec2.agreed.length,
+              superseded: (rec2.superseded || []).length,
               look: 2,
               steered: true,
               notes: notes.length,
@@ -879,7 +912,9 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
         // viewer may retire the camera glyphs. The abort and reload paths skip
         // this beat on purpose — discovering flips false there, and the viewer's
         // safety net retires the props on that signal instead.
-        if (visionCampaign) emit('vision:end', { steered: !!steered });
+        // `ok` kills the spurious client failure toast: the closing beat of a
+        // campaign that RAN is a success whether or not it added candidates.
+        if (visionCampaign) emit('vision:end', { ok: true, added: admitted.added + (steered?.added || 0), steered: !!steered });
         if (reloaded()) return endReloaded();
         if (refineAbort) {
           // A stop landing HERE is not the pre-commit stop above: the candidate

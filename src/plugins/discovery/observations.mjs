@@ -278,6 +278,44 @@ export function saveExpectation(runDir, round, {
 
 export function loadExpectation(runDir, round) { return readJson(resolve(roundDir(runDir, round), 'expectation.json')); }
 
+// The PER-PART LOCALIZATION turn (turn A′, localize.mjs), kept beside the
+// prior that licensed it.
+//
+// Like the prior, a hint is not a discovery and never merges on its own — it
+// unions into the discovery turn's proposal list and the battery disposes of
+// it there. It still gets its own file for the same reason expectation.json
+// exists: "what did the reference list tell us to look for, and where did the
+// model say each part was" is a different question from "what did the model
+// claim", and a round whose hints vanished into proposals.json could not be
+// told apart from a round where the model found every part on its own.
+//
+// `records` are the grounded hint records (already stamped `hinted: true`
+// with their `dictionary:<key>` evidence) and `grounded` how each reply item
+// resolved, in the discovery turn's shape but re-indexed out of its numbering
+// (HINT_INDEX_BASE, loop.mjs). Both may be empty: a turn that was refused or
+// failed is recorded as such rather than as an absent file.
+export function saveLocalization(runDir, round, {
+  prompt = null, reply = null, dictKey = null, asked = 0,
+  records = [], confirms = [], grounded = [],
+  model = null, ms = null, warnings = null,
+} = {}) {
+  if (!runDir) return null;
+  const dir = ensure(roundDir(runDir, round));
+  const file = resolve(dir, 'localization.json');
+  writeJson(file, {
+    ts: new Date().toISOString(), model, ms, warnings, prompt, reply, dictKey, asked,
+    records, confirms, grounded,
+    counts: {
+      asked, records: records.length, confirms: confirms.length,
+      grounded: grounded.length,
+      warnings: Array.isArray(warnings) ? warnings.length : 0,
+    },
+  });
+  return file;
+}
+
+export function loadLocalization(runDir, round) { return readJson(resolve(roundDir(runDir, round), 'localization.json')); }
+
 // What the validator made of that reply: accepted records, confirms, and the
 // reasons anything was dropped. Dropping is recorded because "the model said X
 // and we refused it because Y" is the audit trail a human gate needs.
