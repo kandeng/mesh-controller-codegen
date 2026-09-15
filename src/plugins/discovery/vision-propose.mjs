@@ -26,6 +26,7 @@
 import { VIEWPORT, namedIndex, nodeBox, renderTargets } from './views.mjs';
 import { BOX_DILATE, MAX_CANDIDATES, MIN_BOX_SCORE, groundRegion } from './grounding.mjs';
 import { createProposalGate, parseReply, vec3, TYPES } from './propose-core.mjs';
+import { normPartName } from './actuator-dictionary.mjs';
 
 export const L2_VISION_BASE_CONFIDENCE = 0.7;
 
@@ -390,6 +391,19 @@ export function visionPropose({
       index: idx, frameId, names: resolved.names, grounding: resolved.grounding, uncertainties,
     });
 
+    // THE RECOGNITION HALF of the dual gate. `type` says how the part moves;
+    // `part` says what it IS, named from the actuator dictionary's closed
+    // vocabulary so the recognition gate can check it deterministically. A
+    // name outside the vocabulary is not rescued or guessed at — it is as if
+    // the model left the field empty, and the gate downstream treats the
+    // record as unrecognized. Validates confirms too: "that joint is right,
+    // and it is a wheel" names a record this lane never proposed.
+    const partRaw = item.part ?? item.actuator ?? item.partName ?? null;
+    const part = normPartName(partRaw);
+    if (partRaw != null && String(partRaw).trim() && !part) {
+      gate.warnings.push(`proposal[${idx}] named part "${String(partRaw).slice(0, 40)}", which is not in the actuator vocabulary — the record stays, but it reads as UNRECOGNIZED to the listing gate`);
+    }
+
     // Geometry supplies anchor and axis when it can, because both are 3D facts
     // and the model saw a 2D projection. Its own numbers are preserved for
     // comparison rather than discarded — a large gap between them is itself a
@@ -429,6 +443,7 @@ export function visionPropose({
     if (!axis) uncertainties.push('no axis: the model gave none and the part cloud is not flat enough to derive one');
 
     const extra = {
+      part: part || undefined,
       reasoning: p?.reasoning ? String(p.reasoning).slice(0, 480) : undefined,
       uncertainties: uncertainties.length ? uncertainties : undefined,
       suggestView: sv || undefined,
@@ -447,7 +462,7 @@ export function visionPropose({
       ].filter(Boolean),
     };
 
-    const verdict = gate.admit({ ...item, anchor, axis }, idx, { names: resolved.names, extra });
+    const verdict = gate.admit({ ...item, anchor, axis, part: part || undefined }, idx, { names: resolved.names, extra });
     // Which proposals survived, by index. Recovering this from the record ids
     // would mean parsing an id format, so it is reported directly instead — the
     // complement is the audit trail of what we refused and why.

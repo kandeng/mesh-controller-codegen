@@ -16,6 +16,7 @@ import {
   loadThree, toViewerUrl, refreshView, finalizeRun,
 } from '../src/pipeline.mjs';
 import { reopenFromRigidity, runDiscoveryLoop, runL2Round, runVisionCampaign, runMotionRound, applyJointVerdict, amortizeVerdict, reconcileLanes, admitCandidates, refineJoint, MAX_EXTRA_VIEWS, MAX_VISION_ROUNDS, MOTION_ANGLES } from '../src/plugins/discovery/loop.mjs';
+import { applyRecognitionGate } from '../src/plugins/discovery/actuator-dictionary.mjs';
 import { saveManifest, saveRevision, listRevisions, loadRevision, latestRevision, diffManifests } from '../src/plugins/discovery/manifest.mjs';
 import { rigidityGate } from '../src/plugins/discovery/tests.mjs';
 import { focusFromManifest, modelRadius, modelTarget, panelFramingOf, planPanelViews, planViews, VIEWPORT } from '../src/plugins/discovery/views.mjs';
@@ -740,6 +741,11 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
           { origin: 'L2-vision', tag: 'cross-producer:L2-vision' },
         );
         const admitted = admitCandidates(current.joints, current.manifest, reconciled);
+        // The recognition gate re-judges the WHOLE manifest now that the new
+        // candidates are in: the round's proposals-only pass marked the fresh
+        // records, but a confirm this round may have named an older geometry
+        // record, and only the caller holding the real manifest can mark that.
+        const recognition = applyRecognitionGate(current.manifest, { category: vision?.expectation?.category || null });
         // The vision grounding per candidate, zipped by node set: a vision record's
         // nodes ARE the names grounding resolved, so the set is the identity.
         // MUTABLE on purpose: a steered second look grounds its own proposals
@@ -761,6 +767,7 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
           agreed: reconciled.agreed.length,
           category: vision?.expectation?.category || null,
           gaps: vision?.gaps || null,
+          recognition: recognition.dict ? recognition : null,
           // Why the vision lane grounded nothing, in the lane's own words (a
           // format failure reads differently from an honest empty answer) — the
           // chat says this instead of leaving a human to guess.
@@ -834,6 +841,7 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
             }
             const adm2 = admitCandidates(current.joints, current.manifest, rec2);
             visionGrounded.push(...(v2.grounded || []));
+            const recognition2 = applyRecognitionGate(current.manifest, { category: v2?.expectation?.category || vision?.expectation?.category || null });
             saveManifest(runDir, current.manifest);
             commitRevision(`stage 1b: steered second look — ${current.manifest.length} candidate(s), vision +${adm2.added}, agreed ${rec2.agreed.length}`);
             sessionStore.setWork({ joints: current.joints.map((j) => ({ id: j.id, label: j.label, type: j.type, nodeCount: (j.nodes || []).length })) });
@@ -847,6 +855,7 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
               images: extraImages.length,
               category: v2?.expectation?.category || vision?.expectation?.category || null,
               gaps: v2?.gaps || null,
+              recognition: recognition2.dict ? recognition2 : null,
               visionReason: v2?.reason || null,
               visionRetried: !!v2?.retried,
             });

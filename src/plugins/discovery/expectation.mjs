@@ -31,6 +31,7 @@
 // same `propose` effect the discovery turn uses, so this is testable headless.
 import { normBox } from './grounding.mjs';
 import { TYPES } from './propose-core.mjs';
+import { CATEGORY_KEYS } from './actuator-dictionary.mjs';
 import { frameLine, sceneFacts, sceneHeader } from './vision-prompt.mjs';
 
 // One turn over the survey photos. Bounded for the same reason the discovery turn
@@ -89,6 +90,11 @@ export function buildExpectationPrompt({ frames = [], g = null, viewport = null,
   lines.push('TASK: first say WHAT KIND OF MACHINE this is. Then say which parts a machine of');
   lines.push('that kind usually has that MOVE RELATIVE TO THE REST, how many of each, and where');
   lines.push('in these frames each kind of place is.');
+  lines.push('');
+  lines.push('Naming the category: our reference table knows these kinds —');
+  lines.push(`  ${CATEGORY_KEYS.join(', ')}`);
+  lines.push('If this machine is one of them, use THAT word so the table\'s counts apply. If it is');
+  lines.push('none of them, name it plainly anyway — a true unknown beats a forced match.');
   lines.push('');
   lines.push('READ THIS BEFORE ANSWERING — it is what makes the step safe:');
   lines.push('You are describing a CATEGORY, not this mesh. Every expectation you give is checked');
@@ -305,11 +311,19 @@ export function expectationIsUsable(exp, { minConfidence = MIN_EXPECTATION_CONFI
 // turn merged, so the comparison is against what the project actually believes —
 // including anything geometry found before vision ever looked.
 export function expectationGap(exp, records = []) {
-  if (!exp || !Array.isArray(exp.instances) || !exp.instances.length) return [];
+  if (!exp || (!Array.isArray(exp.instances) && !exp.dictCounts) || (!exp.instances?.length && !exp.dictCounts)) return [];
   const expected = new Map();
-  for (const ins of exp.instances) {
+  for (const ins of exp.instances || []) {
     if (!ins?.type) continue;
     expected.set(ins.type, (expected.get(ins.type) || 0) + Math.max(0, Number(ins.count) || 0));
+  }
+  // The dictionary's totals are the counts to FALSIFY when the category is one
+  // the table knows: they are deterministic, where the model's per-type sum
+  // drifts run to run. Union rather than replacement — a kind the model
+  // expected and the table does not list (a drone's folding arms) is still a
+  // place the loop was asked to look.
+  for (const [type, n] of Object.entries(exp.dictCounts || {})) {
+    if (Number.isFinite(n) && n >= 0) expected.set(type, n);
   }
   const found = new Map();
   for (const rec of records || []) {
@@ -386,6 +400,9 @@ export function expectationBrief(exp, gaps = []) {
   const lines = [];
   lines.push(`a first look at these frames classified the machine as "${exp.category}" (its own confidence ${Number(exp.confidence).toFixed(2)})`);
   if (exp.summary) lines.push(`it said: ${exp.summary}`);
+  if (exp.dictRef) {
+    lines.push(`the reference list for a ${exp.dictKey} — the counts to falsify — is: ${exp.dictRef}`);
+  }
   for (const ins of exp.instances) {
     const box = (ins.regionBox || []).map((v) => Number(v).toFixed(2)).join(',');
     lines.push(`it expects ${ins.count} x ${ins.type}${ins.symmetry ? `, arranged ${ins.symmetry}` : ''} — one such place is in frame "${ins.frameId}" at [${box}]${ins.note ? ` (${ins.note})` : ''}`);

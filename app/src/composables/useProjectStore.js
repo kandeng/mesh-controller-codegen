@@ -342,6 +342,7 @@ function connectEvents() {
             dropped: msg.dropped || null, postponed: msg.postponed || null,
             remaining: msg.remaining ?? null,
             look: msg.look ?? 1, steered: !!msg.steered,
+            recognition: msg.recognition || null,
           },
         });
         refreshJoints();
@@ -355,6 +356,8 @@ function connectEvents() {
           parts.push(msg.added ? `the second look added ${msg.added}` : 'the second look added nothing new');
           if (msg.agreed) parts.push(`and independently re-found ${msg.agreed} part(s) already listed — corroboration of one joint, never a duplicate`);
           if (!msg.added && msg.visionReason) parts.push(`why: ${msg.visionReason}${msg.visionRetried ? ' (after one strict-schema retry)' : ''}`);
+          if (msg.recognition?.excluded) parts.push(`${msg.recognition.excluded} moving part(s) could not be visually recognized and are NOT in the actuator list — their evidence is kept`);
+          if (msg.recognition?.extras) parts.push(`${msg.recognition.extras} recognized part(s) are unusual for a ${msg.recognition.dict} — listed as extras`);
           notify(`your instruction was folded in — ${parts.join(', ')}.`);
         } else if (msg.dropped) {
           notify(`dropped ${msg.dropped} from the plan — ${msg.remaining ?? 0} candidate(s) left to check`);
@@ -367,6 +370,8 @@ function connectEvents() {
           if (msg.agreed) parts.push(`and both producers independently found the same ${msg.agreed} part(s) — recorded as corroboration of one joint, never as a duplicate`);
           if (!msg.added && msg.visionReason) parts.push(`the vision lane grounded nothing: ${msg.visionReason}${msg.visionRetried ? ' (after one strict-schema retry)' : ''}`);
           if (msg.category) parts.unshift(`I read the machine as ${msg.category}`);
+          if (msg.recognition?.excluded) parts.push(`${msg.recognition.excluded} moving part(s) could not be visually recognized and are NOT in the actuator list — their evidence is kept in case you want to rescue them`);
+          if (msg.recognition?.extras) parts.push(`${msg.recognition.extras} recognized part(s) are unusual for a ${msg.recognition.dict} — listed as extras`);
           notify(`stage 1 settled — ${parts.join(', ')}. Candidates are not clickable yet: each one is checked in turn, and I will answer your messages between them.`);
         }
       } else if (msg.kind === 'discover:stage') {

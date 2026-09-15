@@ -25,6 +25,7 @@
 // formatter, so every fact it prints is handed to it — `g` for the model's own
 // size, a planned view's `cam` for the camera it was drawn with.
 import { constraintSummary } from './manifest.mjs';
+import { ACTUATOR_VOCABULARY } from './actuator-dictionary.mjs';
 
 export const MAX_VISION_FRAMES = 12;
 // A colour legend beyond this stops being readable and starts costing more tokens
@@ -263,6 +264,13 @@ export function buildVisionPrompt({
   lines.push('  hinge  - rotates about an axis over a limited range (folding arm, landing gear,');
   lines.push('           control surface, bay door)');
   lines.push('');
+  lines.push('PARTS vocabulary — WHAT a part is, as opposed to how it moves. For every proposal');
+  lines.push('also name the part with ONE word from this list:');
+  lines.push(`  ${[...ACTUATOR_VOCABULARY].sort().join(', ')}`);
+  lines.push('Use null when none of these honestly fits what you are pointing at. A wrong name');
+  lines.push('is worse than none: an unnamed part is excluded from the actuator list, a wrongly');
+  lines.push('named one gets the wrong controller.');
+  lines.push('');
   lines.push('HOW TO POINT AT A PART (read this carefully - it is the whole contract):');
   lines.push('You do NOT know our internal part names and you must NOT invent them. Instead,');
   lines.push('for every proposal give us a way to LOCATE the part:');
@@ -279,7 +287,7 @@ export function buildVisionPrompt({
   lines.push('');
   lines.push('Reply with JSON ONLY (no prose, no code fences): an array of at most 6 objects:');
   lines.push('[{ "op": "new|split|confirm", "targetId": "<existing id, for split/confirm only>",');
-  lines.push('   "type": "rotor|gimbal|hinge",');
+  lines.push('   "type": "rotor|gimbal|hinge", "part": "<one word from the PARTS vocabulary, or null>",');
   lines.push('   "frameId": "<frame id>", "regionBox": [x0,y0,x1,y1], "regionColors": ["#rrggbb"],');
   lines.push('   "nodeIds": ["<only if we gave you names below>"],');
   lines.push('   "axis": [x,y,z], "anchor": [x,y,z],');

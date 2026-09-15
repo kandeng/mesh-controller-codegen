@@ -27,6 +27,7 @@ import {
   parseExpectation, verifiedInstances,
 } from './expectation.mjs';
 import { regionsFromExpectations } from './grounding.mjs';
+import { applyRecognitionGate, reconcileExpectation } from './actuator-dictionary.mjs';
 import { buildMotionPrompt, MAX_MOTION_FRAMES } from './motion-prompt.mjs';
 import { motionAssess } from './motion-propose.mjs';
 import { VIEWPORT, modelRadius, modelTarget, namedIndex, nodeBox, planCloseUps, regionsFromSuggestViews, renderTargets } from './views.mjs';
@@ -95,6 +96,11 @@ function mergeProposals(g, joints, manifest, { records, confirms, confirmTag = '
     // project, 'cross-producer:L2-vision' says it agreed with the TEXT producer.
     // Both go through this one path, so both are capped identically.
     t.evidence.push(c.tag || confirmTag);
+    // A confirm that names what the target IS hands the recognition gate a
+    // vocabulary word the record's own producer may never have been able to
+    // give (the geometry lane names nothing). First name wins: a later confirm
+    // corroborates, it does not rename.
+    if (typeof c.part === 'string' && c.part && !t.part) t.part = c.part;
     // A corroboration may only ever LIFT. The cap keeps confirms below the
     // auto-accept threshold (physics alone crosses it), but applying min() to a
     // record physics already lifted would DEMOTE an auto-accepted joint to
@@ -152,6 +158,8 @@ export function admitCandidates(joints, manifest, { records = [], confirms = [] 
     const t = manifest.find((r) => r.id === c.targetId);
     if (!t) continue;
     t.evidence.push(c.tag || 'cross-producer');
+    // Same first-name-wins stamping as mergeProposals (see the note there).
+    if (typeof c.part === 'string' && c.part && !t.part) t.part = c.part;
   }
   for (const rec of records || []) {
     if (rec.splitFrom) {
@@ -396,6 +404,10 @@ export function reconcileLanes(manifest, delta, { origin = null, tag = null, ove
       confirms.push({
         targetId: hit.id,
         tag: tag || `cross-producer:${origin || 'unknown'}`,
+        // The lane's recognition of the shared parts rides onto the existing
+        // record through the confirm-stamping path — agreement is exactly the
+        // moment a geometry record earns the name it could not give itself.
+        ...(typeof rec.part === 'string' && rec.part ? { part: rec.part } : {}),
       });
       agreed.push({
         id: hit.id, nodes: (rec.nodes || []).length, from: origin || null,
@@ -830,6 +842,14 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
           // caller cannot mistake "the model said nothing usable" for "the model
           // described a machine with no moving parts".
           if (!expectation.category && !(expectation.instances || []).length) expectation = null;
+          // The actuator dictionary's verdict on the category: a hit pins the
+          // expected counts to the table's deterministic values (and hands the
+          // discovery turn the reference list as a hypothesis); a miss leaves
+          // the model's own counts in charge, exactly as before the table.
+          if (expectation) {
+            const rec0 = reconcileExpectation(expectation);
+            expWarnings.push(...rec0.warnings.map((w) => `category turn: ${w}`));
+          }
           // Gaps AT ASK TIME: the prior against what the project already believes
           // BEFORE this round adds anything. That is the comparison turn B can act
           // on ("3 of the 4 rotors it expects are already on the books — find the
@@ -860,6 +880,8 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
           type: ins.type, count: ins.count, frameId: ins.frameId,
           regionBox: ins.regionBox, symmetry: ins.symmetry || null, note: ins.note || null,
         })),
+        dictKey: expectation?.dictKey || null,
+        dictCounts: expectation?.dictCounts || null,
         gaps: gapsAtAsk,
         doubts: expectation?.doubts || [],
         alternatives: expectation?.alternatives || [],
@@ -990,6 +1012,12 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
     .map((e) => ({ index: e.index, frameId: e.frameId, names: e.names, grounding: e.grounding, uncertainties: e.uncertainties }));
 
   if (stopAfter === 'proposals') {
+    // THE RECOGNITION GATE, proposals-only flavour: the records are not in the
+    // manifest yet (the orchestrator admits them), so the gate marks the
+    // proposal objects themselves and the marks ride along with them.
+    const recognition = applyRecognitionGate(parsed.records, { category: expectation?.category || null });
+    for (const n of recognition.notes) warnings.push(`recognition gate: ${n}`);
+    say('vision:recognition', recognition);
     // The audit trail is written exactly as the merging path would write it, so a
     // staged round is replayable from disk like any other; the evidence-round
     // stamp goes onto the records here because there is no post-merge step to do
@@ -1026,6 +1054,7 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
       expectationUsable: expectationIsUsable(expectation),
       gaps: expectation ? expectationGap(expectation, manifest) : null,
       expectationVerified: expectation ? verifiedInstances(expectation, parsed.grounded) : null,
+      recognition,
       model: turn?.model ?? null,
       ms: Date.now() - t0,
       manifestUntouched: true,
@@ -1037,6 +1066,16 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
   const merged = mergeProposals(g, joints, manifest, {
     records: parsed.records, confirms: parsed.confirms, confirmTag: 'l2-vision-confirm',
   });
+
+  // THE RECOGNITION GATE (the user's dual-gate rule: listed = physics-grounded
+  // AND visually named). Runs over the WHOLE manifest, not just this round's
+  // additions: a confirm this round may have named an older geometry record,
+  // and the gate is idempotent, so re-judging the settled records costs nothing
+  // and keeps every mark consistent with the category now known.
+  const recognition = applyRecognitionGate(manifest, { category: expectation?.category || null });
+  for (const n of recognition.notes) warnings.push(`recognition gate: ${n}`);
+  say('vision:recognition', recognition);
+
   say('vision:verdict', {
     added: merged.added ?? 0,
     proposals: merged.proposals || [],
@@ -1095,6 +1134,7 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
     expectationUsable: expectationIsUsable(expectation),
     gaps: expectation ? expectationGap(expectation, manifest) : null,
     expectationVerified: expectation ? verifiedInstances(expectation, parsed.grounded) : null,
+    recognition,
     model: turn?.model ?? null,
     ms: Date.now() - t0,
     manifestUntouched: false,

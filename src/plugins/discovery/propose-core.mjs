@@ -115,7 +115,15 @@ export function createProposalGate({
     if (!byId.has(p.targetId) && p.op !== 'new') return drop(idx, `op "${p.op}" needs a valid targetId`);
 
     if (p.op === 'confirm') {
-      confirms.push({ targetId: p.targetId, rationale: String(p.rationale || p.reasoning || '') });
+      // `part` rides along when the producer named what the target IS (the
+      // recognition gate's vocabulary word). A confirm that says "your joint X
+      // is right, and it is a wheel" is how a geometry-lane record earns the
+      // name it was never in a position to give itself.
+      confirms.push({
+        targetId: p.targetId,
+        rationale: String(p.rationale || p.reasoning || ''),
+        ...(typeof p.part === 'string' && p.part.trim() ? { part: p.part.trim() } : {}),
+      });
       return 'confirm';
     }
 
@@ -147,6 +155,7 @@ export function createProposalGate({
             targetId: hit.id,
             tag: `cross-producer:${origin}`,
             rationale: String(p.reasoning || p.rationale || '').slice(0, 240),
+            ...(typeof p.part === 'string' && p.part.trim() ? { part: p.part.trim() } : {}),
           });
           warnings.push(`proposal[${idx}] landed on the same parts as ${hit.id} — recorded as corroboration from this lane, not as a second record`);
           return 'confirm';
