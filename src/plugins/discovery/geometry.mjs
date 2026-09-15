@@ -12,6 +12,13 @@ const isDup = (n) => /^Object_\d+$/.test(n.name); // mesh child of a named node
 const GIMBAL_RE = /gimbal|camera|payload|mount|DL_|zenmuse|sensor|lens/i;
 const AXNAME = ['x', 'y', 'z'];
 
+// Placed-box centre for scope measurements: baked-vertex exports keep dozens
+// of nodes at one shared origin while their geometry sits metres away, so any
+// instrument reading n.wp is blind on that mesh class.
+const placedPt = (n) => (n?.wb
+  ? [0, 1, 2].map((k) => (n.wb.min[k] + n.wb.max[k]) / 2)
+  : n.wp);
+
 // ---- general machines: ground-hugging spinners (wheels, road wheels) --------
 // The two heuristics below are drone-shaped: the rotor path starts from blade
 // plates, the gimbal path reads a name vocabulary a Sketchfab car export
@@ -186,33 +193,49 @@ export function wheelUnits(g, claimed = new Set()) {
 }
 
 // Cluster blade candidates by corner; collect co-located mates (hub/spinner/locks).
+// Distances read PLACED-BOX CENTRES, never origins: baked-vertex exports keep
+// dozens of nodes at one shared origin (a whole cabin) while their geometry
+// sits metres away. Box-GAP distance was considered and rejected: a model-
+// spanning hull box touches everything, so the gap collapses to ~0 and every
+// rotor swallows the hull. Tolerances use the ring radius: the legacy origin
+// radius is inflated by helper nodes (studio lights).
 function rotorClusters(g) {
   const clusters = [];
+  const ringR = g.ringRadius || g.radius;
   for (const b of bladeCandidates(g)) {
     if (isDup(b)) continue;
-    let c = clusters.find((x) => Math.hypot(x.wp[0] - b.wp[0], x.wp[1] - b.wp[1], x.wp[2] - b.wp[2]) < 0.7 * g.radius);
-    if (!c) { c = { wp: [...b.wp], n: 1, blades: [], mates: [] }; clusters.push(c); } else {
-      for (let k = 0; k < 3; k++) c.wp[k] = (c.wp[k] * c.n + b.wp[k]) / (c.n + 1);
+    const bp = placedPt(b);
+    let c = clusters.find((x) => Math.hypot(x.wp[0] - bp[0], x.wp[1] - bp[1], x.wp[2] - bp[2]) < 0.7 * ringR);
+    if (!c) { c = { wp: [...bp], n: 1, blades: [], mates: [] }; clusters.push(c); } else {
+      for (let k = 0; k < 3; k++) c.wp[k] = (c.wp[k] * c.n + bp[k]) / (c.n + 1);
       c.n++;
     }
     c.blades.push(b.name);
     for (const n of g.nodes) {
       if (!n.wext || isDup(n)) continue;
-      if (Math.hypot(n.wp[0] - b.wp[0], n.wp[1] - b.wp[1], n.wp[2] - b.wp[2]) < 0.45 * g.radius) c.mates.push(n.name);
+      const np = placedPt(n);
+      if (Math.hypot(np[0] - bp[0], np[1] - bp[1], np[2] - bp[2]) < 0.45 * ringR) c.mates.push(n.name);
     }
   }
   return clusters.map((c) => ({ ...c, blades: [...new Set(c.blades)], mates: [...new Set(c.mates)].slice(0, 30) }));
 }
 
-// Quadrant label from the world XY centroid (model is Z-up: XY is horizontal).
-function quadrantLabel(wp, center) {
-  const lr = wp[0] - center[0] >= 0 ? 'R' : 'L';
-  const fb = wp[1] - center[1] >= 0 ? 'F' : 'B';
+// Quadrant label in the model's ground plane (ring axes), about the ring
+// centre — the hardcoded XY-centroid version read a Y-up car's VERTICAL axis
+// as front/back. FB = first ring axis, LR = second; diagonal pairing (FL+BR
+// vs FR+BL) is invariant under axis swap or sign flip, so the counter-
+// rotation assignment below is unaffected by the relabelling.
+function quadrantLabel(wp, g) {
+  const ax = g.ringAxes || [0, 1];
+  const c = g.ringCenter || g.center;
+  const fb = wp[ax[0]] - c[0] >= 0 ? 'F' : 'B';
+  const lr = wp[ax[1]] - c[1] >= 0 ? 'R' : 'L';
   return `${fb}${lr}`; // FL, FR, BL, BR
 }
 
 function gimbalNodes(g) {
-  return g.nodes.filter((n) => !isDup(n) && GIMBAL_RE.test(n.name) && n.r < 0.6 * g.radius);
+  const ringR = g.ringRadius || g.radius;
+  return g.nodes.filter((n) => !isDup(n) && GIMBAL_RE.test(n.name) && (n.rr ?? n.r) < 0.6 * ringR);
 }
 
 // Name-regex over-collection guard: the gimbal device is a COMPACT cluster,
@@ -223,10 +246,10 @@ function gimbalNodes(g) {
 // first >=3x gap, keep the compact core; trimmed names land in meta.trimmed.
 function trimToCluster(gn, radius) {
   if (gn.length < 3) return { kept: gn, trimmed: [] };
-  const c = gn.reduce((a, n) => [a[0] + n.wp[0], a[1] + n.wp[1], a[2] + n.wp[2]], [0, 0, 0]).map((v) => v / gn.length);
+  const c = gn.reduce((a, n) => { const p = placedPt(n); return [a[0] + p[0], a[1] + p[1], a[2] + p[2]]; }, [0, 0, 0]).map((v) => v / gn.length);
   const eps = 0.05 * radius;
   const byDist = gn
-    .map((n) => ({ n, d: Math.hypot(n.wp[0] - c[0], n.wp[1] - c[1], n.wp[2] - c[2]) }))
+    .map((n) => { const p = placedPt(n); return { n, d: Math.hypot(p[0] - c[0], p[1] - c[1], p[2] - c[2]) }; })
     .sort((a, b) => a.d - b.d);
   let cut = byDist.length;
   for (let i = 0; i + 1 < byDist.length; i++) {
@@ -246,7 +269,7 @@ export const geometryDiscovery = definePlugin({
       const joints = [];
 
       for (const [i, c] of rotorClusters(g).entries()) {
-        const label = quadrantLabel(c.wp, g.center);
+        const label = quadrantLabel(c.wp, g);
         const nodes = [...new Set([...c.blades, ...c.mates])];
         const j = createJoint({
           id: `rotor_${label.toLowerCase()}_${i}`,
@@ -270,7 +293,7 @@ export const geometryDiscovery = definePlugin({
 
       const gn0 = gimbalNodes(g);
       if (gn0.length) {
-        const { kept: gn, trimmed } = trimToCluster(gn0, g.radius);
+        const { kept: gn, trimmed } = trimToCluster(gn0, g.ringRadius || g.radius);
         const c = gn.reduce((a, n) => [a[0] + n.wp[0], a[1] + n.wp[1], a[2] + n.wp[2]], [0, 0, 0]).map((v) => v / gn.length);
         const j = createJoint({
           id: 'gimbal_main',

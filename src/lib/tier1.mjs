@@ -214,19 +214,26 @@ export async function tier1(glb, controllerPath, THREE) {
   // World positions come from the glTF TRS/matrix chain (gltf.mjs). A group
   // placed at the body centre, or one mixing centre and corner nodes, is the
   // "wrong parts spin" bug class the human eye catches instantly.
+  // The ring metric is geometry-based (bbox centre + mesh-node origins in the
+  // ground plane): the legacy node-origin XY radius is inflated by non-mesh
+  // helper nodes (studio lights at y=15 tripled car_marussia_b1's radius and
+  // made this check unsatisfiable for every wheel) and biased by node density.
+  const ringAx = glb.ringAxes || [0, 1];
+  const ringC = glb.ringCenter || glb.center;
+  const ringR = glb.ringRadius || glb.radius;
   const byName = new Map(glb.nodes.map((n) => [n.name, n]));
   for (const g of groups) {
     const pts = (g.names || []).map((nm) => byName.get(nm)).filter(Boolean).map((n) => n.wp);
     if (pts.length < 2) continue;
-    const gx = pts.reduce((a, p) => a + p[0], 0) / pts.length;
-    const gy = pts.reduce((a, p) => a + p[1], 0) / pts.length;
-    const cr = Math.hypot(gx - glb.center[0], gy - glb.center[1]);
+    const gx = pts.reduce((a, p) => a + p[ringAx[0]], 0) / pts.length;
+    const gy = pts.reduce((a, p) => a + p[ringAx[1]], 0) / pts.length;
+    const cr = Math.hypot(gx - ringC[0], gy - ringC[1]);
     let spread = 0;
     for (const p of pts) for (const q of pts) spread = Math.max(spread, Math.hypot(p[0] - q[0], p[1] - q[1]));
-    if (cr < 0.5 * glb.radius) {
-      failures.push(`prop group ${g.key}: centroid r=${cr.toFixed(1)} not at the rotor ring (model radius ${glb.radius.toFixed(1)}) — group spins centre/body parts?`);
+    if (cr < 0.5 * ringR) {
+      failures.push(`prop group ${g.key}: centroid r=${cr.toFixed(1)} not at the rotor ring (model radius ${ringR.toFixed(1)}) — group spins centre/body parts?`);
     }
-    if (spread > 0.7 * glb.radius) {
+    if (spread > 0.7 * ringR) {
       failures.push(`prop group ${g.key}: nodes span ${spread.toFixed(1)} world units (> 0.7×radius) — mixes body and rotor nodes?`);
     }
   }

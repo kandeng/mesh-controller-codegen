@@ -291,6 +291,35 @@ export async function parseGlb(path) {
   const wradius = hasBounds
     ? Math.max(1e-9, 0.5 * Math.hypot(bx1 - bx0, by1 - by0, bz1 - bz0))
     : radius;
+
+  // Ring metric: WHERE the actuator ring sits, for tier-1's placement checks
+  // and the blade heuristic. `radius` above spreads ALL node origins in the XY
+  // plane — fine for Z-up drone exports, but it breaks twice on general
+  // meshes: non-mesh helper nodes inflate it (car_marussia_b1: four CoronaLight
+  // studio-light nodes at y=15 tripled it, 5.9 -> 15.4), and a node-count-
+  // weighted centroid is not the geometric centre (a detail-heavy side pulls
+  // it, so symmetric wheels measure different r). The ring metric is geometry-
+  // based instead: the placed-bbox centre, and the farthest MESH-node origin
+  // measured in the GROUND PLANE — the two axes of largest bbox span, which
+  // adapts to Y-up and Z-up exports alike. The legacy fields stay untouched
+  // for the discovery tolerances tuned on them.
+  let ringAxes = [0, 1];
+  let ringCenter = [cx, cy];
+  let ringRadius = radius;
+  if (hasBounds) {
+    const span = [bx1 - bx0, by1 - by0, bz1 - bz0];
+    const order = [0, 1, 2].sort((a, b) => span[b] - span[a]);
+    const meshPts = info.filter((n) => n.mesh);
+    if (meshPts.length) {
+      ringAxes = [order[0], order[1]];
+      ringCenter = [bcenter[ringAxes[0]], bcenter[ringAxes[1]]];
+      ringRadius = Math.max(1e-9, ...meshPts.map((n) => Math.hypot(
+        n.wp[ringAxes[0]] - ringCenter[0], n.wp[ringAxes[1]] - ringCenter[1])));
+    }
+  }
+  info.forEach((n) => {
+    n.rr = Math.hypot(n.wp[ringAxes[0]] - ringCenter[0], n.wp[ringAxes[1]] - ringCenter[1]);
+  });
   return {
     nodes: info,
     names: new Set(info.map((x) => x.name)),
@@ -301,6 +330,9 @@ export async function parseGlb(path) {
     bounds,
     bcenter,
     wradius,
+    ringAxes,
+    ringCenter,
+    ringRadius,
     count: nodes.length,
     animations: (g.animations || []).length,
     parser,
@@ -329,6 +361,14 @@ export function bladeCandidates(g, frac = 0.25) {
     const [a, b] = [n.wext.ex, n.wext.ey, n.wext.ez].sort((p, q) => p - q);
     const plate = a > 1e-6 && b >= 4 * a;
     const e = Math.max(n.wext.ex, n.wext.ey);
-    return plate && e >= frac * g.maxWExt && e < 0.95 * g.maxWExt && n.r >= 0.45 * g.radius;
+    // Ring distance uses the geometry-based ring metric when present: the
+    // legacy XY node-origin radius is inflated by non-mesh helper nodes (studio
+    // lights) and biased by node density, which would hide real blades here.
+    const ringR = g.ringRadius || g.radius;
+    // Body-panel guard: a blade is a NARROW plate — its second axis stays well
+    // under half the ring (Inspire blades: 0.39x). A car's fender/hood plate
+    // passes the flatness and size windows too, but its second axis is a large
+    // fraction of the ring (the marussia front panel: 0.65x → rejected).
+    return plate && e >= frac * g.maxWExt && e < 0.95 * g.maxWExt && (n.rr ?? n.r) >= 0.45 * ringR && b < 0.5 * ringR;
   });
 }

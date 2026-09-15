@@ -125,23 +125,58 @@ export function drivePivot(root, joint, THREE, angle = 0.9) {
 
 // ---- rest-pose tests (hypothesis stage, no controller needed) ---------------
 
+// Member position for scope measurements: the PLACED-box centre, never the
+// node origin. Baked-vertex exports keep dozens of nodes at one shared origin
+// while their geometry sits metres away — origin distances are blind there.
+const memberPt = (n) => (n?.wb
+  ? [0, 1, 2].map((i) => (n.wb.min[i] + n.wb.max[i]) / 2)
+  : n.wp);
+
 // Rotor: members must lie in one disc about the anchor (flat spin plane).
 // Gimbal: members must cluster near the anchor (one compact payload unit).
+// The spin plane follows the model's ring axes (ground plane), not hardcoded
+// XY: the same mesh may be Z-up (drone) or Y-up (car export).
 export function discCoherence(g, joint) {
   const a = joint.anchor || { x: 0, y: 0, z: 0 };
+  const ap = [a.x, a.y, a.z];
   const byName = new Map(g.nodes.map((n) => [n.name, n]));
   const members = (joint.nodes || []).map((nm) => byName.get(nm)).filter(Boolean);
   if (!members.length) return { name: 'disc-coherence', pass: false, detail: 'no members resolve' };
-  const h = (n) => Math.hypot(n.wp[0] - a.x, n.wp[1] - a.y);
+  const ax = g.ringAxes || [0, 1];
+  const nrm = 3 - ax[0] - ax[1]; // the axis outside the ring plane
+  const h = (n) => { const p = memberPt(n); return Math.hypot(p[ax[0]] - ap[ax[0]], p[ax[1]] - ap[ax[1]]); };
   if (joint.type === 'rotor') {
     const R = Math.max(1e-6, ...members.map(h));
-    const zDev = Math.max(...members.map((n) => Math.abs(n.wp[2] - a.z)));
+    const zDev = Math.max(...members.map((n) => Math.abs(memberPt(n)[nrm] - ap[nrm])));
     const pass = zDev <= 1.5 * R; // same flatness rule as the rig report's rotorDisc
     return { name: 'disc-coherence', pass, detail: `R=${R.toFixed(1)} zDev=${zDev.toFixed(2)} (tol ${(1.5 * R).toFixed(1)})` };
   }
-  const spread = Math.max(...members.map((n) => Math.hypot(n.wp[0] - a.x, n.wp[1] - a.y, n.wp[2] - a.z)));
-  const pass = spread <= 0.6 * g.radius;
-  return { name: 'anchor-sphere', pass, detail: `spread=${spread.toFixed(1)} (tol ${(0.6 * g.radius).toFixed(1)})` };
+  const spread = Math.max(...members.map((n) => { const p = memberPt(n); return Math.hypot(p[0] - ap[0], p[1] - ap[1], p[2] - ap[2]); }));
+  const rr = g.ringRadius || g.radius;
+  const pass = spread <= 0.6 * rr;
+  return { name: 'anchor-sphere', pass, detail: `spread=${spread.toFixed(1)} (tol ${(0.6 * rr).toFixed(1)})` };
+}
+
+// Scope spread: how far apart do the members' PLACED boxes sit? This is the
+// check that fails a cabin-swallowing mega-cluster whose origins coincide
+// (spread by memberPt, not wp). Calibrated on the car/drone samples: a legit
+// rotor with its arm spans ≈0.56×ringRadius, the baked-export monster ≈1.9× —
+// the 1.0× ruler separates them with ~2× margin on both sides.
+export function scopeSpread(g, joint) {
+  const byName = new Map(g.nodes.map((n) => [n.name, n]));
+  const members = (joint.nodes || []).map((nm) => byName.get(nm)).filter(Boolean);
+  if (members.length < 2) return { name: 'scope-spread', pass: true, detail: 'fewer than 2 members resolve' };
+  let spread = 0;
+  for (const x of members) {
+    for (const y of members) {
+      const px = memberPt(x); const py = memberPt(y);
+      spread = Math.max(spread, Math.hypot(px[0] - py[0], px[1] - py[1], px[2] - py[2]));
+    }
+  }
+  const rr = g.ringRadius || g.radius || 1;
+  const tol = 1.0 * rr;
+  const pass = spread <= tol;
+  return { name: 'scope-spread', pass, detail: `spread=${spread.toFixed(1)} (tol ${tol.toFixed(1)} = 1.0×${g.ringRadius ? 'ring' : 'model'} radius)` };
 }
 
 // No node may belong to two joints (shared membership = ambiguous hypothesis).
@@ -162,11 +197,12 @@ export function isolation(joints) {
 export function attachmentSanity(g, joint) {
   const byName = new Map(g.nodes.map((n) => [n.name, n]));
   const members = (joint.nodes || []).map((nm) => byName.get(nm)).filter((n) => n && n.wext);
-  const tol = 0.05 * g.radius;
+  const tol = 0.05 * (g.ringRadius || g.radius);
   const gap = (x, y) => {
+    const cx = memberPt(x); const cy = memberPt(y);
     let s = 0;
     for (const [k, e] of [[0, 'ex'], [1, 'ey'], [2, 'ez']]) {
-      const d = Math.max(0, Math.abs(x.wp[k] - y.wp[k]) - (x.wext[e] + y.wext[e]) / 2);
+      const d = Math.max(0, Math.abs(cx[k] - cy[k]) - (x.wext[e] + y.wext[e]) / 2);
       s += d * d;
     }
     return Math.sqrt(s);
@@ -214,7 +250,7 @@ export async function rigidityGate(g, controllerPath, joints, THREE) {
     ctl.setSpeed?.(6);
     tick(1.0);
     for (const { s, rest } of rests) {
-      results.push({ set: s.key, kind: 'rotor', names: s.names, ...compareRel(rest, captureRel(root, s.names, THREE), THREE, 1e-4 * g.radius) });
+      results.push({ set: s.key, kind: 'rotor', names: s.names, ...compareRel(rest, captureRel(root, s.names, THREE), THREE, 1e-4 * (g.ringRadius || g.radius)) });
     }
     ctl.setSpeed?.(0);
     tick(0.5);
@@ -223,7 +259,7 @@ export async function rigidityGate(g, controllerPath, joints, THREE) {
     const rest = captureRel(root, gimbalSet.names, THREE);
     ctl.setGimbal?.(-40, 25);
     tick(1.5);
-    results.push({ set: gimbalSet.key, kind: 'gimbal', names: gimbalSet.names, ...compareRel(rest, captureRel(root, gimbalSet.names, THREE), THREE, 1e-4 * g.radius) });
+    results.push({ set: gimbalSet.key, kind: 'gimbal', names: gimbalSet.names, ...compareRel(rest, captureRel(root, gimbalSet.names, THREE), THREE, 1e-4 * (g.ringRadius || g.radius)) });
   }
 
   // Coverage: discovered joint members no declared set accounts for.

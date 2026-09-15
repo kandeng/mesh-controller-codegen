@@ -657,7 +657,7 @@ function makeFakes(replyOf) {
     res.frames === f.calls.capture && f.calls.capture > 0 && f.seen.images.length === res.frames,
     `${f.calls.capture} captured, ${f.seen.images.length} attached`);
   ok('G: the deterministic battery ran on the proposal',
-    man[0]?.tests?.length === 3, J((man[0]?.tests || []).map((t) => `${t.name}:${t.pass}`)));
+    man[0]?.tests?.length === 4, J((man[0]?.tests || []).map((t) => `${t.name}:${t.pass}`)));
   ok('G: confidence was disposed by PHYSICS, not by the model',
     [0.7, 0.75, 0.8].includes(man[0]?.confidence) && man[0].modelConfidence === undefined,
     `conf=${man[0]?.confidence}`);
