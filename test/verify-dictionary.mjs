@@ -3,7 +3,7 @@
 // the dual admission rule (physics-grounded AND visually recognized) decide
 // the actuator list?"
 //
-// Eight legs, exit 0 only if all hold:
+// Nine legs, exit 0 only if all hold:
 //   D1) a free-text category resolves to the right table entry — and an
 //       unknown machine is a clean MISS, never a forced match
 //   D2) the recognition vocabulary is closed, normalized (case, dashes,
@@ -24,12 +24,15 @@
 //   D8) one whole vision round with faked effects: the category is reconciled,
 //       the recognition beat fires, and the three proposal fates land on the
 //       manifest
+//   D9) the step-2 hardline: a record is VISIBLE as an actuator only when its
+//       part is one of the pre-defined category names — unnamed, unknown-word,
+//       gate-withheld, and rejected records are all hidden
 //
 // Usage: node test/verify-dictionary.mjs
 import { parseGlb } from '../src/lib/gltf.mjs';
 import { planViews } from '../src/plugins/discovery/views.mjs';
 import {
-  ACTUATOR_VOCABULARY, DICTIONARY, actuatorList, applyRecognitionGate,
+  ACTUATOR_VOCABULARY, DICTIONARY, actuatorList, actuatorVisible, applyRecognitionGate,
   lookupDictionary, normPartName, reconcileExpectation,
 } from '../src/plugins/discovery/actuator-dictionary.mjs';
 import { expectationBrief, expectationGap, buildExpectationPrompt, isExpectationPrompt } from '../src/plugins/discovery/expectation.mjs';
@@ -68,15 +71,24 @@ console.log('\nProving the actuator dictionary + recognition gate\n');
 
 // ---- D2) the closed vocabulary ------------------------------------------------
 {
-  const motions = new Set(['rotor', 'gimbal', 'hinge']);
+  // The table speaks the MODEL-FACING two words only. hinge survives as an IR
+  // type (manual records, the motion lane) but no prompt offers it, so no
+  // entry here may use it — and a limited-swing part (door, boom, control
+  // surface) is a gimbal in this vocabulary.
+  const motions = new Set(['rotor', 'gimbal']);
   const entries = Object.values(DICTIONARY).flatMap((e) => e.actuators);
-  ok('D2: every table entry speaks the IR motion vocabulary and a positive count',
+  ok('D2: every table entry speaks the model-facing motion vocabulary and a positive count',
     entries.every((a) => motions.has(a.motion) && a.count >= 1 && a.name && a.where));
+  ok('D2: hinge appears NOWHERE in the table — it is an internal IR type, never an expectation',
+    !entries.some((a) => a.motion === 'hinge'));
+  ok('D2: doors are listed for the categories that have them — named door, typed gimbal',
+    ['car', 'truck', 'bus'].every((k) => DICTIONARY[k].actuators.some((a) => a.name === 'door' && a.motion === 'gimbal' && a.count === 2 && !a.soft)));
   ok('D2: the vocabulary is exactly the names the table uses — no orphan words, no missing ones',
     entries.every((a) => ACTUATOR_VOCABULARY.has(a.name))
     && ACTUATOR_VOCABULARY.size === new Set(entries.map((a) => a.name)).size);
   ok('D2: names normalize — case, spaces, dashes, and a plural rescued only into a real word',
     normPartName('Wheels') === 'wheel'
+    && normPartName('doors') === 'door'
     && normPartName('track sprocket') === 'track_sprocket'
     && normPartName('MAIN_ROTOR') === 'main_rotor'
     && normPartName('flux-capacitor') === null
@@ -95,20 +107,22 @@ console.log('\nProving the actuator dictionary + recognition gate\n');
   };
   const rec = reconcileExpectation(exp);
   ok('D3: a known category is pinned to its table entry with deterministic per-motion counts',
-    exp.dictKey === 'car' && exp.dictCounts?.rotor === 4 && typeof exp.dictRef === 'string' && /4x wheel/.test(exp.dictRef),
+    exp.dictKey === 'car' && exp.dictCounts?.rotor === 4 && exp.dictCounts?.gimbal === 6
+    && typeof exp.dictRef === 'string' && /4x wheel/.test(exp.dictRef) && /2x door/.test(exp.dictRef),
     exp.dictRef);
   ok('D3: a disagreement between the first look and the table is ANNOUNCED, not absorbed',
     rec.warnings.some((w) => /usually has 4 rotor/.test(w) && /first look said 2/.test(w)), J(rec.warnings));
   const gaps = expectationGap(exp, []);
-  ok('D3: the gap check falsifies the DICTIONARY count, not the model\'s run-to-run guess — and a car expects no hinges',
-    gaps.find((x) => x.type === 'rotor')?.expected === 4 && gaps.find((x) => x.type === 'gimbal')?.expected === 4
-      && !gaps.some((x) => x.type === 'hinge'),
+  ok('D3: the gap check falsifies the DICTIONARY list per part NAME, not the model\'s run-to-run guess — and a car expects no hinges',
+    gaps.find((x) => x.part === 'wheel')?.expected === 4 && gaps.find((x) => x.part === 'door')?.expected === 2
+      && gaps.find((x) => x.part === 'mirror')?.expected === 2 && gaps.find((x) => x.part === 'headlight')?.expected === 2
+      && !gaps.some((x) => x.type || x.part === 'hinge'),
     J(gaps));
   ok('D3: a kind the model expected and the table does not list is still looked for',
     expectationGap({ instances: [{ type: 'hinge', count: 2 }], dictCounts: { rotor: 4 } }, [])
       .find((x) => x.type === 'hinge')?.expected === 2);
-  ok('D3: the discovery prompt is handed the reference list as a hypothesis line',
-    expectationBrief(exp).some((l) => /reference list for a car/.test(l) && /counts to falsify/.test(l)));
+  ok('D3: the discovery prompt is handed the reference list as a hypothesis line, walked one by one',
+    expectationBrief(exp).some((l) => /reference list for a car/.test(l) && /one by one/.test(l)));
   const miss = reconcileExpectation({ category: 'submarine', instances: [] });
   ok('D3: a category the table does not know keeps the model\'s own counts, and says so',
     miss.dict === null && miss.warnings.some((w) => /not in the actuator dictionary/.test(w)), J(miss.warnings));
@@ -124,6 +138,10 @@ console.log('\nProving the actuator dictionary + recognition gate\n');
   const ep = buildExpectationPrompt({ frames: [{ id: 'f0', mode: 'photo', dataBase64: PNG }] });
   ok('D4: the category prompt names the kinds the table knows, and permits a true unknown',
     ep.text.includes('quadrotor-drone') && ep.text.includes('robot-arm') && /a true unknown beats a forced match/.test(ep.text));
+  ok('D4: the category prompt teaches TWO motion kinds and never speaks the word hinge',
+    /"motion": "rotor\|gimbal"/.test(ep.text) && /Do not invent a third kind/.test(ep.text) && !/\bhinge\b/.test(ep.text));
+  ok('D4: the discovery prompt proposes a door as a gimbal named door, and refuses the other hinged panels',
+    /A DOOR is proposed/.test(vp.text) && /part "door"/.test(vp.text) && /hood, hatch, trunk, wiper\) are NOT proposed/.test(vp.text));
 }
 
 // ---- D5) the producer validates the name --------------------------------------
@@ -232,6 +250,22 @@ const [n1, n2, n3] = nodeNames;
     && J(res.recognition) === J(recBeat.payload), J(recBeat?.payload));
   ok('D8: the exclusion is announced in the round\'s own warnings, so a persisted round keeps it',
     res.warnings.some((w) => /recognition gate: .*EXCLUDED/.test(w)), J(res.warnings.filter((w) => /recognition/.test(w))));
+}
+
+// ---- D9) the step-2 hardline --------------------------------------------------
+{
+  ok('D9: a record named with a pre-defined category is VISIBLE in step 2',
+    actuatorVisible({ id: 'w', type: 'rotor', status: 'candidate', nodes: [n1], part: 'wheel' }) === true);
+  ok('D9: a record nobody named yet is NOT shown — the list waits for a vocabulary name',
+    actuatorVisible({ id: 'u', type: 'rotor', status: 'candidate', nodes: [n2] }) === false);
+  ok('D9: a name outside every pre-defined category is NOT shown either',
+    actuatorVisible({ id: 'x', type: 'rotor', status: 'candidate', nodes: [n2], part: 'antenna' }) === false);
+  ok('D9: a plural spelling of a category name still counts — the normalizer rescues it',
+    actuatorVisible({ id: 'd', type: 'gimbal', status: 'candidate', nodes: [n3], part: 'doors' }) === true);
+  ok('D9: the recognition gate\'s withheld listing stays withheld, name or not',
+    actuatorVisible({ id: 'e', type: 'gimbal', status: 'candidate', nodes: [n3], part: 'door', listed: false }) === false);
+  ok('D9: a rejected record is never an actuator, named or not',
+    actuatorVisible({ id: 'r', type: 'rotor', status: 'rejected', nodes: [n1], part: 'rotor' }) === false);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

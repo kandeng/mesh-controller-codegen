@@ -27,6 +27,14 @@ export const vec3 = (v) => Array.isArray(v) && v.length === 3 && v.every((x) => 
 // because both producers face the same failure: a model that wraps its JSON in
 // prose or code fences despite being told not to.
 //
+// When the first-`[`-to-last-`]` span does not parse as ONE document — the
+// classic cause being a long reply that emitted SEVERAL arrays, or prose that
+// carries brackets of its own — the parser falls back to a salvage scan: every
+// balanced TOP-LEVEL array is parsed on its own and the ones that succeed are
+// concatenated. One malformed array then costs itself instead of the whole
+// reply (a 20KB answer dying to one stray comma is how a round reports "the
+// model proposed nothing" while having proposed plenty).
+//
 // `maxItems` defaults to the shared cap. The localization turn (localize.mjs)
 // asks for one item PER dictionary part and passes its own ask count — a cap
 // the caller set, not a cap the model talked us into.
@@ -38,16 +46,52 @@ export function parseReply(reply, maxItems = MAX_PROPOSALS) {
   const a = body.indexOf('[');
   const b = body.lastIndexOf(']');
   if (a < 0 || b <= a) return { items: [], warnings: ['no JSON array found in reply'] };
+  let items = null;
+  let warnings = [];
   try {
-    const items = JSON.parse(body.slice(a, b + 1));
-    if (!Array.isArray(items)) return { items: [], warnings: ['parsed value is not an array'] };
-    return {
-      items: items.slice(0, cap),
-      warnings: items.length > cap ? [`truncated to ${cap} proposals`] : [],
-    };
+    const parsed = JSON.parse(body.slice(a, b + 1));
+    if (!Array.isArray(parsed)) return { items: [], warnings: ['parsed value is not an array'] };
+    items = parsed;
   } catch (e) {
-    return { items: [], warnings: [`JSON parse failed: ${e.message}`] };
+    // Salvage scan: bracket depth with string awareness, so a quoted "]/["
+    // inside a string cannot fake a split. Each top-level array that parses
+    // contributes its OBJECT items; non-objects (a stray colour list in prose)
+    // are dropped, and the gate downstream refuses anything still malformed.
+    const salvaged = [];
+    let depth = 0;
+    let start = -1;
+    let inStr = false;
+    let esc = false;
+    for (let i = a; i <= b; i += 1) {
+      const ch = body[i];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (ch === '\\') esc = true;
+        else if (ch === '"') inStr = false;
+        continue;
+      }
+      if (ch === '"') { inStr = true; continue; }
+      if (ch === '[') { if (depth === 0) start = i; depth += 1; }
+      else if (ch === ']') {
+        depth -= 1;
+        if (depth < 0) break; // more closers than openers — the span is prose
+        if (depth === 0 && start >= 0) {
+          try {
+            const part = JSON.parse(body.slice(start, i + 1));
+            if (Array.isArray(part)) salvaged.push(...part.filter((x) => x && typeof x === 'object'));
+          } catch { /* one malformed array does not poison its neighbours */ }
+          start = -1;
+        }
+      }
+    }
+    if (!salvaged.length) return { items: [], warnings: [`JSON parse failed: ${e.message}`] };
+    items = salvaged;
+    warnings = [`the reply was not one JSON array (${e.message}); salvaged ${salvaged.length} item(s) from the array(s) that did parse`];
   }
+  return {
+    items: items.slice(0, cap),
+    warnings: [...warnings, ...(items.length > cap ? [`truncated to ${cap} proposals`] : [])],
+  };
 }
 
 // Create one gate over a parse table + manifest.

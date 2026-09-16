@@ -112,6 +112,10 @@ export function jointRoutes(app, kernel) {
   app.post('/api/manifest/vision-refine', async (req, reply) => {
     const r = await kernel.visionRefine(req.body || {});
     if (!r.ok) {
+      // A parked category review is NOT a failure: the round stopped on purpose
+      // to ask the human about an unknown machine, so the ask rides a 200 body
+      // (and the served state) instead of surfacing as an error toast.
+      if (r.code === 'CATEGORY_REVIEW') return r;
       const code = r.code === 'NO_PROJECT' ? 400
         : r.code === 'NO_MODEL' ? 409
           : r.code === 'PLAN_FAILED' ? 500

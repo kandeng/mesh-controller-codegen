@@ -14,7 +14,7 @@ import { computed, ref, watch } from 'vue';
 import { useProjectStore } from '../composables/useProjectStore.js';
 import { useKernelApi } from '../composables/useKernelApi.js';
 
-const { state, activeJoint, notify } = useProjectStore();
+const { state, activeJoint, notify, applyJoints } = useProjectStore();
 const api = useKernelApi();
 
 const peers = ref(null);          // { canAmortize, peers:[ids], group:[ids] }
@@ -70,7 +70,7 @@ async function decide(decision) {
     if (skipped.length) line += ` — ${skipped.length} mirror(s) skipped (already judged directly)`;
     notify(line);
     const fresh = await api.joints();
-    if (fresh?.ok) state.joints = fresh.joints;
+    if (fresh?.ok) applyJoints(fresh.joints);
     await loadPeers(j.id);
   } catch (e) {
     notify(`verdict failed: ${e.message}`);

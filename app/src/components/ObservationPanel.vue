@@ -26,7 +26,7 @@ import { computed, ref, watch } from 'vue';
 import { useProjectStore } from '../composables/useProjectStore.js';
 import { useKernelApi } from '../composables/useKernelApi.js';
 
-const { state } = useProjectStore();
+const { state, applyJoints } = useProjectStore();
 const api = useKernelApi();
 
 const tab = ref('claim');            // 'claim' | 'rounds'
@@ -209,7 +209,7 @@ async function submit() {
     // Refresh the served joint list so the chips in step 3 and the viewer's
     // colours agree with the record that was just written.
     const j = await api.joints();
-    if (j.ok) state.joints = j.joints;
+    if (j.ok) applyJoints(j.joints);
     await load(state.activeJointId);
   } catch (e) {
     msg.value = e.message;

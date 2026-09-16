@@ -1,0 +1,100 @@
+{
+  "car": {
+    "match": ["car", "sedan", "coupe", "sports car", "sportscar", "suv", "hatchback", "convertible", "race car", "racing car", "supercar"],
+    "actuators": [
+      { "name": "wheel", "motion": "rotor", "count": 4, "where": "four corners of chassis", "soft": false },
+      { "name": "door", "motion": "gimbal", "count": 2, "where": "sides of cabin", "soft": false },
+      { "name": "mirror", "motion": "gimbal", "count": 2, "where": "exterior sides of cabin", "soft": true },
+      { "name": "headlight", "motion": "gimbal", "count": 2, "where": "front fascia", "soft": true }
+    ]
+  },
+  "truck": {
+    "match": ["truck", "pickup", "lorry", "semi truck", "box truck", "van"],
+    "actuators": [
+      { "name": "wheel", "motion": "rotor", "count": 6, "where": "axles along chassis", "soft": false },
+      { "name": "door", "motion": "gimbal", "count": 2, "where": "sides of cab", "soft": false },
+      { "name": "mirror", "motion": "gimbal", "count": 2, "where": "exterior sides of cab", "soft": true }
+    ]
+  },
+  "bus": {
+    "match": ["bus", "coach", "minibus"],
+    "actuators": [
+      { "name": "wheel", "motion": "rotor", "count": 6, "where": "axles along chassis", "soft": false },
+      { "name": "door", "motion": "gimbal", "count": 2, "where": "sides of passenger cabin", "soft": false },
+      { "name": "mirror", "motion": "gimbal", "count": 2, "where": "exterior front corners", "soft": true }
+    ]
+  },
+  "motorbike": {
+    "match": ["motorbike", "motorcycle", "scooter", "moped", "dirt bike"],
+    "actuators": [
+      { "name": "wheel", "motion": "rotor", "count": 2, "where": "front and rear forks", "soft": false },
+      { "name": "mirror", "motion": "gimbal", "count": 2, "where": "ends of handlebars", "soft": true }
+    ]
+  },
+  "bicycle": {
+    "match": ["bicycle", "bike", "road bike", "mountain bike"],
+    "actuators": [
+      { "name": "wheel", "motion": "rotor", "count": 2, "where": "front and rear forks", "soft": false },
+      { "name": "pedal", "motion": "rotor", "count": 2, "where": "bottom bracket crank arms", "soft": false }
+    ]
+  },
+  "quadrotor-drone": {
+    "match": ["quadrotor drone", "quadrotor", "quadcopter", "drone", "multirotor", "uav", "quad"],
+    "actuators": [
+      { "name": "rotor", "motion": "rotor", "count": 4, "where": "ends of arms", "soft": false },
+      { "name": "gimbal_mount", "motion": "gimbal", "count": 1, "where": "underside center body", "soft": false }
+    ]
+  },
+  "helicopter": {
+    "match": ["helicopter", "heli", "chopper", "gyrocopter"],
+    "actuators": [
+      { "name": "main_rotor", "motion": "rotor", "count": 1, "where": "top of mast", "soft": false },
+      { "name": "tail_rotor", "motion": "rotor", "count": 1, "where": "end of tail boom", "soft": false }
+    ]
+  },
+  "airplane": {
+    "match": ["airplane", "aeroplane", "plane", "aircraft", "jet", "fixed-wing", "propeller plane", "biplane", "glider"],
+    "actuators": [
+      { "name": "propeller", "motion": "rotor", "count": 1, "where": "nose or engine nacelle", "soft": false },
+      { "name": "aileron", "motion": "gimbal", "count": 2, "where": "trailing edge of wings", "soft": false },
+      { "name": "elevator", "motion": "gimbal", "count": 2, "where": "trailing edge of tailplane", "soft": false },
+      { "name": "rudder", "motion": "gimbal", "count": 1, "where": "trailing edge of fin", "soft": false },
+      { "name": "flap", "motion": "gimbal", "count": 2, "where": "inner trailing wing edge", "soft": false }
+    ]
+  },
+  "tank": {
+    "match": ["tank", "main battle tank", "battle tank", "armoured vehicle", "armored vehicle"],
+    "actuators": [
+      { "name": "track_sprocket", "motion": "rotor", "count": 2, "where": "rear of track assemblies", "soft": false },
+      { "name": "turret", "motion": "rotor", "count": 1, "where": "top of hull", "soft": false },
+      { "name": "gun_barrel", "motion": "gimbal", "count": 1, "where": "front of turret", "soft": false }
+    ]
+  },
+  "boat": {
+    "match": ["boat", "ship", "yacht", "vessel", "speedboat", "sailboat"],
+    "actuators": [
+      { "name": "propeller", "motion": "rotor", "count": 1, "where": "stern below waterline", "soft": false },
+      { "name": "rudder", "motion": "gimbal", "count": 1, "where": "stern behind propeller", "soft": false }
+    ]
+  },
+  "robot-arm": {
+    "match": ["robot arm", "robotic arm", "robot-arm", "manipulator", "robot manipulator", "industrial arm"],
+    "actuators": [
+      { "name": "base_joint", "motion": "rotor", "count": 1, "where": "bottom mounting plate", "soft": false },
+      { "name": "shoulder_joint", "motion": "gimbal", "count": 1, "where": "base to upper arm", "soft": false },
+      { "name": "elbow_joint", "motion": "gimbal", "count": 1, "where": "upper to lower arm", "soft": false },
+      { "name": "wrist_joint", "motion": "rotor", "count": 1, "where": "lower arm to end effector", "soft": false },
+      { "name": "gripper_jaw", "motion": "gimbal", "count": 2, "where": "end effector tip", "soft": false }
+    ]
+  },
+  "excavator": {
+    "match": ["excavator", "digger", "backhoe", "tracked excavator"],
+    "actuators": [
+      { "name": "track_sprocket", "motion": "rotor", "count": 2, "where": "rear of track assemblies", "soft": false },
+      { "name": "cab_turret", "motion": "rotor", "count": 1, "where": "top of undercarriage", "soft": false },
+      { "name": "boom", "motion": "gimbal", "count": 1, "where": "front of cab body", "soft": false },
+      { "name": "stick", "motion": "gimbal", "count": 1, "where": "end of boom arm", "soft": false },
+      { "name": "bucket", "motion": "gimbal", "count": 1, "where": "end of stick arm", "soft": false }
+    ]
+  }
+}

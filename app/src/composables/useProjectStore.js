@@ -70,6 +70,28 @@ function notify(text) {
   state.transcript.push({ role: 'system', text: t, ts: Date.now() });
 }
 
+// The stop-and-ask, narrated as the assistant's own question. Shared by the
+// live vision:category-review beat and the /api/state resume path, so the
+// question reads the same whether you watched the campaign park or opened the
+// page after it did. `resumed` marks the reload case, where the live beat is
+// long gone and the ask is being re-told from the served state.
+function categoryReviewText(review, { resumed = false } = {}) {
+  const acts = Array.isArray(review?.actuators) ? review.actuators : [];
+  const para = [];
+  para.push(`${resumed ? 'Still waiting for your decision: ' : ''}this machine is not in our reference table, so I stopped before looking for its parts. I read it as "${review?.category || 'unknown'}"${Number.isFinite(review?.confidence) ? ` (confidence ${review.confidence})` : ''}${review?.summary ? ` — ${review.summary}` : ''}.`);
+  if (acts.length) {
+    para.push(`Please verify the new category and its common actuators before I continue. The model proposes:\n${acts.map((a, i) => `  ${i + 1}. ${a.name} — ${a.motion} × ${a.count}${a.where ? ` — usually at: ${a.where}` : ''}`).join('\n')}`);
+  } else {
+    para.push('The model proposed no actuators for it, so the entry would be empty — you may want to write it into the table yourself.');
+  }
+  if ((review?.alternatives || []).length) para.push(`Other categories it could be: ${review.alternatives.join('; ')}.`);
+  para.push('Say "yes" to confirm: I will add the entry to the reference table (config/actuator-dictionary.json) and restart the recognition with it, finding its actuators one by one. To correct the names or counts first, edit that file directly — it reloads on every read — then say "yes".');
+  return para.join('\n\n');
+}
+function narrateCategoryReview(review, opts = {}) {
+  state.transcript.push({ role: 'assistant', text: categoryReviewText(review, opts), ts: Date.now() });
+}
+
 // The inspection guidance the assistant says when the human picks a joint from the
 // list. It is said ONCE per conversation: the whole transcript is scanned, not just
 // its last entry, so clicking joint after joint — with questions and screenshots in
@@ -97,13 +119,30 @@ function pushVision(msg) {
   if (state.visionFeed.length > 400) state.visionFeed.splice(0, state.visionFeed.length - 400);
 }
 
+// THE STEP-2 HARDLINE, enforced where the list enters the UI: a record is an
+// actuator in this app only when the SERVER says it is visible (the kernel's
+// actuatorVisible rule, served as the `visible` flag on every joint summary).
+// The kernel keeps every record (evidence is never dropped and the exclusions
+// are announced in chat); the store simply never lists the rest.
+// Every joint-list assignment goes through here. When a refresh drops the
+// ACTIVE joint from the visible list, the selection, its slot graph, and its
+// knob values go too — step 3 must never drive an unlisted record.
+function applyJoints(list) {
+  state.joints = (Array.isArray(list) ? list : []).filter((j) => j && j.visible !== false);
+  if (state.activeJointId && !state.joints.some((j) => j.id === state.activeJointId)) {
+    state.activeJointId = null;
+    state.slotGraph = null;
+    state.knobValues = {};
+  }
+}
+
 // The producers merge records SERVER-side; the list the human reads is the
 // server's, so re-read it instead of trusting what this tab had when the load
 // happened. A merge the list never shows is indistinguishable from a merge that
 // never happened — which is exactly the bug this call exists to prevent.
 function refreshJoints() {
   useKernelApi().joints()
-    .then((d) => { if (d?.ok) state.joints = d.joints || []; })
+    .then((d) => { if (d?.ok) applyJoints(d.joints); })
     .catch(() => { /* the next load will refresh it */ });
 }
 
@@ -153,7 +192,10 @@ function connectEvents() {
         // the orchestrator says both have settled.
         if (!state.refining) { state.visionActive = false; state.discovering = false; setStatus(null); }
         pushEvent({ type: msg.kind, ts: Date.now(), data: { ok: !!msg.ok, code: msg.code || null, reason: msg.reason || msg.error || null, look: msg.look ?? 1 } });
-        if (msg.kind === 'vision:skip') {
+        if (msg.kind === 'vision:skip' && msg.code === 'CATEGORY_REVIEW') {
+          // The vision:category-review beat above already asked the question in
+          // full — a skip line here would only repeat it in worse words.
+        } else if (msg.kind === 'vision:skip') {
           // A skip of the STEERED second look is a different sentence: the run is
           // not degraded, the instruction simply could not be folded in, and the
           // list from the first look still stands.
@@ -168,7 +210,9 @@ function connectEvents() {
           notify(`vision refinement failed: ${msg.reason || msg.code || 'unknown error'}`);
         }
       } else if (msg.kind === 'vision:expect') {
-        // The category answer is in; the discovery turn goes out right after this.
+        // The category answer is in. For a table category the localization turn
+        // goes out right after this; for an unknown one the round is about to
+        // stop — narrated by the vision:category-review beat that follows.
         setStatus(`DSH is asking ${state.visionModel} to detect the joints in the rendered frames. Please wait …`);
         // The category prior, narrated as the assistant's own hypothesis — with
         // the boundary stated in the same breath, because a guess that reads like
@@ -176,22 +220,31 @@ function connectEvents() {
         state.expectation = {
           category: msg.category || null, confidence: msg.confidence ?? null,
           summary: msg.summary || null, usable: !!msg.usable,
-          instances: msg.instances || [], doubts: msg.doubts || [],
-          alternatives: msg.alternatives || [], ts: Date.now(),
+          dictKey: msg.dictKey || null,
+          instances: msg.instances || [], actuators: msg.actuators || [],
+          doubts: msg.doubts || [], alternatives: msg.alternatives || [], ts: Date.now(),
         };
         state.gaps = msg.gaps || [];
-        const want = (msg.instances || [])
-          .map((i) => `${i.count} ${i.type}${Number(i.count) === 1 ? '' : 's'}`).join(', ');
-        const miss = (msg.gaps || []).filter((gp) => (gp.missing || 0) > 0);
+        // The reference list, told BY NAME: the gap rows carry one line per
+        // actuator the table expects of this category (wheel ×4, door ×2, …).
+        const rows = (msg.gaps || []).filter((gp) => gp.part);
+        const want = rows.map((gp) => `${gp.expected} ${gp.part}${Number(gp.expected) === 1 ? '' : 's'}`).join(', ');
+        // "Still missing" only says something a re-look needs to hear: on a
+        // first look the map is empty and the one-by-one sentence above already
+        // covers it.
+        const anyFound = rows.some((gp) => (gp.found || 0) > 0);
+        const miss = rows.filter((gp) => (gp.missing || 0) > 0);
         const para = [];
         para.push(msg.usable
           ? `Before going part by part, one look at the whole machine: this appears to be ${msg.category || 'something I cannot name yet'}${msg.summary ? ` — ${msg.summary}` : ''}.`
           : `I could not settle what kind of machine this is${msg.category ? ` (my best guess was ${msg.category})` : ''}, so I will look at it part by part and expect nothing.`);
-        if (want) {
-          para.push(`A machine of that category would have ${want}. That is a GUESS about a category, not a joint: I will verify each one against the frames, and anything I cannot ground I report rather than assume.`);
+        if (msg.usable && msg.dictKey && want) {
+          para.push(`Our reference table says a ${msg.dictKey} carries: ${want}. I will now find each of them one by one, and anything I cannot point at in the frames I report rather than assume.`);
+        } else if (msg.usable && msg.dictKey) {
+          para.push('That category is in our reference table. I will find its actuators one by one, and anything I cannot point at in the frames I report rather than assume.');
         }
-        if (miss.length) {
-          para.push(`Against that expectation I am still missing ${miss.map((gp) => `${gp.missing} of ${gp.expected} ${gp.type}`).join(', ')} — that is where I will aim the close-ups.`);
+        if (msg.usable && msg.dictKey && anyFound && miss.length) {
+          para.push(`Of those, I am still missing ${miss.map((gp) => `${gp.missing} of ${gp.expected} ${gp.part}`).join(', ')} — that is where I will aim the close-ups.`);
         }
         if ((msg.alternatives || []).length) para.push(`Other categories it could be: ${msg.alternatives.join('; ')}.`);
         if ((msg.doubts || []).length) para.push(`What I am unsure about: ${msg.doubts.join(' ')}`);
@@ -199,6 +252,14 @@ function connectEvents() {
         if (msg.prompt) etext += `\n\nI asked:\n\n${msg.prompt}`;
         if (msg.reply) etext += `\n\nThe model answered:\n\n${msg.reply}`;
         state.transcript.push({ role: 'assistant', text: etext, ts: Date.now() });
+      } else if (msg.kind === 'vision:category-review') {
+        // The stop-and-ask: the machine matched NO reference-table category, so
+        // the workflow parked BEFORE any part was looked for. Narrated as a
+        // question to the human — a chat "yes" writes the proposed entry into
+        // config/actuator-dictionary.json and restarts the look; editing that
+        // file directly is the correction path (it reloads on every read).
+        setStatus(null);
+        narrateCategoryReview(msg);
       } else if (msg.kind === 'vision:frame' && msg.url) {
         setStatus(`DSH rendered view ${msg.viewId || msg.id} and is looking at the frames. Please wait …`);
         // The campaign's artifacts ride the CHAT as the assistant's self-talk:
@@ -463,5 +524,5 @@ function connectEvents() {
 }
 
 export function useProjectStore() {
-  return { state, activeJoint, setActiveJoint, setKnob, pushEvent, notify, sayJointGuidance, connectEvents };
+  return { state, activeJoint, setActiveJoint, setKnob, pushEvent, notify, sayJointGuidance, connectEvents, applyJoints, narrateCategoryReview };
 }

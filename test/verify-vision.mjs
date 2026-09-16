@@ -1333,17 +1333,22 @@ function makeFakes(replyOf) {
     isExpectationPrompt(ep.text) && ep.images.length === surveyFrames.length && ep.frames.every((f) => f.attached),
     `${ep.images.length} attached, ${ep.frames.length} described`);
   ok('G9: the category prompt says plainly that an expectation is NEVER a discovery',
-    /NEVER a/.test(ep.text) && /nothing you write here becomes a joint/.test(ep.text));
+    /nothing you write here/.test(ep.text) && /becomes a joint/.test(ep.text) && /NOT your job/.test(ep.text));
   // The prior is read off the orthographic six, so the prompt has to SAY that: a
   // model told it is looking at obliques will place an instance's regionBox from
   // the wrong mental camera, and the aim that comes back misses the part.
   ok('G9: the category prompt describes the survey it is really showing - six orthographic looks',
     /six orthographic looks/.test(ep.text) && /eye-level side/.test(ep.text) && !/four oblique/.test(ep.text),
     ep.text.split('\n').filter((l) => /orthographic|eye-level/.test(l)).join(' / ').slice(0, 150));
-  ok('G9: the category prompt demands a count, a place, a symmetry, a doubt and an alternative',
-    ['count', 'regionBox', 'symmetry', 'doubts', 'alternatives'].every((k) => ep.text.includes(k)));
-  ok('G9: it maps an inexpressible motion onto the nearest of the three and forbids a fourth kind',
-    /track/.test(ep.text) && /Do not invent a fourth kind/.test(ep.text));
+  // The user's hardline: no interior, no internal mechanical structure — the
+  // prompt has to SAY that, or the model speculates about steering linkages.
+  ok('G9: the category prompt fences the scope to the OUTER SURFACE - no interior, no internal mechanism - and says to keep it short',
+    /OUTER SURFACE/.test(ep.text) && /no steering linkage/.test(ep.text) && /KEEP IT SHORT/.test(ep.text));
+  ok('G9: the category prompt demands a category, a confidence, a summary, doubts and alternatives - and never a pointing contract',
+    ['category', 'confidence', 'summary', 'doubts', 'alternatives', 'actuators'].every((k) => ep.text.includes(k))
+    && !/"frameId"|symmetry/.test(ep.text));
+  ok('G9: it offers exactly two motion words and forbids a third kind',
+    /"motion": "rotor\|gimbal"/.test(ep.text) && /Do not invent a third kind/.test(ep.text));
   ok('G9: with no whole-machine photo there is nothing to ask, and the caller is told rather than left to guess',
     (() => { const none = buildExpectationPrompt({ frames: noise, g }); return none.text === null && none.images.length === 0 && none.warnings.length > 0; })(),
     J(buildExpectationPrompt({ frames: noise, g }).warnings));
@@ -1379,12 +1384,16 @@ function makeFakes(replyOf) {
       { type: 'rotor', count: 4, frameId: 'v999.photo', regionBox: [0, 0, 0.5, 0.5] },
       { type: 'rotor', count: 4, frameId: surveyFrames[0].id, regionBox: [0, 0, 5000, 5000] },
       { type: 'gimbal', count: 99, frameId: surveyFrames[0].id, regionBox: [0.1, 0.1, 0.4, 0.4] },
+      { type: 'hinge', count: 3, frameId: surveyFrames[0].id, regionBox: [0.2, 0.2, 0.3, 0.3] },
       'not an object',
     ],
   }), { frameIds: sentIds });
   ok('G9: an instance outside the motion vocabulary is DROPPED with a warning, never mapped by guesswork',
     !bad.expectation.instances.some((i) => i.type === 'track')
-    && bad.warnings.some((w) => /track/.test(w) && /not rotor\|gimbal\|hinge/.test(w)), J(bad.warnings));
+    && bad.warnings.some((w) => /track/.test(w) && /not rotor\|gimbal/.test(w)), J(bad.warnings));
+  ok('G9: a stale HINGE instance is re-typed to gimbal — announced, because a limited-swing panel is a gimbal in the two-kind vocabulary',
+    bad.expectation.instances.some((i) => i.type === 'gimbal' && i.count === 3)
+    && bad.warnings.some((w) => /"hinge" re-typed to gimbal/.test(w)), J(bad.warnings));
   ok('G9: an instance naming a frame that was never sent is dropped - it could not be aimed at anyway',
     bad.warnings.some((w) => /v999\.photo/.test(w) && /was not sent/.test(w)));
   ok('G9: a box beyond the frame it was drawn on is STILL dropped - it is neither convention, and repairing it would aim a camera at a place nobody indicated',
@@ -1436,11 +1445,11 @@ function makeFakes(replyOf) {
       instances: [{ type: 'rotor', count: 4, frameId: surveyFrames[0].id, regionBox: [205, 256, 410, 461] }],
     }), { frameIds: sentIds, viewport: { w: 512, h: 512 } }).expectation.instances[0].regionBox[0] === 205 / 512);
 
-  ok('G9: a low-confidence, nameless or empty prior is NOT usable - and then the campaign behaves exactly as it did before this lane existed',
+  ok('G9: a low-confidence or nameless prior is NOT usable - and the classify-only turn needs no instances to be',
     expectationIsUsable(parsed.expectation) === true
     && expectationIsUsable({ ...parsed.expectation, confidence: 0.2 }) === false
     && expectationIsUsable({ ...parsed.expectation, category: '' }) === false
-    && expectationIsUsable({ ...parsed.expectation, instances: [] }) === false
+    && expectationIsUsable({ category: 'quadrotor drone', confidence: 0.9 }) === true
     && expectationIsUsable(null) === false);
 
   const books = [
@@ -1501,9 +1510,9 @@ function makeFakes(replyOf) {
     /HYPOTHESIS TO FALSIFY/.test(discoveryPrompt || '') && /quadrotor drone/.test(discoveryPrompt || '')
     && /expects 4 x rotor/.test(discoveryPrompt || '') && /look for the missing 4/.test(discoveryPrompt || ''),
     (discoveryPrompt || '').split('\n').filter((l) => /HYPOTHESIS|expects |missing/.test(l)).slice(0, 3).join(' | ').slice(0, 150));
-  ok('G9: the prior and its outcome ride on the round result, with gaps recomputed AFTER the merge',
+  ok('G9: the prior and its outcome ride on the round result, with gaps recomputed AFTER the merge, per part NAME',
     res9.expectation?.category === 'quadrotor drone' && res9.expectationUsable === true
-    && res9.gaps?.find((x) => x.type === 'rotor')?.expected === 4 && J(res9.expectationVerified) === '[]',
+    && res9.gaps?.find((x) => x.part === 'rotor')?.expected === 4 && J(res9.expectationVerified) === '[]',
     J(res9.gaps));
   ok('G9: the prior is persisted beside the frames that produced it - prompt, reply, gaps and warnings',
     savedExp.length === 1 && !!savedExp[0].prompt?.text && savedExp[0].reply === goodReply
@@ -1551,6 +1560,54 @@ function makeFakes(replyOf) {
     res11.ok === true && res11.expectation === null && res11.expectationUsable === false && res11.gaps === null
     && res11.warnings.some((w) => /category turn: the model call failed/.test(w)),
     J(res11.warnings.filter((w) => /category/.test(w)).slice(0, 1)));
+
+  // THE STOP-AND-ASK: a usable prior whose category the table does NOT know.
+  // The round parks the model's proposed actuator list for a human to confirm
+  // into the dictionary JSON, and ends before anything is aimed or merged.
+  let turns13 = 0;
+  const beats13 = [];
+  const savedExp13 = [];
+  const fRev = makeFakes(() => '[]');
+  const subReply = J({
+    category: 'submarine', confidence: 0.88,
+    summary: 'a streamlined hull with diving planes and a spinning propeller',
+    actuators: [
+      { name: 'propeller', motion: 'rotor', count: 1, where: 'the stern' },
+      { name: 'dive_plane', motion: 'gimbal', count: 2, where: 'the sail and the stern' },
+    ],
+    doubts: ['whether the rudder is a separate moving part'],
+    alternatives: ['a torpedo - settled by whether it has a sail'],
+  });
+  const resRev = await runVisionRound(g, [], [], {
+    plan: fRev.plan, capture: fRev.capture,
+    propose: async (text) => {
+      turns13 += 1;
+      if (isExpectationPrompt(text)) return { reply: subReply, model: 'fake-vlm', ms: 3 };
+      return { reply: '[]', model: 'fake-vlm', ms: 4 };
+    },
+    persist: { ...fRev.persist, expectation: (e) => savedExp13.push(e) },
+    expectation: true, emit: (kind, payload) => beats13.push({ kind, payload }),
+  });
+  ok('G9: an unknown category STOPS the round after the category turn - review, not discovery',
+    resRev.ok === false && resRev.code === 'CATEGORY_REVIEW' && resRev.manifestUntouched === true && turns13 === 1,
+    J({ ok: resRev.ok, code: resRev.code, turns: turns13 }));
+  ok('G9: the parked review carries the category, the proposed actuators and the verbatim exchange',
+    resRev.categoryReview?.category === 'submarine'
+    && resRev.categoryReview?.actuators?.length === 2
+    && resRev.categoryReview?.actuators?.[0]?.name === 'propeller'
+    && !!resRev.categoryReview?.prompt && !!resRev.categoryReview?.reply
+    && resRev.expectationUsable === true,
+    J(resRev.categoryReview && { category: resRev.categoryReview.category, actuators: resRev.categoryReview.actuators.length }));
+  ok('G9: the wire says vision:expect then vision:category-review - and never vision:ask',
+    (() => {
+      const k = beats13.map((b) => b.kind);
+      return k.includes('vision:expect') && k.includes('vision:category-review')
+        && k.indexOf('vision:expect') < k.indexOf('vision:category-review') && !k.includes('vision:ask');
+    })(), J(beats13.map((b) => b.kind)));
+  ok('G9: the review is persisted beside the prior, so a reload can re-ask the same question',
+    savedExp13.length === 1 && savedExp13[0].review?.category === 'submarine'
+    && savedExp13[0].expectation?.category === 'submarine',
+    J(Object.keys(savedExp13[0] || {})));
 
   let turns12 = 0;
   const f12 = makeFakes(() => '[]');
@@ -1689,9 +1746,10 @@ function makeFakes(replyOf) {
   ok('G10: an exact-set hint supersedes too, reported as an exact match with nothing given up',
     exactSup.superseded.length === 1 && exactSup.superseded[0].match === 'exact' && exactSup.superseded[0].laneOnly.length === 0);
 
-  // The round, fully faked: a car prior, five pointed boxes (four wheels and a
-  // door — the hinge no prompt offers any more, faked here to prove the gate
-  // refuses one that arrives anyway), and one extra the discovery turn finds.
+  // The round, fully faked: a car prior, six pointed boxes (four wheels, a
+  // door as a gimbal — the vocabulary the prompts now teach — and the SAME
+  // door again in the stale hinge word, to prove the gate refuses it), and
+  // one extra the discovery turn finds.
   const sv10 = bigPlan.views.find((v) => v.spec?.kind === 'survey');
   const cam10 = sv10.cam;
   const frame10 = {
@@ -1720,14 +1778,18 @@ function makeFakes(replyOf) {
   ok('G10: fixture — six parts whose boxes ground to mutually disjoint node sets exist to point at',
     pointed.length === 6, pointed.map((p) => `${p.nm}:${p.nodes.length}n`).join(', '));
 
-  // The door entry stays a hinge on purpose: the dictionary no longer asks a
-  // car for one, so this is a stale model proposing it anyway — the gate must
-  // refuse it, and only the four wheels land as hints.
-  const locReply = J(pointed.slice(0, 5).map((p, i) => ({
-    op: 'new', type: i < 4 ? 'rotor' : 'hinge', part: i < 4 ? 'wheel' : 'door',
-    frameId: frame10.id, regionBox: p.box,
-    reasoning: `the ${i < 4 ? `wheel ${i + 1} of 4` : 'door'} at this spot`,
-  })));
+  // The dictionary now asks a car for doors (gimbal, part door), so the door
+  // LANDS as a hint — while the same part in the stale hinge word is refused
+  // at the gate, ungrounded. The fixture sends both to prove each half.
+  const locReply = J([
+    ...pointed.slice(0, 4).map((p, i) => ({
+      op: 'new', type: 'rotor', part: 'wheel',
+      frameId: frame10.id, regionBox: p.box,
+      reasoning: `the wheel ${i + 1} of 4 at this spot`,
+    })),
+    { op: 'new', type: 'gimbal', part: 'door', frameId: frame10.id, regionBox: pointed[4].box, reasoning: 'the door at this spot — it swings about its front edge' },
+    { op: 'new', type: 'hinge', part: 'door', frameId: frame10.id, regionBox: pointed[4].box, reasoning: 'the same door, in the stale vocabulary' },
+  ]);
   const carReply = J({
     category: 'a sports car', confidence: 0.9, summary: 'four wheels at the corners, doors on the sides',
     instances: [{ type: 'rotor', count: 4, frameId: frame10.id, regionBox: [0.1, 0.1, 0.5, 0.5], symmetry: 'one per corner', note: 'wheels' }],
@@ -1756,8 +1818,8 @@ function makeFakes(replyOf) {
   });
   ok('G10: a dictionary-backed prior runs the three turns in order — category, localization, discovery',
     J(turnsH) === '["category","localization","discovery"]', J(turnsH));
-  ok('G10: the four wheels land as hints and the door\'s hinge is REFUSED, announced — plus the discovery turn\'s extra',
-    resh.ok === true && resh.added === 5 && resh.hinted === 4 && manh.length === 5
+  ok('G10: the four wheels and the door land as hints, the stale hinge is REFUSED, announced — plus the discovery turn\'s extra',
+    resh.ok === true && resh.added === 6 && resh.hinted === 5 && manh.length === 6
     && resh.warnings.some((w) => /is a hinge/.test(w)),
     J({ added: resh.added, hinted: resh.hinted, manifest: manh.length, w: resh.warnings.slice(0, 2) }));
   const wheels = manh.filter((r) => r.part === 'wheel');
@@ -1769,9 +1831,13 @@ function makeFakes(replyOf) {
     wheels.every((r, i) => (r.nodes || []).includes(pointed[i].nm)),
     J(manh.map((r) => `${r.id}:${(r.nodes || []).length}n`)));
   const door = manh.find((r) => r.part === 'door');
-  ok('G10: the hinge box mints NO record and is never grounded — a type refusal at the gate, not a grounding failure',
-    !door && resh.warnings.some((w) => /proposal\[4\] is a hinge/.test(w)),
-    J({ door: door?.id, records: manh.map((r) => `${r.id}:${r.part ?? '?'}:${r.type}`) }));
+  ok('G10: the door LANDS as a gimbal hint named door — the vocabulary the prompts now teach',
+    !!door && door.type === 'gimbal' && door.hinted === true && door.origin === 'expectation-hint'
+    && (door.nodes || []).includes(pointed[4].nm) && (door.evidence || []).includes('dictionary:car'),
+    J(door && { id: door.id, type: door.type, nodes: (door.nodes || []).length }));
+  ok('G10: ...and the SAME part in the stale hinge word mints no record and is never grounded — a type refusal at the gate, not a grounding failure',
+    resh.warnings.some((w) => /proposal\[5\] is a hinge/.test(w)) && manh.filter((r) => r.part === 'door').length === 1,
+    J({ records: manh.map((r) => `${r.id}:${r.part ?? '?'}:${r.type}`) }));
   ok('G10: a hint whose cloud yields no axis lands anyway, with the gap announced (the steered-wheel case)',
     manh.filter((r) => r.hinted).every((r) => r.axis !== null
       || (r.uncertainties || []).some((u) => u.includes('no axis'))),
@@ -1783,7 +1849,7 @@ function makeFakes(replyOf) {
     manh.every((r) => (r.tests || []).find((t) => t.name === 'isolation')?.pass === true),
     J(manh.map((r) => (r.tests || []).find((t) => t.name === 'isolation')?.detail).filter(Boolean)));
   ok('G10: the recognition gate lists the hints as EXPECTED parts of a car',
-    resh.recognition?.dict === 'car' && resh.recognition?.listed === 5
+    resh.recognition?.dict === 'car' && resh.recognition?.listed === 6
     && manh.filter((r) => r.hinted).every((r) => r.listed === true && r.expected === true && r.extra === false),
     J(resh.recognition && { dict: resh.recognition.dict, listed: resh.recognition.listed }));
   ok('G10: ...and the extra the discovery turn found is still gated — listed, flagged, announced',
@@ -1791,20 +1857,22 @@ function makeFakes(replyOf) {
     && manh.find((r) => r.part === 'turret')?.extra === true
     && resh.warnings.some((w) => /recognition gate: .*turret.*EXTRA/.test(w)),
     J(resh.recognition?.notes));
-  ok('G10: the gap check closes on the hints — the wheels the prior expected are FOUND, the turret is a surplus',
-    resh.gaps?.find((x) => x.type === 'rotor')?.expected === 4
-    && resh.gaps.find((x) => x.type === 'rotor')?.found === 5
-    && resh.gaps.find((x) => x.type === 'rotor')?.missing === 0
-    && resh.gaps.find((x) => x.type === 'rotor')?.surplus === 1,
+  ok('G10: the gap check closes on the hints — the wheels the table expects are FOUND, by name',
+    resh.gaps?.find((x) => x.part === 'wheel')?.expected === 4
+    && resh.gaps.find((x) => x.part === 'wheel')?.found === 4
+    && resh.gaps.find((x) => x.part === 'wheel')?.missing === 0
+    && resh.gaps.find((x) => x.part === 'wheel')?.surplus === 0,
     J(resh.gaps));
-  ok('G10: the parts nobody pointed at stay missing — and a car is no longer expected to HAVE hinges at all',
-    !resh.gaps?.some((x) => x.type === 'hinge')
-    && resh.gaps?.find((x) => x.type === 'gimbal')?.missing === 4,
+  ok('G10: the parts nobody pointed at stay missing — the second door, mirrors, headlights — and a car is no longer expected to HAVE hinges at all',
+    !resh.gaps?.some((x) => x.type || x.part === 'hinge')
+    && resh.gaps?.find((x) => x.part === 'door')?.found === 1 && resh.gaps.find((x) => x.part === 'door')?.missing === 1
+    && resh.gaps.find((x) => x.part === 'mirror')?.missing === 2
+    && resh.gaps.find((x) => x.part === 'headlight')?.missing === 2,
     J(resh.gaps));
   const locBeat = beatsH.find((b) => b.kind === 'vision:localize');
   ok('G10: the localization beat carries the dictionary key, the ask count and the landed hints',
-    !!locBeat && locBeat.payload.dictKey === 'car' && locBeat.payload.asked === 8
-    && (locBeat.payload.hints || []).length === 4 && !!locBeat.payload.prompt && !!locBeat.payload.reply,
+    !!locBeat && locBeat.payload.dictKey === 'car' && locBeat.payload.asked === 10
+    && (locBeat.payload.hints || []).length === 5 && !!locBeat.payload.prompt && !!locBeat.payload.reply,
     J(locBeat?.payload && { dictKey: locBeat.payload.dictKey, asked: locBeat.payload.asked, hints: locBeat.payload.hints?.length }));
   const verdictBeatH = beatsH.find((b) => b.kind === 'vision:verdict');
   ok('G10: the verdict beat reports no supersession when the manifest held nothing the hints overlap',

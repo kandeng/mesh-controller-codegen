@@ -16,7 +16,7 @@ useTheme().load();
 
 createApp(App).mount('#app');
 
-const { state, connectEvents } = useProjectStore();
+const { state, connectEvents, applyJoints, narrateCategoryReview } = useProjectStore();
 const api = useKernelApi();
 
 // Live kernel bus events (auto-reconnects if the backend isn't up yet).
@@ -36,9 +36,13 @@ useRenderFarm().connect();
       state.loaded = true;
       state.glb = s.glb;
       state.stats = s.stats || null;
-      state.joints = s.joints || [];
+      applyJoints(s.joints);
       state.viewer = s.viewer || { glb: null, ctl: null };
       state.validation = s.validation || null;
+      // A parked unknown-category ask (loop CATEGORY_REVIEW) survives a reload
+      // only in words: the live beat is gone, so the question is re-narrated
+      // from the served state. Answering it is a chat "yes" (dsh-agent).
+      if (s.categoryReview) narrateCategoryReview(s.categoryReview, { resumed: true });
     }
   } catch {
     /* backend not reachable yet; the events socket keeps retrying */

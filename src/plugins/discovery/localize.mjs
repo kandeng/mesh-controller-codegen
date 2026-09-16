@@ -110,9 +110,9 @@ export function buildLocalizationPrompt({
   lines.push('EXPECTED PARTS (point at every one you can see):');
   ask.forEach((a, i) => lines.push(`  ${i + 1}. ${a.name} ${a.k} of ${a.of} — ${a.motion} — usually at: ${a.where}${a.soft ? ' [may be fused or cosmetic]' : ''}`));
   lines.push('');
-  const missing = (gaps || []).filter((x) => x?.missing > 0);
+  const missing = (gaps || []).filter((x) => x?.missing > 0 && x?.part);
   if (missing.length) {
-    lines.push(`The project's current joint map is MISSING ${missing.map((x) => `${x.missing} of ${x.expected} ${x.type}(s)`).join(', ')}.`);
+    lines.push(`The project's current joint map is MISSING ${missing.map((x) => `${x.missing} of ${x.expected} ${x.part}(s)`).join(', ')}.`);
     lines.push('Pay special attention to finding those — but point at every listed part, found or not.');
     lines.push('');
   }
@@ -143,6 +143,9 @@ export function buildLocalizationPrompt({
   lines.push('');
   lines.push('Rules:');
   lines.push('- "type" and "part" come from the numbered list VERBATIM — they are given, not chosen.');
+  lines.push('- We only model parts visible on the OUTER SURFACE of the machine — no interior,');
+  lines.push('  no internal mechanical structure (no steering linkage, no suspension, no gearbox,');
+  lines.push('  no engine internals). The list never contains one, so never point at one.');
   lines.push('- Two instances of the same kind are two entries pointing at two DIFFERENT places;');
   lines.push('  wheel 1 and wheel 2 are not the same wheel, and one box around both is wrong.');
   lines.push('- Point only at parts you can actually SEE in the frame you name. A part hidden in');
@@ -151,6 +154,9 @@ export function buildLocalizationPrompt({
   lines.push('  usually [0,0,1]; a door hinge is usually vertical. Omit either rather than invent it —');
   lines.push('  we derive both from the geometry your box selects whenever we can.');
   lines.push('- Put every real doubt in "uncertainties". A stated doubt is acted on; a hidden one is not.');
+  lines.push('- KEEP IT SHORT: one sentence of "reasoning" per entry, and only the uncertainties');
+  lines.push('  that are real. Long replies fail to parse, and a truncated reply loses the parts');
+  lines.push('  at the end of your list.');
   lines.push('- Never describe the render itself (transparency, colours, grid, background).');
   lines.push('  Describe the MACHINE.');
   lines.push('');

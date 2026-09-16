@@ -1,6 +1,9 @@
 // Project routes — the REST surface over the kernel pipeline. Thin: each handler
 // delegates to the kernel facade and serializes a browser-friendly result.
 import { resolveSlotGraph } from '../slots.mjs';
+import {
+  CATEGORY_KEYS, DICTIONARY, actuatorVisible, addDictionaryEntry, dictionaryStatus,
+} from '../../src/plugins/discovery/actuator-dictionary.mjs';
 
 // Slim a joint for the wire (node arrays can be large; the list only needs counts).
 // `carves` is the LIVE registry on the parsed graph (kernel.current.glb.carves):
@@ -33,6 +36,16 @@ function jointSummary(j, carves) {
     // vision-sourced chip differently because its evidence is a frame a human can
     // open, not a sentence in a node dump.
     ...(j.origin ? { origin: j.origin } : {}),
+    // The recognition gate's two outputs: WHAT the mover was recognized as (one
+    // of the pre-defined category names) and WHETHER the gate withheld its
+    // listing. They ride along for auditability — but the app filters on the
+    // COMPUTED flag below, never on these raw fields, so the kernel's
+    // actuatorVisible stays the single source of truth for the step-2 hardline.
+    ...(j.part ? { part: j.part } : {}),
+    ...(j.listed !== undefined ? { listed: j.listed } : {}),
+    // The step-2 hardline, computed server-side: a record with no vocabulary
+    // name, or an explicit listed=false, is not an actuator in the app.
+    visible: actuatorVisible(j),
     // Phase 3 task 17: what a human decided, and — when the decision was inherited
     // from a symmetry peer — whose verdict it really was. The panel renders a
     // confirmed chip differently when `amortizedFrom` is set, because "a person
@@ -119,6 +132,19 @@ export function projectRoutes(app, kernel) {
       validation: c.lastValidation,
       viewer: c.glb ? kernel.viewerUrls() : { glb: null, ctl: null },
       runDir: kernel.runDir,
+      // A parked unknown-category ask (loop CATEGORY_REVIEW), slimmed of the
+      // prompt/reply audit text — the full exchange is in the run dir. The chat
+      // narrates it; confirming is a chat "yes" (dsh-agent) or a direct edit
+      // of config/actuator-dictionary.json, which the loader picks up live.
+      categoryReview: c.categoryReview ? {
+        category: c.categoryReview.category,
+        confidence: c.categoryReview.confidence ?? null,
+        summary: c.categoryReview.summary || null,
+        actuators: c.categoryReview.actuators || [],
+        doubts: c.categoryReview.doubts || [],
+        alternatives: c.categoryReview.alternatives || [],
+        model: c.categoryReview.model || null,
+      } : null,
     };
   });
 
@@ -127,6 +153,29 @@ export function projectRoutes(app, kernel) {
     const joint = kernel.current.joints.find((j) => j.id === req.params.id);
     if (!joint) return reply.code(404).send({ error: `joint not found: ${req.params.id}` });
     return { ok: true, graph: resolveSlotGraph(kernel, joint) };
+  });
+
+  // The actuator dictionary is DATA (config/actuator-dictionary.json), editable
+  // by a human or the DSH without touching a script. GET shows what is in force
+  // (and whether the last hand-edit parsed); POST is the inspected-and-confirmed
+  // write path — it appends ONE new category, which is exactly what the
+  // unknown-category confirmation flow needs. Changing an existing category is
+  // deliberately a hand-edit of the file, not an API call.
+  app.get('/api/dictionary', async () => ({
+    ok: true,
+    ...dictionaryStatus(),
+    keys: CATEGORY_KEYS,
+    dictionary: DICTIONARY,
+  }));
+
+  app.post('/api/dictionary', async (req, reply) => {
+    const r = addDictionaryEntry(req.body || {});
+    if (!r.ok) return reply.code(r.code === 'EXISTS' ? 409 : 400).send({ ok: false, code: r.code, error: r.error });
+    // The vocabulary grew: the next served `visible` flags and gate run reflect
+    // it immediately — tell the tabs, so a stale joint list never argues with
+    // the table the human just confirmed.
+    app.broadcast?.({ kind: 'dictionary:changed', key: r.key, entry: r.entry, ts: Date.now() });
+    return { ok: true, key: r.key, entry: r.entry, file: r.file };
   });
 }
 

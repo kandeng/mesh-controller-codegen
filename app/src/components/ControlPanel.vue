@@ -19,7 +19,7 @@ import { useSlotRouting } from '../composables/useSlotRouting.js';
 import JointList from './JointList.vue';
 import KnobPanel from './KnobPanel.vue';
 
-const { state } = useProjectStore();
+const { state, applyJoints } = useProjectStore();
 const api = useKernelApi();
 const { selectJoint } = useSlotRouting();
 
@@ -69,7 +69,7 @@ async function loadMesh() {
     state.glb = r.glb;
     glbFull.value = r.glb || p;              // full resolved path, displayed below
     state.stats = r.stats;
-    state.joints = r.joints;
+    applyJoints(r.joints);
     state.viewer = r.viewer;
     state.validation = null;
     note.value = `discovered ${r.joints.length} joint units · ${r.stats.count} nodes`;
@@ -78,7 +78,7 @@ async function loadMesh() {
     // the first joint that has actually been checked, and otherwise let the viewer
     // stay empty until stage 2 settles one — auto-selecting a candidate would drive
     // the preview pivot off a membership the checks may still revise.
-    const ready = r.joints.find((j) => j.status !== 'candidate');
+    const ready = state.joints.find((j) => j.status !== 'candidate');
     if (ready) await selectJoint(ready.id);
   } catch (e) { state.error = e.message; }
   // Only clear the lock if discovery is not already running. The server fires

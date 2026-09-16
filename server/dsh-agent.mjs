@@ -28,9 +28,15 @@ import { randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
 import { defineAgentContract } from './agent-contract.mjs';
 import { writeAgentWorkspace } from './agent-workspace.mjs';
+import { DICTIONARY_FILE, addDictionaryEntry } from '../src/plugins/discovery/actuator-dictionary.mjs';
 
 export const STOP_MSG = 'agent turn stopped by user';
 export const DROPPED_MSG = 'queued message dropped by user stop';
+// A whole-message affirmation — the answer to a parked category review (loop
+// CATEGORY_REVIEW). Kept deliberately tight: anything longer or qualified goes
+// to the assistant as ordinary prose, where a misread costs a model turn, not
+// a dictionary write.
+const AFFIRMATION = /^\s*(yes|yep|yeah|y|ok|okay|confirm|confirmed|correct|sure|go ahead|looks good|lgtm|add it|add them)\s*[.!]*\s*$/i;
 const STUB_NOTE =
   'The live DSH assistant is unavailable (web host did not start), so this is a stub reply. ' +
   'The app shell remains fully functional: load a mesh, pick a joint, drive its knobs, and validate/generate from the toolbar.';
@@ -458,6 +464,38 @@ export function createDshAgent(kernel) {
     return n;
   }
 
+  // Confirm a parked category review (see send()): write the model's proposed
+  // entry into the dictionary file, clear the park, and restart the look so the
+  // new entry drives localization, gaps and the recognition gate. Deterministic
+  // — no model turn. An EXISTS answer means someone wrote the key in by hand
+  // meanwhile: that still settles the review (the table now knows the category),
+  // but the TABLE's entry, not the proposal, is what the loop follows.
+  async function confirmCategoryReview(review, text) {
+    const key = String(review.category || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+    const r = addDictionaryEntry({ key, actuators: review.actuators });
+    if (!r.ok && r.code !== 'EXISTS') {
+      // The park STAYS: a "yes" cannot write an entry the validator refuses, so
+      // the fix is a direct file edit (the loader picks it up on the next read),
+      // after which another "yes" lands on the EXISTS path below and proceeds.
+      return {
+        role: 'assistant', text, mode: 'deterministic',
+        reply: `I could not add "${review.category}" to the reference table: ${r.error}\n\nThe review is still open. Fix the entry directly in ${DICTIONARY_FILE} — the table reloads itself on every read — then say "yes" again.`,
+      };
+    }
+    kernel.current.categoryReview = null;
+    const noted = r.ok
+      ? `Added "${r.key}" to the reference table (${(r.entry?.actuators || []).length} actuator kind(s)) in ${r.file}.`
+      : `"${key}" is already in the reference table — it must have been written in directly, so I will use the table's own entry, not the proposal.`;
+    // Fire-and-forget, exactly like the refine chained off a load: the table
+    // changed, so the whole look restarts with the confirmed category driving
+    // the per-part localization turn this time.
+    setImmediate(() => { kernel.autoRefine?.().catch(() => {}); });
+    return {
+      role: 'assistant', text, mode: 'deterministic',
+      reply: `${noted}\n\nRestarting the recognition with the confirmed category — I will look for its actuators one by one, following the reference table.`,
+    };
+  }
+
   const agent = {
     get mode() { return mode; },
     contract,
@@ -502,6 +540,19 @@ export function createDshAgent(kernel) {
         running = true;
         try {
         if (disposed) throw new Error('agent disposed');
+        // CATEGORY CONFIRMATION, answered without a model turn. An unknown-
+        // machine prior parks its proposed table entry in
+        // kernel.current.categoryReview (loop CATEGORY_REVIEW) and the workflow
+        // waits for the human to vet it; a plain affirmation in chat is the
+        // confirm. Deterministic on purpose: a write into the dictionary file
+        // must not depend on a model reading "yes" correctly. Read at RUN time,
+        // not send time — a "yes" queued behind the campaign that parks the
+        // review is still the answer to it. Anything else falls through to the
+        // assistant as ordinary prose and the review stays parked.
+        const review = kernel.current?.categoryReview;
+        if (item.origin === 'user' && review && AFFIRMATION.test(text)) {
+          return await confirmCategoryReview(review, text);
+        }
         const wasLive = mode === 'live';
         if (wasLive || existsSync(cfg.paths.dshBin)) {
           try {

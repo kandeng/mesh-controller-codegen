@@ -1,6 +1,7 @@
-// The actuator dictionary — a STATIC, deterministic answer to "what does a
-// machine of this kind usually move?", asked of qwen3.8-max once and frozen
-// here as data.
+// The actuator dictionary — the deterministic answer to "what does a machine
+// of this kind usually move?", living in a PLAIN JSON FILE
+// (config/actuator-dictionary.json, overridable via MCC_DICTIONARY) so a
+// human — or the DSH — can add or fix a category without touching any script.
 //
 // Why data and not a runtime model call: the category prior (expectation.mjs)
 // already asks the model what a machine usually has, and the answer changes
@@ -28,127 +29,147 @@
 //      joint nobody can name cannot get a meaningful controller — the record
 //      stays in the manifest as evidence, only the listing is withheld.
 //
-// Pure data + pure functions: no I/O, no imports, so every lane can use it.
+// The file is re-read whenever its mtime changes (refreshDictionary runs on
+// every public read path), so a hand-edit takes effect without a restart. A
+// file that is broken AT BOOT is a hard failure (nothing starts with a table
+// it cannot trust); a file that breaks MID-SESSION keeps the last good table
+// and reports through dictionaryStatus() until it parses again.
+import { readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
-// motion is the IR's only vocabulary: rotor | gimbal | hinge (propose-core).
+// motion is the MODEL-FACING vocabulary: rotor | gimbal. The IR keeps a
+// third type, hinge, as an internal structural name (propose-core admits it
+// for manual records), but no prompt offers it and nothing in this table
+// uses it — a part that swings over a limited arc (a door, a boom, a control
+// surface) is a gimbal here.
 // `soft` marks actuators a 3D model may fuse into the body or skip entirely
 // (lights, mirrors) — expected, but their absence is not a discovery failure.
 //
-// VEHICLES LIST NO HINGE-PANEL ACTUATORS. A hinge is an internal component
-// of an assembly, not a drivable actuator in its own right, and a panel's
-// scope (which nodes belong to the door/hood/wiper) is the most error-prone
-// grounding in the table — removing the class beats mis-scoping every run.
-// Working machines keep their hinge entries because those ARE what you
-// drive on them: a robot arm's elbow, an excavator's boom, an airplane's
-// control surfaces, a tank's gun barrel, a boat's rudder.
-export const DICTIONARY = {
-  car: {
-    match: ['car', 'sedan', 'coupe', 'sports car', 'sportscar', 'suv', 'hatchback', 'convertible', 'race car', 'racing car', 'supercar'],
-    actuators: [
-      { name: 'wheel', motion: 'rotor', count: 4, where: 'four corners of chassis', soft: false },
-      { name: 'mirror', motion: 'gimbal', count: 2, where: 'exterior sides of cabin', soft: true },
-      { name: 'headlight', motion: 'gimbal', count: 2, where: 'front fascia', soft: true },
-    ],
-  },
-  truck: {
-    match: ['truck', 'pickup', 'lorry', 'semi truck', 'box truck', 'van'],
-    actuators: [
-      { name: 'wheel', motion: 'rotor', count: 6, where: 'axles along chassis', soft: false },
-      { name: 'mirror', motion: 'gimbal', count: 2, where: 'exterior sides of cab', soft: true },
-    ],
-  },
-  bus: {
-    match: ['bus', 'coach', 'minibus'],
-    actuators: [
-      { name: 'wheel', motion: 'rotor', count: 6, where: 'axles along chassis', soft: false },
-      { name: 'mirror', motion: 'gimbal', count: 2, where: 'exterior front corners', soft: true },
-    ],
-  },
-  motorbike: {
-    match: ['motorbike', 'motorcycle', 'scooter', 'moped', 'dirt bike'],
-    actuators: [
-      { name: 'wheel', motion: 'rotor', count: 2, where: 'front and rear forks', soft: false },
-      { name: 'mirror', motion: 'gimbal', count: 2, where: 'ends of handlebars', soft: true },
-    ],
-  },
-  bicycle: {
-    match: ['bicycle', 'bike', 'road bike', 'mountain bike'],
-    actuators: [
-      { name: 'wheel', motion: 'rotor', count: 2, where: 'front and rear forks', soft: false },
-      { name: 'pedal', motion: 'rotor', count: 2, where: 'bottom bracket crank arms', soft: false },
-    ],
-  },
-  'quadrotor-drone': {
-    match: ['quadrotor drone', 'quadrotor', 'quadcopter', 'drone', 'multirotor', 'uav', 'quad'],
-    actuators: [
-      { name: 'rotor', motion: 'rotor', count: 4, where: 'ends of arms', soft: false },
-      { name: 'gimbal_mount', motion: 'gimbal', count: 1, where: 'underside center body', soft: false },
-    ],
-  },
-  helicopter: {
-    match: ['helicopter', 'heli', 'chopper', 'gyrocopter'],
-    actuators: [
-      { name: 'main_rotor', motion: 'rotor', count: 1, where: 'top of mast', soft: false },
-      { name: 'tail_rotor', motion: 'rotor', count: 1, where: 'end of tail boom', soft: false },
-    ],
-  },
-  airplane: {
-    match: ['airplane', 'aeroplane', 'plane', 'aircraft', 'jet', 'fixed-wing', 'propeller plane', 'biplane', 'glider'],
-    actuators: [
-      { name: 'propeller', motion: 'rotor', count: 1, where: 'nose or engine nacelle', soft: false },
-      { name: 'aileron', motion: 'hinge', count: 2, where: 'trailing edge of wings', soft: false },
-      { name: 'elevator', motion: 'hinge', count: 2, where: 'trailing edge of tailplane', soft: false },
-      { name: 'rudder', motion: 'hinge', count: 1, where: 'trailing edge of fin', soft: false },
-      { name: 'flap', motion: 'hinge', count: 2, where: 'inner trailing wing edge', soft: false },
-    ],
-  },
-  tank: {
-    match: ['tank', 'main battle tank', 'battle tank', 'armoured vehicle', 'armored vehicle'],
-    actuators: [
-      { name: 'track_sprocket', motion: 'rotor', count: 2, where: 'rear of track assemblies', soft: false },
-      { name: 'turret', motion: 'rotor', count: 1, where: 'top of hull', soft: false },
-      { name: 'gun_barrel', motion: 'hinge', count: 1, where: 'front of turret', soft: false },
-    ],
-  },
-  boat: {
-    match: ['boat', 'ship', 'yacht', 'vessel', 'speedboat', 'sailboat'],
-    actuators: [
-      { name: 'propeller', motion: 'rotor', count: 1, where: 'stern below waterline', soft: false },
-      { name: 'rudder', motion: 'hinge', count: 1, where: 'stern behind propeller', soft: false },
-    ],
-  },
-  'robot-arm': {
-    match: ['robot arm', 'robotic arm', 'robot-arm', 'manipulator', 'robot manipulator', 'industrial arm'],
-    actuators: [
-      { name: 'base_joint', motion: 'rotor', count: 1, where: 'bottom mounting plate', soft: false },
-      { name: 'shoulder_joint', motion: 'hinge', count: 1, where: 'base to upper arm', soft: false },
-      { name: 'elbow_joint', motion: 'hinge', count: 1, where: 'upper to lower arm', soft: false },
-      { name: 'wrist_joint', motion: 'rotor', count: 1, where: 'lower arm to end effector', soft: false },
-      { name: 'gripper_jaw', motion: 'hinge', count: 2, where: 'end effector tip', soft: false },
-    ],
-  },
-  excavator: {
-    match: ['excavator', 'digger', 'backhoe', 'tracked excavator'],
-    actuators: [
-      { name: 'track_sprocket', motion: 'rotor', count: 2, where: 'rear of track assemblies', soft: false },
-      { name: 'cab_turret', motion: 'rotor', count: 1, where: 'top of undercarriage', soft: false },
-      { name: 'boom', motion: 'hinge', count: 1, where: 'front of cab body', soft: false },
-      { name: 'stick', motion: 'hinge', count: 1, where: 'end of boom arm', soft: false },
-      { name: 'bucket', motion: 'hinge', count: 1, where: 'end of stick arm', soft: false },
-    ],
-  },
-};
+// DOORS ARE LISTED, OTHER HINGED PANELS ARE NOT. A door is a drivable
+// actuator of its own — named `door`, typed gimbal (it swings over a limited
+// arc about its edge). Hoods, hatches and trunks stay unlisted: their scope
+// (which nodes belong to the panel) is the most error-prone grounding in the
+// table, and removing the class beats mis-scoping every run. Working
+// machines' swing joints are gimbals too: a robot arm's elbow, an
+// excavator's boom, an airplane's control surfaces, a tank's gun barrel, a
+// boat's rudder.
 
-export const CATEGORY_KEYS = Object.keys(DICTIONARY);
+// Where the table lives. MCC_DICTIONARY overrides the path (tests point it at
+// a temp file; deployment can point it at an ops-editable location).
+export const DICTIONARY_FILE = process.env.MCC_DICTIONARY
+  || fileURLToPath(new URL('../../../config/actuator-dictionary.json', import.meta.url));
 
+const MOTIONS = new Set(['rotor', 'gimbal']);
+
+// The file's contract with every lane that reads it: a category key is a
+// lowercase dash word; each actuator names a part (snake_case), one of the
+// two model-facing motions, a count, and a "where" hint. Validation normalizes
+// what it safely can (name casing, soft's default) and refuses the rest — bad
+// data must never quietly degrade discovery.
+function validateDictionary(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('the dictionary file must hold an object of categories');
+  const out = {};
+  for (const [key, entry] of Object.entries(raw)) {
+    if (!/^[a-z][a-z0-9-]*$/.test(key)) throw new Error(`category key "${key}" must be lowercase dash-case`);
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error(`category "${key}" must be an object`);
+    if (!Array.isArray(entry.actuators) || !entry.actuators.length) throw new Error(`category "${key}" lists no actuators`);
+    const seen = new Set();
+    const actuators = entry.actuators.map((a, i) => {
+      if (!a || typeof a !== 'object') throw new Error(`${key}.actuators[${i}] must be an object`);
+      const name = String(a.name || '').trim().toLowerCase().replace(/[\s-]+/g, '_');
+      if (!name) throw new Error(`${key}.actuators[${i}] has no part name`);
+      if (!MOTIONS.has(a.motion)) throw new Error(`${key}.actuators[${i}] ("${name}") motion must be rotor|gimbal, got "${a.motion}"`);
+      const count = Math.round(Number(a.count));
+      if (!Number.isFinite(count) || count < 1 || count > 64) throw new Error(`${key}.actuators[${i}] ("${name}") count must be 1..64`);
+      if (seen.has(name)) throw new Error(`category "${key}" lists "${name}" twice`);
+      seen.add(name);
+      return { name, motion: a.motion, count, where: String(a.where || '').trim(), soft: !!a.soft };
+    });
+    out[key] = {
+      match: (Array.isArray(entry.match) ? entry.match : []).map((m) => String(m || '').trim()).filter(Boolean),
+      actuators,
+    };
+  }
+  if (!Object.keys(out).length) throw new Error('the dictionary file holds no categories');
+  return out;
+}
+
+export const DICTIONARY = {};
+export const CATEGORY_KEYS = [];
 // The closed naming vocabulary the recognition gate judges against — every
 // actuator name the dictionary uses, plus nothing else. A vision proposal's
 // `part` is valid only when it is one of these words: a fixed vocabulary is
 // what turns "the model called it something" into a checkable fact rather
 // than a synonym puzzle ("wing flap" vs "flap").
-export const ACTUATOR_VOCABULARY = new Set(
-  Object.values(DICTIONARY).flatMap((e) => e.actuators.map((a) => a.name)),
-);
+export const ACTUATOR_VOCABULARY = new Set();
+
+let dictMtime = 0;
+let dictError = null;
+
+// Re-derive every exported snapshot IN PLACE: importers hold references to
+// these exact objects, so swapping in fresh objects would strand every lane
+// on the old table while only new lookups saw the edit.
+function adopt(data, mtimeMs) {
+  for (const k of Object.keys(DICTIONARY)) delete DICTIONARY[k];
+  Object.assign(DICTIONARY, data);
+  CATEGORY_KEYS.splice(0, CATEGORY_KEYS.length, ...Object.keys(data));
+  ACTUATOR_VOCABULARY.clear();
+  for (const e of Object.values(data)) for (const a of e.actuators) ACTUATOR_VOCABULARY.add(a.name);
+  dictMtime = mtimeMs;
+  dictError = null;
+}
+
+function loadFromDisk() {
+  const st = statSync(DICTIONARY_FILE);
+  adopt(validateDictionary(JSON.parse(readFileSync(DICTIONARY_FILE, 'utf8'))), st.mtimeMs);
+}
+
+// Boot load: a broken file throws here and nothing starts — fail loud, by design.
+loadFromDisk();
+
+// The mtime check behind every public read path: a hand-edit (or the DSH's)
+// takes effect without a restart. A broken edit mid-session is NOT fatal the
+// way a broken boot file is — the last good table stays in force and the
+// error rides dictionaryStatus() until the file parses again (each read
+// retries, so a fix is picked up on the next lookup).
+export function refreshDictionary() {
+  let st = null;
+  try { st = statSync(DICTIONARY_FILE); } catch (e) { dictError = e.message; return false; }
+  if (st.mtimeMs === dictMtime) return false;
+  try { loadFromDisk(); return true; } catch (e) { dictError = e.message; return false; }
+}
+
+// What's in force right now — the route and the chat ask both read this, so a
+// human can see which file to edit and whether the last edit took.
+export function dictionaryStatus() {
+  return { file: DICTIONARY_FILE, categories: CATEGORY_KEYS.length, mtimeMs: dictMtime, error: dictError };
+}
+
+// Add ONE category and persist the whole table atomically (tmp + rename, so a
+// crash mid-write cannot truncate the file every lane reads). The candidate
+// matches the shape of the model's unknown-category proposal —
+// { key, match, actuators } — and is validated by the SAME contract as the
+// file, so a confirmed proposal can never put data on disk that a boot would
+// reject. An existing key is refused: changing a category is a hand-edit,
+// not a confirmation.
+export function addDictionaryEntry(candidate) {
+  refreshDictionary();
+  const key = String(candidate?.key || candidate?.category || '')
+    .trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  if (!key) return { ok: false, code: 'BAD_KEY', error: 'a category key is required' };
+  if (DICTIONARY[key]) return { ok: false, code: 'EXISTS', error: `"${key}" is already in the dictionary — edit ${DICTIONARY_FILE} directly to change it` };
+  let entry = null;
+  try {
+    entry = validateDictionary({ [key]: { match: candidate?.match || candidate?.aliases || [], actuators: candidate?.actuators } })[key];
+  } catch (e) {
+    return { ok: false, code: 'INVALID', error: e.message };
+  }
+  const tmp = `${DICTIONARY_FILE}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify({ ...DICTIONARY, [key]: entry }, null, 2)}\n`);
+  renameSync(tmp, DICTIONARY_FILE);
+  loadFromDisk();
+  return { ok: true, key, entry, file: DICTIONARY_FILE };
+}
 
 // Normalize a free-text part name the way the model is told to write it:
 // lowercase, snake_case, singular. A plural is rescued only when its singular
@@ -171,6 +192,7 @@ const normCategory = (v) => String(v || '').toLowerCase().replace(/[^a-z0-9]+/g,
 // expectation lane then keeps its model-generated counts, which is the exact
 // behaviour it had before this table existed.
 export function lookupDictionary(category) {
+  refreshDictionary();
   const text = normCategory(category);
   if (!text) return null;
   let best = null;
@@ -208,6 +230,7 @@ export function countsByMotion(entry) {
 export function reconcileExpectation(exp) {
   const warnings = [];
   if (!exp?.category) return { dict: null, warnings };
+  refreshDictionary();
   const hit = lookupDictionary(exp.category);
   if (!hit) {
     warnings.push(`category "${exp.category}" is not in the actuator dictionary — the expected counts stay the model's own`);
@@ -252,6 +275,7 @@ export function reconcileExpectation(exp) {
 // gate is a clean no-op and every record keeps the pre-dictionary behaviour.
 // Rejected records are skipped: a human already disposed of them.
 export function applyRecognitionGate(records, { category = null } = {}) {
+  refreshDictionary();
   const notes = [];
   const out = { dict: null, listed: 0, extras: 0, excluded: 0, notes };
   const hit = lookupDictionary(category);
@@ -280,6 +304,20 @@ export function applyRecognitionGate(records, { category = null } = {}) {
     }
   }
   return out;
+}
+
+// THE STEP-2 HARDLINE — a record may be SHOWN as an actuator (the app's
+// step-2 list) only when its part is one of the pre-defined category names in
+// ACTUATOR_VOCABULARY. The recognition gate already withholds the listing from
+// movers nobody could name (listed === false); this predicate is the stricter
+// UI-facing half: a record the gate never judged (no category recognized, or
+// no vision round has run yet) is ALSO not shown until it carries a vocabulary
+// name. Nothing is deleted — the record, its evidence, and the chat
+// announcement all stay; only the listing is withheld.
+export function actuatorVisible(rec) {
+  if (!rec || rec.status === 'rejected') return false;
+  if (rec.listed === false) return false;
+  return normPartName(rec.part) != null;
 }
 
 // The actuator list proper: the records a controller may be generated for.

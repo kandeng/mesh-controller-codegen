@@ -807,8 +807,12 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
 
   // One shape for every failure, always carrying the reason and always stating
   // that nothing was mutated — the caller must never have to guess.
-  const bail = (reason, code = null) => ({
+  // `extra` carries a caller payload up through the campaign result (the round
+  // entries spread `...res`): a CATEGORY_REVIEW bail uses it for the pending
+  // human-confirmation ask and the expectation that produced it.
+  const bail = (reason, code = null, extra = null) => ({
     ok: false, added: 0, reason, code, warnings, proposals: [], manifestUntouched: true,
+    ...(extra || {}),
   });
 
   if (!g?.nodes?.length) return bail('no parse table to ground against', 'NO_PROJECT');
@@ -889,6 +893,12 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
   // TO AIM, and that is all.
   let expectation = null;
   let gapsAtAsk = [];
+  // Set when a USABLE prior names a category the reference table does not know:
+  // the model's proposed table entry, parked for the human to confirm (a chat
+  // "yes" writes it into the dictionary file and restarts the look). While it
+  // is set the round must NOT continue — the whole point of the table is that
+  // the loop looks for parts someone wrote down, not parts a model invented.
+  let categoryReview = null;
   if (wantExpectation) {
     if (typeof propose !== 'function') {
       warnings.push('category turn: asked for, but no vision provider is wired — the round carries on with no prior');
@@ -914,7 +924,7 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
           // read at all. Reported as null rather than as a blank object, so a
           // caller cannot mistake "the model said nothing usable" for "the model
           // described a machine with no moving parts".
-          if (!expectation.category && !(expectation.instances || []).length) expectation = null;
+          if (!expectation.category && !(expectation.instances || []).length && !(expectation.actuators || []).length) expectation = null;
           // The actuator dictionary's verdict on the category: a hit pins the
           // expected counts to the table's deterministic values (and hands the
           // discovery turn the reference list as a hypothesis); a miss leaves
@@ -922,6 +932,28 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
           if (expectation) {
             const rec0 = reconcileExpectation(expectation);
             expWarnings.push(...rec0.warnings.map((w) => `category turn: ${w}`));
+            // The TABLE is the source of "what such a machine has". When the
+            // category matched it, an actuator list the model proposed anyway
+            // is dropped — the table's list is the one the next steps follow.
+            if (expectation.dictKey && (expectation.actuators || []).length) {
+              expWarnings.push("category turn: the category is in the reference table, so the model's proposed actuator list was dropped — the table, not the model, says what a machine of this kind has");
+              expectation.actuators = [];
+            }
+            // A usable prior the table does NOT know is a stop, not a
+            // hypothesis (see the declaration above). The round ends after the
+            // audit beats below with nothing localized, discovered or merged.
+            if (expectationIsUsable(expectation) && !expectation.dictKey) {
+              categoryReview = {
+                category: expectation.category,
+                confidence: expectation.confidence ?? null,
+                summary: expectation.summary || null,
+                actuators: expectation.actuators || [],
+                doubts: expectation.doubts || [],
+                alternatives: expectation.alternatives || [],
+                prompt: ep.text, reply: expReply, model: expModel,
+              };
+              expWarnings.push('category turn: the category is not in the reference table — the round stops here so a human can confirm the proposed entry before anything is looked for');
+            }
           }
           // Gaps AT ASK TIME: the prior against what the project already believes
           // BEFORE this round adds anything. That is the comparison turn B can act
@@ -940,6 +972,10 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
         persist?.expectation?.({
           prompt: { text: ep.text, frames: ep.frames, images: ep.images.length },
           reply: expReply, expectation, gaps: gapsAtAsk,
+          // The parked unknown-category ask, when this exchange produced one:
+          // the confirmation flow (dsh-agent) reads the served state, but the
+          // audit trail keeps what was proposed beside the exchange itself.
+          review: categoryReview || null,
           model: expModel, ms: Date.now() - e0, warnings: expWarnings,
         });
       }
@@ -953,6 +989,12 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
           type: ins.type, count: ins.count, frameId: ins.frameId,
           regionBox: ins.regionBox, symmetry: ins.symmetry || null, note: ins.note || null,
         })),
+        // The proposed actuator list a NON-table category came back with (what
+        // the human is asked to confirm into the dictionary). Empty for a table
+        // category — there the table, not the model, is the list.
+        actuators: (expectation?.actuators || []).map((a) => ({
+          name: a.name, motion: a.motion, count: a.count, where: a.where || null,
+        })),
         dictKey: expectation?.dictKey || null,
         dictCounts: expectation?.dictCounts || null,
         gaps: gapsAtAsk,
@@ -964,6 +1006,20 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
         prompt: ep.text, reply: expReply, model: expModel,
         warnings: expWarnings,
       });
+      // The stop-and-ask: the exchange is persisted and narrated, so the round
+      // ends here — nothing is aimed, prompted or merged against a category the
+      // table cannot vouch for. The campaign reads the code and stops without
+      // treating it as an error; the kernel parks the review on the served
+      // state and a chat "yes" confirms it (dsh-agent).
+      if (categoryReview) {
+        say('vision:category-review', categoryReview);
+        warnings.push('the machine is not in the reference table — waiting for the human to confirm the new category');
+        return bail('the machine is not in the reference table — waiting for the human to confirm the new category', 'CATEGORY_REVIEW', {
+          categoryReview,
+          expectation,
+          expectationUsable: true,
+        });
+      }
     }
   }
 
@@ -1735,6 +1791,10 @@ export async function runVisionCampaign(g, joints, manifest, effects = {}) {
     ms: sum('ms'),
     reason: added || confirms ? null : (stop || last?.reason || 'the model proposed nothing'),
     code: aborted ? 'PROJECT_RELOADED' : (failed?.code ?? null),
+    // The pending human-confirmation ask, when a round parked on an unknown
+    // category: the kernel serves it on /api/state until the human confirms
+    // (a chat "yes") or edits the dictionary file directly.
+    categoryReview: failed?.categoryReview ?? null,
     manifestUntouched: !rounds.some((x) => x.manifestUntouched === false),
     warnings: [...warnings, ...rounds.flatMap((x) => (x.warnings || []).map((w) => `round ${x.round + 1}: ${w}`))],
   };

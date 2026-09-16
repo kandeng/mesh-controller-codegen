@@ -78,6 +78,11 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
     controller: null,
     lastValidation: null,
     manifest: null, // joint hypothesis records (phase 1 discovery loop)
+    // A category prior the reference table does not know, parked for the human
+    // to confirm (loop CATEGORY_REVIEW). Served on /api/state so the ask
+    // survives a page reload; cleared by a load, by the confirmation itself
+    // (dsh-agent), or by a later campaign whose prior matches the table.
+    categoryReview: null,
   };
 
   const THREE = await loadThree(host);
@@ -164,6 +169,9 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
       current.spec = d.spec;
       current.controller = null;
       current.lastValidation = null;
+      // A parked category review belongs to the PREVIOUS machine: a new load
+      // asks its own category question.
+      current.categoryReview = null;
       sessionStore.setSession({ glb: d.glbPath });
       sessionStore.setWork({ joints: d.joints.map((j) => ({ id: j.id, label: j.label, type: j.type, nodeCount: (j.nodes || []).length })) });
       // Hypothesis loop (phase 1): re-type joints into manifest records, run the
@@ -556,12 +564,20 @@ export async function createKernelHost({ configPath = null, verbose = false } = 
         code: x.code || null, reason: x.reason || null, model: x.model, ms: x.ms,
       }));
       if (!res.ok) {
+        // A category the reference table does not know parks on the SERVED
+        // state, not just on this response: the ask must survive a page
+        // reload, and the chat confirmation (dsh-agent) must find what was
+        // proposed. Nothing was merged, so nothing else changes.
+        if (res.code === 'CATEGORY_REVIEW' && res.categoryReview) current.categoryReview = res.categoryReview;
         return {
           ...res, rounds: roundSummary, error: res.reason || res.error || 'the vision round failed',
           round, rendererId, provider: provider.kind, frameUrls, farm: farm.status(),
           independent, noGeometryBaseline: adoptedEmptyManifest,
         };
       }
+      // A later campaign whose prior DID match the table settles the question
+      // a parked review was asking — drop it.
+      if (res.expectation?.dictKey && current.categoryReview) current.categoryReview = null;
       return {
         ...res,
         rounds: roundSummary,

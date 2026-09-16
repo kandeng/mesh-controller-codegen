@@ -260,10 +260,11 @@ export function buildVisionPrompt({
   lines.push(question || 'TASK: identify the parts of this machine that MOVE RELATIVE to the rest,');
   lines.push('and say what kind of motion each has.');
   lines.push('  rotor  - spins continuously about one axis (propeller, fan, motor, wheel)');
-  lines.push('  gimbal - pivots about a point over a limited range (camera mount, turret, mirror)');
-  lines.push('There is no third kind: a hinged panel (door, hood, wiper, hatch) is NOT proposed.');
-  lines.push('Its hinge is an internal component of the assembly, not an actuator of its own,');
-  lines.push('and a panel\'s extent cannot be pointed at reliably enough to rig.');
+  lines.push('  gimbal - pivots over a limited range (camera mount, turret, mirror, door): a');
+  lines.push('           panel that swings about a fixed edge is a gimbal too');
+  lines.push('There is no third kind. A DOOR is proposed — as a gimbal, part "door". Other hinged');
+  lines.push('panels (hood, hatch, trunk, wiper) are NOT proposed: they are service panels, not');
+  lines.push('driven actuators, and their extent cannot be pointed at reliably enough to rig.');
   lines.push('If a moving part is FUSED into a larger shell — no seam, no separate node — point');
   lines.push('at it anyway: the surface is cut out mechanically, and your box tells the cutter');
   lines.push('where to start. Never name the whole shell as the part to avoid pointing.');
@@ -300,6 +301,9 @@ export function buildVisionPrompt({
   lines.push('   "suggestView": { "target": "what to look at", "reason": "why it would settle it" } }]');
   lines.push('');
   lines.push('Rules:');
+  lines.push('- We only model parts visible on the OUTER SURFACE of the machine. No interior,');
+  lines.push('  and no internal mechanical structure: no steering linkage, no suspension, no');
+  lines.push('  gearbox, no engine internals. Do not propose them, even where you can infer them.');
   lines.push('- The scene is Z-UP. A rotor\'s spin axis is usually [0,0,1]; a gimbal usually');
   lines.push('  tilts about a horizontal axis. axis and anchor are in MODEL world units.');
   lines.push('- anchor is the point the part rotates ABOUT (a rotor hub, not a blade tip).');

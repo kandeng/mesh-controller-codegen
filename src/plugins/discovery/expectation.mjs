@@ -1,37 +1,41 @@
-// Category expectation — a lane that AIMS and CHECKS, and never merges.
+// Category expectation — a lane that CLASSIFIES and CHECKS, and never merges.
 //
 // The question this answers is the one a coverage-driven planner cannot ask:
-// "what machine is this, and where does a machine like this keep its joints?"
-// Coverage picks frames by marginal gain over a kd-tree of parts, which is the
-// right answer to "what have we not seen" and no answer at all to "what are we
-// looking at". A quadrotor keeps its joints at four arm tips and its nose; a
-// tank keeps theirs along both hull flanks and on a turret ring. Saying that out
-// loud, before the discovery turn, buys three concrete things:
+// "what machine is this?" Coverage picks frames by marginal gain over a
+// kd-tree of parts, which is the right answer to "what have we not seen" and
+// no answer at all to "what are we looking at". The turn is deliberately
+// CLASSIFY-ONLY: the model names the machine, and the actuator dictionary
+// (actuator-dictionary.mjs, a JSON data file) supplies the expected parts —
+// because a model asked to enumerate moving parts invents internal mechanisms
+// ("two steering gimbals") and speculates about structures it cannot see, and
+// both used to land in the chat narration and the discovery prompt. Naming
+// the category, and only that, buys three concrete things:
 //
-//   1. AIM. Round 2's close-ups come from `suggestView` sentences alone today.
-//      An expectation whose instances have NOT been grounded is a list of places
-//      worth a frame, resolved to real geometry by views.mjs.
-//   2. A NUMBER TO FALSIFY. `expectationGap` compares what a category says
-//      should be there against what actually grounded. "expected 4 rotors,
-//      grounded 3" is a discrepancy a human can act on, and it feeds the
-//      symmetry machinery that amortizes one verdict across a family.
-//   3. VOCABULARY. The IR only expresses rotor|gimbal|hinge. A turret is a
-//      gimbal and a road wheel is a rotor, but nothing in the geometry says so;
-//      a category prior is what maps an unknown machine onto those three words.
+//   1. THE REFERENCE LIST. The dictionary entry the category resolves to is
+//      the per-part ask the localization turn (localize.mjs) walks ONE BY ONE
+//      — four wheels are four asks — with category names (wheel, door), never
+//      motion types.
+//   2. A NUMBER TO FALSIFY. `expectationGap` compares what the table says
+//      should be there against what actually grounded, per part NAME.
+//      "expected 4 wheel, named 3" is a discrepancy a human can act on.
+//   3. A REVIEW WHEN THE TABLE DOESN'T KNOW. For an unknown category the
+//      model may PROPOSE the machine's on-surface actuators (the `actuators`
+//      field); the workflow then stops and asks a human to confirm the new
+//      entry before any discovery continues (loop.mjs, CATEGORY_REVIEW).
 //
 // AND ONE HARD BOUNDARY, which is the whole reason this is its own module:
 // there is NO path from here to mergeProposals. Nothing this file returns can
-// become a manifest record. An expectation is a hypothesis the discovery turn is
-// asked to falsify with a locator, and the only things that ever reach the
-// manifest are proposals that grounding resolved and the physics battery scored.
-// A guess that could mint a joint would be a hallucination with extra steps —
-// the model's own confidence in the category is not evidence about this mesh.
+// become a manifest record. An expectation is a hypothesis the discovery turn
+// is asked to falsify, and the only things that ever reach the manifest are
+// proposals that grounding resolved and the physics battery scored. A guess
+// that could mint a joint would be a hallucination with extra steps — the
+// model's own confidence in the category is not evidence about this mesh.
 //
-// Pure: builds a prompt, parses a reply, compares counts. The transport is the
-// same `propose` effect the discovery turn uses, so this is testable headless.
+// Pure: builds a prompt, parses a reply, compares counts. The transport is
+// the same `propose` effect the discovery turn uses, so this is testable
+// headless.
 import { normBox } from './grounding.mjs';
-import { TYPES } from './propose-core.mjs';
-import { CATEGORY_KEYS } from './actuator-dictionary.mjs';
+import { CATEGORY_KEYS, lookupDictionary, normPartName } from './actuator-dictionary.mjs';
 import { frameLine, sceneFacts, sceneHeader } from './vision-prompt.mjs';
 
 // One turn over the survey photos. Bounded for the same reason the discovery turn
@@ -43,6 +47,9 @@ export const MAX_EXPECTATION_FRAMES = 6;
 // round-2 budget at a coin flip is worse than leaving coverage to decide.
 export const MIN_EXPECTATION_CONFIDENCE = 0.5;
 export const MAX_EXPECTATION_INSTANCES = 12;
+// Kinds of actuator an unknown-category proposal may carry. Bounded because
+// the reply is model output: past this, the list is a ramble, not a machine.
+export const MAX_EXPECTATION_ACTUATORS = 8;
 export const MAX_CATEGORY_CHARS = 120;
 // One instance may claim this many of a type. Beyond it the number is a
 // transcription error (40 rotors on a quadrotor) rather than a category fact.
@@ -63,10 +70,9 @@ export function surveyPhotos(frames = []) {
   return survey.length ? survey : photos;
 }
 
-// Build the category turn. Same image shape agent.send() wants, and the same
-// locator contract as the discovery prompt — because an instance that cannot be
-// pointed at cannot be aimed at either, and the two turns must agree on what
-// "pointing" means for `regionsFromExpectations` to resolve anything.
+// Build the category turn. Same image shape agent.send() wants. The ask is
+// classify-only: no part enumeration, no pointing contract — the reference
+// table does the listing and the localization turn does the pointing.
 export function buildExpectationPrompt({ frames = [], g = null, viewport = null, maxFrames = MAX_EXPECTATION_FRAMES } = {}) {
   const warnings = [];
   const cap = Math.max(1, maxFrames | 0);
@@ -87,65 +93,57 @@ export function buildExpectationPrompt({ frames = [], g = null, viewport = null,
   lines.push('');
   lines.push(...sceneHeader(sceneFacts(g, viewport, used)));
   lines.push('');
-  lines.push('TASK: first say WHAT KIND OF MACHINE this is. Then say which parts a machine of');
-  lines.push('that kind usually has that MOVE RELATIVE TO THE REST, how many of each, and where');
-  lines.push('in these frames each kind of place is.');
+  lines.push('TASK: say WHAT KIND OF MACHINE this is. Nothing more — naming the parts is');
+  lines.push('NOT your job here. A later step finds them one by one, guided by our reference');
+  lines.push('table, not by anything you list in this reply.');
   lines.push('');
   lines.push('Naming the category: our reference table knows these kinds —');
   lines.push(`  ${CATEGORY_KEYS.join(', ')}`);
   lines.push('If this machine is one of them, use THAT word so the table\'s counts apply. If it is');
   lines.push('none of them, name it plainly anyway — a true unknown beats a forced match.');
   lines.push('');
+  lines.push('SCOPE — read this before answering:');
+  lines.push('We only model parts that are visible on the OUTER SURFACE of the machine. No');
+  lines.push('interior, and no internal mechanical structure: no steering linkage, no');
+  lines.push('suspension, no gearbox, no engine internals. Do not report them, do not count');
+  lines.push('them, and do not speculate about them in "doubts" — a part we cannot see is');
+  lines.push('simply out of scope, not a finding.');
+  lines.push('');
   lines.push('READ THIS BEFORE ANSWERING — it is what makes the step safe:');
-  lines.push('You are describing a CATEGORY, not this mesh. Every expectation you give is checked');
-  lines.push('against what is actually visible by a later step, and an expectation is NEVER a');
-  lines.push('discovery: nothing you write here becomes a joint. What it does is aim a camera and');
-  lines.push('give the next step a count to falsify, so be specific about WHERE and HOW MANY, and');
-  lines.push('be specific about what you are NOT sure of.');
+  lines.push('You are describing a CATEGORY, not this mesh, and nothing you write here');
+  lines.push('becomes a joint. What your answer does is choose the reference list the next');
+  lines.push('step checks part by part against the frames.');
   lines.push('');
-  lines.push('Motion vocabulary — the only three kinds the loop downstream can express:');
-  lines.push('  rotor  - spins continuously about one axis (propeller, fan, road wheel, rotor head)');
-  lines.push('  gimbal - pivots about a point over a limited range (camera mount, turret, boom)');
-  lines.push('  hinge  - rotates about an axis over a limited range (folding arm, landing gear,');
-  lines.push('           control surface, bay door, hatch)');
-  lines.push('A continuous track, a sliding hatch or a telescoping leg has no exact match: report');
-  lines.push('the nearest expressible kind (a track\'s road wheels are rotors) and say in "doubts"');
-  lines.push('that the real motion is not expressible. Do not invent a fourth kind.');
-  lines.push('');
-  lines.push('HOW TO POINT AT A PLACE (same contract as the discovery step):');
-  lines.push('You do NOT know our internal part names and you must NOT invent them. Instead give');
-  lines.push('  "frameId"   - which frame below shows the place (use the exact id)');
-  lines.push('  "regionBox" - [x0, y0, x1, y1] as FRACTIONS of that frame, 0..1, origin at the');
-  lines.push('                TOP-LEFT, y increasing DOWNWARD, tight around the place');
+  lines.push('KEEP IT SHORT. One sentence for "summary"; one short sentence per "doubts" or');
+  lines.push('"alternatives" entry, at most 3 of each. Long replies fail to parse.');
   lines.push('');
   lines.push('Reply with JSON ONLY (no prose, no code fences), ONE object:');
   lines.push('{ "category": "short machine category, e.g. quadrotor drone / main battle tank / robotic arm",');
   lines.push('  "confidence": 0.0-1.0,');
-  lines.push('  "summary": "one sentence: what it is and what moves on it",');
-  lines.push('  "instances": [');
-  lines.push('    { "type": "rotor|gimbal|hinge", "count": <how many a machine like this has>,');
-  lines.push('      "frameId": "<a frame below>", "regionBox": [x0,y0,x1,y1],');
-  lines.push('      "symmetry": "how they are arranged, e.g. 4-fold about the vertical, one per arm');
-  lines.push('                  tip / left-right mirror along the hull",');
-  lines.push('      "note": "what the moving group is, and why it moves" } ],');
-  lines.push('  "doubts": ["what you are NOT sure about, stated plainly"],');
-  lines.push('  "alternatives": ["at least one other category this could be, and what would settle it"] }');
+  lines.push('  "summary": "one sentence: what it is and what moves on its outer surface",');
+  lines.push('  "doubts": ["at most 3 short entries: what you are NOT sure about"],');
+  lines.push('  "alternatives": ["at least one other category this could be, and what would settle it"],');
+  lines.push('  "actuators": [ ONLY when your category is NOT one of the table words above:');
+  lines.push('    { "name": "plain part word, snake_case, e.g. wheel / dome / hatch",');
+  lines.push('      "motion": "rotor|gimbal",');
+  lines.push('      "count": <how many a machine like this has, on its outer surface>,');
+  lines.push('      "where": "where on the machine these sit" } ] }');
   lines.push('');
   lines.push('Rules:');
-  lines.push('- ONE instance entry per KIND of moving part, with "count" saying how many. Not one');
-  lines.push('  entry per part: four rotors are one entry with count 4.');
-  lines.push('- "regionBox" must point at a place actually visible in the frame you name. If a kind');
-  lines.push('  of part is NOT visible in any frame (a hull-hidden suspension, an internal gearbox),');
-  lines.push('  still report it, box the region that HIDES it, and say so in "doubts".');
-  lines.push('- Give the count a machine of this category really has. If you do not know, say so in');
-  lines.push('  "doubts" and give your best count anyway: a wrong count gets checked, a missing one');
-  lines.push('  does not.');
-  lines.push('- Name at least one ALTERNATIVE category. A prior that cannot imagine being wrong is');
-  lines.push('  not a hypothesis.');
-  lines.push('- Never describe the render itself (transparency, colours, grid, background). Describe');
-  lines.push('  the MACHINE.');
-  lines.push('- An empty "instances" array is a valid answer when you cannot tell what the machine');
-  lines.push('  is, and is far better than a confident guess.');
+  lines.push('- "rotor" spins continuously about one axis (propeller, fan, road wheel); "gimbal"');
+  lines.push('  pivots over a limited range (camera mount, folding arm, a swinging door or');
+  lines.push('  hatch). Do not invent a third kind.');
+  lines.push('- Omit "actuators" (or leave it empty) when you used a table word — the table');
+  lines.push('  already says what that machine carries, and its list wins over anything you');
+  lines.push('  could write here.');
+  lines.push('- Every actuator you propose must be visible on the OUTER SURFACE in these');
+  lines.push('  frames. If no part of it can be seen, do not list it.');
+  lines.push('- Name at least one ALTERNATIVE category. A prior that cannot imagine being');
+  lines.push('  wrong is not a hypothesis.');
+  lines.push('- Never describe the render itself (transparency, colours, grid, background).');
+  lines.push('  Describe the MACHINE.');
+  lines.push('- An empty "category" with a low "confidence" is a valid answer when you cannot');
+  lines.push('  tell what the machine is, and is far better than a confident guess.');
   lines.push('');
   lines.push(`FRAMES (${used.length} attached, in order):`);
   used.forEach((f, i) => lines.push(`  ${frameLine(f, i)}`));
@@ -179,6 +177,13 @@ export const isExpectationPrompt = (text) => String(text || '').includes(EXPECTA
 
 const str = (v, max) => (typeof v === 'string' && v.trim() ? v.trim().slice(0, max) : '');
 const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);
+
+// The model-facing vocabulary. The IR keeps `hinge` as an internal structural
+// type (propose-core / motion-spec), but this prompt offers only these two —
+// so a reply outside them is either stale (hinge: re-typed, because an
+// expectation is a hypothesis, not a record, and a limited-swing panel IS a
+// gimbal here) or meaningless (anything else: dropped).
+const PRIOR_TYPES = new Set(['rotor', 'gimbal']);
 
 // A box is only usable if it is a real, ordered, in-frame rectangle — but
 // "in-frame" is a UNIT question before it is a value question. Models switch
@@ -261,8 +266,15 @@ export function parseExpectation(reply, { frameIds = null, viewport } = {}) {
   const instances = [];
   rawInstances.slice(0, MAX_EXPECTATION_INSTANCES).forEach((ins, i) => {
     if (!ins || typeof ins !== 'object') { warnings.push(`instance[${i}] was not an object — dropped`); return; }
-    const type = str(ins.type ?? ins.kind ?? ins.motion, 16);
-    if (!TYPES.has(type)) { warnings.push(`instance[${i}] type "${type || '(none)'}" is not rotor|gimbal|hinge — dropped`); return; }
+    let type = str(ins.type ?? ins.kind ?? ins.motion, 16);
+    // A stale prompt's word for a limited-swing part. Re-typed rather than
+    // dropped: the instance still aims a camera and feeds the count, which is
+    // all an expectation ever does. The remap is ANNOUNCED, never absorbed.
+    if (type === 'hinge') {
+      warnings.push(`instance[${i}] type "hinge" re-typed to gimbal — the motion vocabulary offered to the model is rotor|gimbal; a limited-swing part is a gimbal`);
+      type = 'gimbal';
+    }
+    if (!PRIOR_TYPES.has(type)) { warnings.push(`instance[${i}] type "${type || '(none)'}" is not rotor|gimbal — dropped`); return; }
     const frameId = str(ins.frameId ?? ins.frame ?? ins.viewId, 64);
     if (sent && !sent.has(frameId)) {
       warnings.push(`instance[${i}] (${type}) names frame "${frameId || '(none)'}", which was not sent — dropped`);
@@ -284,52 +296,88 @@ export function parseExpectation(reply, { frameIds = null, viewport } = {}) {
     });
   });
 
+  // The unknown-category proposal: the machine's ON-SURFACE actuators, asked
+  // for only when the category is not a table word. These names are NOT yet
+  // vocabulary (the whole point is that the table doesn't know this machine),
+  // so validation is shape-only — snake_case name, rotor|gimbal, a sane count.
+  // What survives becomes the candidate a human confirms into the dictionary
+  // JSON (addDictionaryEntry); until then it mints nothing.
+  const actuators = [];
+  const rawActs = Array.isArray(raw.actuators) ? raw.actuators : [];
+  if (rawActs.length > MAX_EXPECTATION_ACTUATORS) {
+    warnings.push(`truncated ${rawActs.length} proposed actuators to ${MAX_EXPECTATION_ACTUATORS}`);
+  }
+  rawActs.slice(0, MAX_EXPECTATION_ACTUATORS).forEach((a, i) => {
+    if (!a || typeof a !== 'object') { warnings.push(`actuator[${i}] was not an object — dropped`); return; }
+    const name = str(a.name ?? a.part, 40).toLowerCase().replace(/[\s-]+/g, '_');
+    if (!name) { warnings.push(`actuator[${i}] has no name — dropped`); return; }
+    const motion = str(a.motion ?? a.type, 16);
+    if (!PRIOR_TYPES.has(motion)) { warnings.push(`actuator[${i}] ("${name}") motion "${motion || '(none)'}" is not rotor|gimbal — dropped`); return; }
+    const count = Math.max(1, Math.min(MAX_INSTANCE_COUNT, Math.round(num(a.count ?? 1) ?? 1)));
+    actuators.push({ name, motion, count, where: str(a.where ?? a.location, 120) });
+  });
+
   const list = (v, max, n) => (Array.isArray(v) ? v.map((x) => str(typeof x === 'string' ? x : x?.text, max)).filter(Boolean).slice(0, n) : []);
   const expectation = {
     category,
     confidence,
     summary,
     instances,
+    actuators,
     doubts: list(raw.doubts ?? raw.uncertainties, 240, 12),
     alternatives: list(raw.alternatives ?? raw.alternative, 160, 6),
   };
   return { expectation, warnings };
 }
 
-// Whether the prior is worth acting on. False means the campaign behaves exactly
-// as it did before this lane existed: no hypothesis block, no expectation-driven
-// round-2 regions. Degrading to today's behaviour is the design — a prior is an
-// optimisation, never a dependency.
+// Whether the prior is worth acting on. A usable prior is a NAMED CATEGORY at
+// enough confidence — the classify-only turn produces no instances, and none
+// are needed: the dictionary supplies the parts. False means the campaign
+// behaves exactly as it did before this lane existed: no hypothesis block, no
+// localization ask. Degrading to today's behaviour is the design — a prior is
+// an optimisation, never a dependency.
 export function expectationIsUsable(exp, { minConfidence = MIN_EXPECTATION_CONFIDENCE } = {}) {
   if (!exp || typeof exp !== 'object') return false;
   if (!Number.isFinite(exp.confidence) || exp.confidence < minConfidence) return false;
-  if (!exp.category) return false;
-  return Array.isArray(exp.instances) && exp.instances.length > 0;
+  return !!exp.category;
 }
 
-// Expected vs grounded, per type. `records` is the manifest AFTER the discovery
-// turn merged, so the comparison is against what the project actually believes —
+// Expected vs grounded. `records` is the manifest AFTER the discovery turn
+// merged, so the comparison is against what the project actually believes —
 // including anything geometry found before vision ever looked.
+//
+// With a dictionary category the rows are per PART NAME (wheel, door — the
+// words the human reads and the localization turn asks for), never per motion
+// type: expected comes from the table entry, found counts the non-rejected
+// records whose `part` normalizes to that name. Movers nobody has named yet
+// ride as one trailing row with part: null — "2 movers are not named yet" is
+// the honest pre-recognition state, and it keeps a named-3-of-4 from reading
+// as 4-of-4.
+//
+// With no dictionary entry the legacy per-type rows are computed from the
+// model's own instances, exactly as before the table — which, since the
+// classify-only turn, is precisely the case the workflow stops to review.
 export function expectationGap(exp, records = []) {
-  if (!exp || (!Array.isArray(exp.instances) && !exp.dictCounts) || (!exp.instances?.length && !exp.dictCounts)) return [];
+  const live = (records || []).filter((r) => r && r.status !== 'rejected');
+  const hit = exp?.dictKey ? lookupDictionary(exp.category) : null;
+  if (hit?.entry) {
+    const rows = hit.entry.actuators.map((a) => {
+      const found = live.filter((r) => normPartName(r.part) === a.name).length;
+      return { part: a.name, expected: a.count, found, missing: Math.max(0, a.count - found), surplus: Math.max(0, found - a.count) };
+    });
+    const unnamed = live.filter((r) => !normPartName(r.part)).length;
+    if (unnamed) rows.push({ part: null, expected: 0, found: unnamed, missing: 0, surplus: unnamed });
+    return rows;
+  }
+  if (!exp || !Array.isArray(exp.instances) || !exp.instances.length) return [];
   const expected = new Map();
-  for (const ins of exp.instances || []) {
+  for (const ins of exp.instances) {
     if (!ins?.type) continue;
     expected.set(ins.type, (expected.get(ins.type) || 0) + Math.max(0, Number(ins.count) || 0));
   }
-  // The dictionary's totals are the counts to FALSIFY when the category is one
-  // the table knows: they are deterministic, where the model's per-type sum
-  // drifts run to run. Union rather than replacement — a kind the model
-  // expected and the table does not list (a drone's folding arms) is still a
-  // place the loop was asked to look.
-  for (const [type, n] of Object.entries(exp.dictCounts || {})) {
-    if (Number.isFinite(n) && n >= 0) expected.set(type, n);
-  }
   const found = new Map();
-  for (const rec of records || []) {
-    // A rejected record is not a joint, so counting one would report a gap as
-    // filled by something a human threw away.
-    if (!rec?.type || rec.status === 'rejected') continue;
+  for (const rec of live) {
+    if (!rec?.type) continue;
     found.set(rec.type, (found.get(rec.type) || 0) + 1);
   }
   return [...expected.entries()].map(([type, e]) => {
@@ -394,24 +442,33 @@ export function verifiedInstances(exp, grounded = [], { minOverlap = MIN_VERIFY_
 // block is inserted into a prompt whose model has just been told to report what
 // it sees, and a prior phrased as a finding would be agreed with rather than
 // tested. So every line is attributed to the earlier look and every count is
-// stated as an expectation.
+// stated as an expectation. Counts are stated per PART NAME — the words the
+// reference table and the localization turn both speak.
 export function expectationBrief(exp, gaps = []) {
   if (!expectationIsUsable(exp)) return [];
   const lines = [];
   lines.push(`a first look at these frames classified the machine as "${exp.category}" (its own confidence ${Number(exp.confidence).toFixed(2)})`);
   if (exp.summary) lines.push(`it said: ${exp.summary}`);
   if (exp.dictRef) {
-    lines.push(`the reference list for a ${exp.dictKey} — the counts to falsify — is: ${exp.dictRef}`);
+    lines.push(`the reference list for a ${exp.dictKey} — the parts to find, one by one — is: ${exp.dictRef}`);
   }
-  for (const ins of exp.instances) {
+  for (const ins of exp.instances || []) {
     const box = (ins.regionBox || []).map((v) => Number(v).toFixed(2)).join(',');
     lines.push(`it expects ${ins.count} x ${ins.type}${ins.symmetry ? `, arranged ${ins.symmetry}` : ''} — one such place is in frame "${ins.frameId}" at [${box}]${ins.note ? ` (${ins.note})` : ''}`);
   }
   const gapLines = (gaps || []).filter((x) => x.missing > 0 || x.surplus > 0);
   for (const gap of gapLines) {
-    lines.push(gap.missing > 0
-      ? `only ${gap.found} of the ${gap.expected} ${gap.type}(s) it expected have been grounded — look for the missing ${gap.missing}`
-      : `${gap.found} ${gap.type}(s) were grounded where it expected ${gap.expected} — the extra ${gap.surplus} may be real, or the category may be wrong`);
+    if (gap.part === null) {
+      lines.push(`${gap.found} mover(s) on the map have not been named yet — the localization step is what names them`);
+    } else if (gap.part) {
+      lines.push(gap.missing > 0
+        ? `only ${gap.found} of the ${gap.expected} ${gap.part}(s) the table expects have been found — look for the missing ${gap.missing}`
+        : `${gap.found} ${gap.part}(s) were found where the table expects ${gap.expected} — the extra ${gap.surplus} may be real, or the category may be wrong`);
+    } else {
+      lines.push(gap.missing > 0
+        ? `only ${gap.found} of the ${gap.expected} ${gap.type}(s) it expected have been grounded — look for the missing ${gap.missing}`
+        : `${gap.found} ${gap.type}(s) were grounded where it expected ${gap.expected} — the extra ${gap.surplus} may be real, or the category may be wrong`);
+    }
   }
   for (const d of (exp.doubts || []).slice(0, 3)) lines.push(`it doubted: ${d}`);
   for (const alt of (exp.alternatives || []).slice(0, 2)) lines.push(`it also considered: ${alt}`);
