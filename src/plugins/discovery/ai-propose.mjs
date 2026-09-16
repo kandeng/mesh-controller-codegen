@@ -36,7 +36,20 @@ export function aiPropose({ reply, g, manifest }) {
   const { items, warnings } = parseReply(reply);
   gate.warnings.push(...warnings);
 
-  items.forEach((p, idx) => gate.admit(p, idx));
+  items.forEach((p, idx) => {
+    // HINGE PROPOSALS ARE REFUSED HERE, exactly as the vision lane refuses
+    // them (vision-propose.mjs): a hinge is an internal component of its
+    // assembly (a door's, a hood's), not a drivable actuator of its own, and
+    // the L2 prompt no longer offers the type (context.mjs). A confirm of an
+    // EXISTING hinge record slips past: it proposes no scope, it only
+    // corroborates one a human already owns. The IR keeps the type for manual
+    // and other producers.
+    if (p && p.type === 'hinge' && p.op !== 'confirm') {
+      gate.warnings.push(`proposal[${idx}] is a hinge — the L2 lane no longer admits hinge joints (a hinge is internal to its assembly, not a drivable actuator); the IR keeps the type for manual and other producers`);
+      return;
+    }
+    gate.admit(p, idx);
+  });
 
   return { records: gate.records, confirms: gate.confirms, warnings: gate.warnings };
 }

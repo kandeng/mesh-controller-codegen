@@ -66,7 +66,7 @@ const freeNames = g.nodes.filter((n) => !claimed.has(n.name) && n.wext).slice(0,
 {
   const anchor = g.nodes.find((n) => n.name === freeNames[0]).wp;
   const good = JSON.stringify([{
-    op: 'new', nodeIds: freeNames, type: 'hinge', axis: [0, 0, 1],
+    op: 'new', nodeIds: freeNames, type: 'gimbal', axis: [0, 0, 1],
     anchor: [anchor[0], anchor[1], anchor[2]], rationale: 'unit test',
   }]);
   const r1 = aiPropose({ reply: good, g, manifest: manifest2 });
@@ -78,7 +78,7 @@ const freeNames = g.nodes.filter((n) => !claimed.has(n.name) && n.wext).slice(0,
   ok('malformed reply → no records, warning raised', r2.records.length === 0 && r2.warnings.length > 0);
 
   const r3 = aiPropose({
-    reply: JSON.stringify([{ op: 'new', nodeIds: [freeNames[0], 'NoSuchNode'], type: 'hinge', axis: [0, 0, 1], anchor: [0, 0, 0] }]),
+    reply: JSON.stringify([{ op: 'new', nodeIds: [freeNames[0], 'NoSuchNode'], type: 'gimbal', axis: [0, 0, 1], anchor: [0, 0, 0] }]),
     g, manifest: manifest2,
   });
   ok('unknown node ids are rejected', r3.records.length === 0 && r3.warnings.some((w) => w.includes('unknown nodes')));
@@ -93,6 +93,27 @@ const freeNames = g.nodes.filter((n) => !claimed.has(n.name) && n.wext).slice(0,
 
   const fenced = aiPropose({ reply: `Here you go:\n\`\`\`json\n${good}\n\`\`\``, g, manifest: manifest2 });
   ok('fenced replies parse (record would duplicate → dropped, but parsed)', fenced.warnings.some((w) => w.includes('duplicate')) || fenced.records.length === 1);
+}
+
+// ---- 3b) the L2 lane refuses hinge -------------------------------------------
+// The type survives in the IR for manual records, but no producer prompt offers
+// it: a hinge item that arrives anyway is refused with an announcement, and
+// only a confirm of a record a human already owns slips past (it proposes no
+// scope — it corroborates).
+{
+  const refused = aiPropose({
+    reply: JSON.stringify([{ op: 'new', nodeIds: freeNames, type: 'hinge', axis: [0, 0, 1], anchor: [0, 0, 0], rationale: 'a stale prompt word' }]),
+    g, manifest: manifest2,
+  });
+  ok('a hinge proposal is REFUSED by the L2 lane — announced, never admitted',
+    refused.records.length === 0 && refused.warnings.some((w) => /is a hinge/.test(w)), refused.warnings[0]);
+  const humanHinge = [{ id: 'hinge_human_0', type: 'hinge', status: 'confirmed', nodes: [freeNames[0]] }];
+  const conf = aiPropose({
+    reply: JSON.stringify([{ op: 'confirm', targetId: 'hinge_human_0', type: 'hinge', rationale: 'a person already owns this one' }]),
+    g, manifest: humanHinge,
+  });
+  ok('...but a confirm of an EXISTING hinge record slips past — it corroborates, it proposes no scope',
+    conf.records.length === 0 && conf.confirms.length === 1 && conf.confirms[0].targetId === 'hinge_human_0');
 }
 
 // ---- 4) runL2Round with a fake producer: gimbal split --------------------------
@@ -143,7 +164,7 @@ const freeNames = g.nodes.filter((n) => !claimed.has(n.name) && n.wext).slice(0,
   const conf0 = callerManifest[0].confidence;
   const laneAnchor = g.nodes.find((n) => n.name === freeNames[0]).wp;
   const laneReply = JSON.stringify([{
-    op: 'new', nodeIds: freeNames, type: 'hinge', axis: [0, 0, 1],
+    op: 'new', nodeIds: freeNames, type: 'gimbal', axis: [0, 0, 1],
     anchor: [laneAnchor[0], laneAnchor[1], laneAnchor[2]], rationale: 'lane isolation unit test',
   }]);
 

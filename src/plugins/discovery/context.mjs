@@ -34,12 +34,12 @@ export function buildProposalPrompt({ g, manifest, focusIds = new Set() }) {
   const table = sliceNodeTable(g, { excludeIds: claimed, focusIds });
   return [
     'You are L2, a hypothesis producer in a rigged-mesh joint-discovery loop.',
-    'Propose movable joints (rotor/gimbal/hinge) over the mesh nodes below.',
+    'Propose movable joints (rotor/gimbal) over the mesh nodes below.',
     '',
     'Reply with JSON ONLY (no prose, no code fences): an array of at most 6 objects:',
     '[{ "op": "new|split|merge|confirm", "targetId": "<existing joint id, for split/merge/confirm>",',
    '   "nodeIds": ["<node names from the table>"],',
-   '   "type": "rotor|gimbal|hinge", "axis": [x,y,z], "anchor": [x,y,z], "rationale": "..." }]',
+   '   "type": "rotor|gimbal", "axis": [x,y,z], "anchor": [x,y,z], "rationale": "..." }]',
     '',
     'Rules:',
     '- Use only node names that appear in the table below.',
