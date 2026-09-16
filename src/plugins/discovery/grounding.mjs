@@ -23,6 +23,9 @@ import {
   AZIMUTH_RETRY, REGION_MAX_R, REGION_MIN_R, REGION_PAD, VIEWPORT, makeCamera,
   modelRadius, namedBoxes, namedIndex, nodeBox, rectOf, renderTargets, slug, unionBoxes,
 } from './views.mjs';
+import {
+  carveEvidence, floodPatch, patchMetrics, registerCarve, seedFromRegion, worldScaleOf,
+} from './carve.mjs';
 
 // VLM boxes are the least reliable part of their output: 10% slop is normal and
 // thin parts (blades, arms, gimbal yokes) are worse. Boxes therefore give a COARSE
@@ -32,6 +35,40 @@ export const BOX_DILATE = 0.1;
 // Below this a candidate is noise: a part clipping the very edge of a dilated box.
 export const MIN_BOX_SCORE = 0.12;
 export const MAX_CANDIDATES = 24;
+
+// Subject-anchored pruning: a model points at ONE visible surface, so the top
+// candidate IS the subject and every other kept candidate must still look like
+// it belongs to the same surface. Three independent rejections, because each
+// catches a mixture the other two cannot:
+//   INSIDE  a part the box barely clips is background (the door under the
+//           pointed-at wheel): the overlap is a small fraction of ITS area.
+//   REL     a near-tie of the subject's score reads as a sibling of the same
+//           part (tire/rim/spokes); much weaker reads as a different part the
+//           dilated box happens to cover.
+//   DEPTH   a part sitting beyond the subject's own depth extent plus its own
+//           cannot be the surface the model saw — the steering wheel behind
+//           the door glass grounded as part of the wheel until this band
+//           existed. The band is the sum of the two parts' box half-diagonals,
+//           so it scales with the parts, not with the model.
+export const SUBJECT_MIN_INSIDE = 0.5;
+export const SUBJECT_MIN_REL_SCORE = 0.5;
+
+// Fused-shell trigger: the subject's box half-diagonal is at least 45% of the
+// model's (the subject IS the shell) and the pointed box covers under 40% of
+// its projection (a sliver — the part, not the shell). When both hold, the
+// part the model pointed at was never exported as its own node, and the only
+// honest scope is the surface itself: carve it (carve.mjs). A node-normal
+// mesh — the drone sample — never satisfies the pair, so its grounding is
+// bit-for-bit what it was before carving existed.
+export const SHELL_MIN_SHARE = 0.45;
+export const SHELL_MAX_INSIDE = 0.4;
+// Patch sanity bounds: a cut worth making is at least 30 triangles, between 1%
+// and 40% of the shell's area, and no wider than 1.5x the box's own world size
+// (the radius the flood is allowed to reach is 1.3x the box's footprint).
+export const CARVE_MIN_TRIS = 30;
+export const CARVE_AREA_RANGE = [0.01, 0.4];
+export const CARVE_MAX_BOX_SCALE = 1.5;
+export const CARVE_RADIUS_SCALE = 1.3;
 
 // ---- box normalization -------------------------------------------------------
 
@@ -117,7 +154,14 @@ export function cameraOf(view, viewport = VIEWPORT) {
 // Returns { box, dilated, candidates:[{name,i,score,inside,fill,depth}], warnings }.
 export function boxToNodes(box, view, g, {
   dilate = BOX_DILATE, viewport = VIEWPORT, minScore = MIN_BOX_SCORE, maxResults = MAX_CANDIDATES,
+  carver,
 } = {}) {
+  // The carver is ON whenever the graph can decode geometry, unless the caller
+  // explicitly disables it (carver: null) or injects its own reader — which is
+  // how tests carve synthetic geometry without a GLB buffer.
+  const carveRead = carver === undefined
+    ? (typeof g?.readGeometry === 'function' ? (mi) => g.readGeometry(mi) : null)
+    : (carver && typeof carver.readGeometry === 'function' ? carver.readGeometry : null);
   const warnings = [];
   const nb = normBox(box, viewport);
   if (!nb) return { box: null, dilated: null, candidates: [], warnings: ['box missing or degenerate'] };
@@ -133,7 +177,8 @@ export function boxToNodes(box, view, g, {
   const named = namedIndex(g);
   const best = new Map();      // name -> strongest mesh node behind it
   for (const n of renderTargets(g)) {
-    const r = rectOf(nodeBox(n), cam);
+    const b = nodeBox(n);
+    const r = rectOf(b, cam);
     if (!r) continue;
     const ox = Math.min(r.x1, bx1) - Math.max(r.x0, bx0);
     const oy = Math.min(r.y1, by1) - Math.max(r.y0, by0);
@@ -149,15 +194,120 @@ export function boxToNodes(box, view, g, {
     const name = named.get(n.i) || n.name;
     const prev = best.get(name);
     if (!prev || score > prev.score) {
-      best.set(name, { name, i: n.i, score, inside, fill, depth: r.depth, rect: r });
+      best.set(name, { name, i: n.i, score, inside, fill, depth: r.depth, rect: r, hd: b ? Math.hypot(b.h[0], b.h[1], b.h[2]) : 0 });
     }
   }
 
-  const candidates = [...best.values()]
-    .sort((a, b) => (b.score - a.score) || (a.depth - b.depth))
-    .slice(0, Math.max(1, maxResults | 0));
+  const ranked = [...best.values()]
+    .sort((a, b) => (b.score - a.score) || (a.depth - b.depth));
+
+  // Prune around the subject BEFORE capping: the head of the ranking is where
+  // the pointed-at part is, and the cap must not spend its slots on background
+  // the prune already identified. Pruned names stay on the result as audit
+  // evidence — a wrong prune must be as legible as a wrong grounding.
+  const subject = ranked[0] || null;
+  let candidates = ranked;
+  const pruned = [];
+  const carves = [];
+  if (subject) {
+    candidates = [subject];
+    for (const c of ranked.slice(1)) {
+      let why = null;
+      if (c.inside < SUBJECT_MIN_INSIDE) why = `mostly outside the box (inside=${c.inside.toFixed(2)}) — background, not the subject`;
+      else if (c.score < SUBJECT_MIN_REL_SCORE * subject.score) why = `score ${c.score.toFixed(2)} is less than half the subject's ${subject.score.toFixed(2)}`;
+      else if (c.depth > subject.depth + subject.hd + c.hd) why = 'sits behind the subject — the box denotes the visible surface';
+      if (why) pruned.push({ name: c.name, why }); else candidates.push(c);
+    }
+  }
+
+  // ---- fused-shell carve ------------------------------------------------------
+  // The subject is the whole shell and the box covers a sliver of it: the part
+  // the model pointed at is FUSED into a bigger mesh and node-granular
+  // grounding cannot name it — the best node answer is the shell, which is
+  // exactly the scope-mixing failure (wheel + steering wheel + door in one
+  // joint). So cut the pointed surface out and answer THAT. On any failure the
+  // whole-node answer stands, with the reason carried as a warning.
+  if (subject && g.bounds && carveRead) {
+    const modelHd = 0.5 * Math.hypot(
+      g.bounds.max[0] - g.bounds.min[0],
+      g.bounds.max[1] - g.bounds.min[1],
+      g.bounds.max[2] - g.bounds.min[2]);
+    if (subject.hd >= SHELL_MIN_SHARE * modelHd && subject.inside < SHELL_MAX_INSIDE) {
+      const src = g.nodes[subject.i];
+      let why = null;
+      let spec = null;
+      if (!src || src.mi == null) {
+        why = 'the subject has no mesh of its own';
+      } else {
+        const rd = carveRead(src.mi);
+        if (!rd) {
+          why = 'geometry unavailable (external or missing buffer)';
+        } else {
+          // The soup is mesh-local, the camera world: seed rays are cast
+          // through src.wm's inverse, and the radius — derived from the box's
+          // WORLD footprint — is converted into soup units for the flood. The
+          // LOCAL radius is what the spec persists, because applyCarves
+          // re-floods in soup units on reload; the world value rides along as
+          // human-legible evidence.
+          const seed = seedFromRegion(rd, cam, nb, { wm: src.wm });
+          if (!seed) {
+            why = 'no surface under the pointed box';
+          } else {
+            const worldW = (nb.x1 - nb.x0) * 2 * subject.depth * cam.tanHalfY * cam.aspect;
+            const worldH = (nb.y1 - nb.y0) * 2 * subject.depth * cam.tanHalfY;
+            const boxDiag = Math.hypot(worldW, worldH);
+            const maxRadiusWorld = CARVE_RADIUS_SCALE * (boxDiag / 2);
+            const maxRadius = maxRadiusWorld / worldScaleOf(src.wm);
+            const patch = floodPatch(rd.positions, rd.index, seed.tri, { maxRadius, seedPoint: seed.point });
+            if (!patch || !patch.tris.length) {
+              why = 'the seed flooded nothing';
+            } else if (patch.tris.length < CARVE_MIN_TRIS) {
+              why = `only ${patch.tris.length} triangles flooded — too small to rig`;
+            } else {
+              patch.mi = src.mi;
+              const m = patchMetrics(rd, patch.tris, src.wm);
+              const shellArea = patchMetrics(
+                rd, Array.from({ length: Math.floor(rd.index.length / 3) }, (_, k) => k), src.wm,
+              ).area;
+              const share = shellArea > 1e-12 ? m.area / shellArea : 0;
+              const patchDiag = 2 * Math.hypot(m.wb.h[0], m.wb.h[1], m.wb.h[2]);
+              if (share < CARVE_AREA_RANGE[0] || share > CARVE_AREA_RANGE[1]) {
+                why = `patch is ${(share * 100).toFixed(1)}% of the shell — outside the 1..40% a part should be`;
+              } else if (patchDiag > CARVE_MAX_BOX_SCALE * boxDiag) {
+                why = 'the flood ran past what the box could denote';
+              } else {
+                try {
+                  spec = registerCarve(g, subject.name, patch, { maxRadius, maxRadiusWorld });
+                } catch (e) { why = e.message; }
+              }
+            }
+          }
+        }
+      }
+      if (spec) {
+        const cnode = g.nodes.find((n) => n.carve === spec.id);
+        carves.push(carveEvidence(spec));
+        warnings.push(`carved ${spec.triCount} triangles out of "${subject.name}" as ${spec.id} — the pointed part is fused into the shell`);
+        candidates = [{
+          name: spec.id,
+          i: cnode ? cnode.i : subject.i,
+          score: subject.score,
+          inside: 1,
+          fill: subject.fill,
+          depth: subject.depth,
+          rect: subject.rect,
+          hd: Math.hypot(spec.wb.h[0], spec.wb.h[1], spec.wb.h[2]),
+          carved: subject.name,
+        }];
+      } else if (why) {
+        warnings.push(`carve failed: ${why} — keeping whole-node scope`);
+      }
+    }
+  }
+
+  candidates = candidates.slice(0, Math.max(1, maxResults | 0));
   if (!candidates.length) warnings.push('no part projects inside this box');
-  return { box: nb, dilated: d, candidates, warnings };
+  return { box: nb, dilated: d, candidates, pruned, carves, warnings };
 }
 
 // ---- channel 2: colour id -> nodes -------------------------------------------
@@ -254,9 +404,10 @@ export function reconcile(boxNodes, colorNodes) {
 export function groundRegion({
   box = null, colors = null, view = null, g = null, colorMap = null,
   dilate = BOX_DILATE, viewport = VIEWPORT, minScore = MIN_BOX_SCORE, maxResults = MAX_CANDIDATES,
+  carver,
 } = {}) {
   const warnings = [];
-  const viaBox = box && view && g ? boxToNodes(box, view, g, { dilate, viewport, minScore, maxResults }) : null;
+  const viaBox = box && view && g ? boxToNodes(box, view, g, { dilate, viewport, minScore, maxResults, carver }) : null;
   const viaColor = colors && colorMap ? colorIdToNodes(colorMap, colors) : null;
   warnings.push(...(viaBox?.warnings || []));
   for (const u of viaColor?.unknown || []) warnings.push(`colour ${u.asked} ${u.reason}`);
@@ -288,6 +439,7 @@ export function groundRegion({
     candidates: viaBox?.candidates || [],
     colors: viaColor?.matched || [],
     box: viaBox?.dilated || null,
+    carves: viaBox?.carves || [],
     uncertainties, warnings,
   };
 }
