@@ -3,7 +3,13 @@
 import { resolveSlotGraph } from '../slots.mjs';
 
 // Slim a joint for the wire (node arrays can be large; the list only needs counts).
-function jointSummary(j) {
+// `carves` is the LIVE registry on the parsed graph (kernel.current.glb.carves):
+// the record's evidence form deliberately carries no triangle list, but the
+// viewer cannot cut the patch out of the shell without one, so the wire form
+// merges the registry's tris in when they exist. A spec without live tris
+// ships as-is and simply never materializes.
+function jointSummary(j, carves) {
+  const live = j.carve ? (carves || []).find((c) => c.id === j.carve.id) : null;
   return {
     id: j.id,
     label: j.label,
@@ -33,6 +39,10 @@ function jointSummary(j) {
     // looked at this joint" and "a person looked at its mirror" are different
     // claims and only one of them is direct evidence.
     ...(j.verdict ? { verdict: j.verdict } : {}),
+    // On-surface OUT: this joint's part was cut out of a fused shell. The spec
+    // (+ live tris when the registry has them) lets the viewer materialize the
+    // carve as its own named subtree.
+    ...(j.carve ? { carve: { ...j.carve, ...(live?.tris ? { tris: live.tris } : {}) } } : {}),
   };
 }
 
@@ -56,7 +66,7 @@ export function projectRoutes(app, kernel) {
         glb: d.glbPath,
         stats: d.stats,
         specCheck: d.specCheck,
-        joints: d.joints.map(jointSummary),
+        joints: d.joints.map((j) => jointSummary(j, kernel.current.glb?.carves)),
         viewer: kernel.viewerUrls(),
       };
     } catch (e) {
@@ -105,7 +115,7 @@ export function projectRoutes(app, kernel) {
       loaded: !!c.glb,
       glb: c.glbPath,
       stats: c.glb,
-      joints: (c.joints || []).map(jointSummary),
+      joints: (c.joints || []).map((j) => jointSummary(j, c.glb?.carves)),
       validation: c.lastValidation,
       viewer: c.glb ? kernel.viewerUrls() : { glb: null, ctl: null },
       runDir: kernel.runDir,

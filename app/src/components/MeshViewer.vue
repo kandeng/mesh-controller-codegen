@@ -14,6 +14,7 @@ import { useSlotRouting } from '../composables/useSlotRouting.js';
 import { registerViewerCapture, registerViewerCaptureAt, registerViewerCaptureMotion, registerViewerModel, registerViewerFraming } from '../composables/useViewerCapture.js';
 import { useRenderFarm } from '../composables/useRenderFarm.js';
 import { useKernelApi } from '../composables/useKernelApi.js';
+import { materializeCarves } from '../lib/carve-materialize.js';
 // The two right-hand toolbar glyphs, inlined (?raw + v-html) so stroke="currentColor"
 // themes them exactly like the pens beside them — a mask-image would work too (see
 // ChatPanel) but the pens are inline SVG, and one DOM style keeps the row coherent.
@@ -42,6 +43,7 @@ let pivot = null;                // temp pivot the active joint is parented to
 let pivotNodes = [];             // nodes currently parented to the pivot
 let pivotParents = [];           // their original parents (for restore)
 let pivotJointId = null;         // joint id the pivot belongs to
+const appliedCarves = new Set(); // carve ids already materialized in THIS scene
 let lastPublish = 0;             // throttle readout publishing (~5 Hz)
 const DEG2RAD = Math.PI / 180;
 
@@ -888,6 +890,7 @@ async function loadModel(url) {
   if (drone) { scene.remove(drone); drone = null; }
   disposeViewMats();          // the OLD model's overrides die with it
   origMats.clear();
+  appliedCarves.clear();      // carve subtrees die with the scene they were cut into
   loadedGlb = url;
   status.value = `loading mesh…`;
   const gltf = await new Promise((res, rej) => new GLTFLoader().load(url, res, undefined, rej));
@@ -931,10 +934,45 @@ async function loadModel(url) {
   makeHighlightMaterial();
   rebuildMarkers();
   applyViewMaterials();       // a chosen view mode survives a model swap
+  syncCarves();               // re-cut the patches the joint list already carries
   updateHighlight();
   // Announce LAST: the farm may pick this tab the instant it hears "model
   // loaded", and every part of the scene must already be in its rest state.
   announceModel();
+}
+
+// ---- on-surface OUT: carve materialization -----------------------------------
+// A proposal that points at a part FUSED into a shell is grounded by cutting
+// the patch out of the shell (discovery/carve.mjs) and naming it
+// `<source>#carve<N>`; the joint record carries that spec over the joints
+// channel. Here is where the scene honours it: the patch leaves the source
+// geometry and becomes its own subtree NAMED the carve id, so the preview,
+// highlight, view modes and any generated controller keep addressing the part
+// by name like any other node. Idempotent — a joints refresh re-lists specs
+// the scene already has, and those are skipped inside materializeCarves.
+function syncCarves() {
+  if (!drone) return;
+  const specs = [];
+  for (const j of state.joints || []) {
+    const c = j?.carve;
+    if (c && Array.isArray(c.tris) && c.tris.length && !appliedCarves.has(c.id)) specs.push(c);
+  }
+  if (!specs.length) return;
+  const made = materializeCarves(drone, specs, THREE, {
+    // The scene is parseGlb world space minus the model's bbox centre.
+    toScene: (p) => new THREE.Vector3(p[0] - center.x, p[1] - center.y, p[2] - center.z),
+  });
+  for (const m of made) {
+    appliedCarves.add(m.id);
+    nodeByName.set(m.id, m.group);
+    restWorld.set(m.id, m.group.getWorldPosition(new THREE.Vector3()));
+    // The carved parts inherit the SOURCE's authored material as their restore
+    // target, so view modes and highlight treat them like any model mesh.
+    for (const part of m.parts) origMats.set(part.mesh, origMats.get(part.from) || part.from.material);
+  }
+  if (!made.length) return;
+  applyViewMaterials();       // a live view mode must dress the new meshes too
+  updateHighlight();
 }
 
 // ---- isolated single-joint preview -----------------------------------------
@@ -1495,7 +1533,7 @@ async function reload() {
 
 watch(() => state.viewer.glb, reload);
 watch(() => [state.activeJointId, state.slotGraph], updateOverlay, { deep: true });
-watch(() => state.joints, rebuildMarkers, { deep: true });
+watch(() => state.joints, () => { syncCarves(); rebuildMarkers(); }, { deep: true });
 watch(() => state.activeJointId, () => { rebuildMarkers(); updateHighlight(); });
 watch(() => state.tourRound, loadTour);
 watch(() => state.activeJointId, teardownPivot);

@@ -124,7 +124,7 @@ export function jointRoutes(app, kernel) {
 
   app.get('/api/joints', async () => ({
     ok: true,
-    joints: (kernel.current.joints || []).map(jointSummary),
+    joints: (kernel.current.joints || []).map((j) => jointSummary(j, kernel.current.glb?.carves)),
   }));
 
   // Phase 3 task 17: the evidence behind ONE claim — the frames the model was
