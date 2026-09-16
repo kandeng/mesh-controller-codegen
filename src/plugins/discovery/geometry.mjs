@@ -197,15 +197,28 @@ export function wheelUnits(g, claimed = new Set()) {
 // dozens of nodes at one shared origin (a whole cabin) while their geometry
 // sits metres away. Box-GAP distance was considered and rejected: a model-
 // spanning hull box touches everything, so the gap collapses to ~0 and every
-// rotor swallows the hull. Tolerances use the ring radius: the legacy origin
-// radius is inflated by helper nodes (studio lights).
+// rotor swallows the hull.
+//
+// Both tolerances are BLADE-LOCAL, never machine-scaled: the legacy ring-
+// radius versions (0.7x / 0.45x ringR) read the whole vehicle as one rotor's
+// neighbourhood — on the marussia they put the front tires inside a
+// headlight-lens "rotor" (tires at 163 plate thicknesses from the lens).
+// The constants are measured on the two reference meshes:
+//   cluster 1.6x plate DIAMETER — an Inspire corner's two blade plates sit
+//     1.42x apart, the next corner's plates 1.80x; 1.6 splits the gap. The
+//     marussia's three headlight lenses sit 0.04x apart and stay one cluster.
+//   mates   7x plate THICKNESS — every hub/spinner/lock node of the Inspire's
+//     accepted rotor scopes sits within 6.1 thicknesses of a blade plate; the
+//     marussia's headlight assembly sits within 5.6x, while its tires (163x),
+//     logo and fender trim (~100x) fall far outside any sane constant.
 function rotorClusters(g) {
   const clusters = [];
-  const ringR = g.ringRadius || g.radius;
   for (const b of bladeCandidates(g)) {
     if (isDup(b)) continue;
     const bp = placedPt(b);
-    let c = clusters.find((x) => Math.hypot(x.wp[0] - bp[0], x.wp[1] - bp[1], x.wp[2] - bp[2]) < 0.7 * ringR);
+    const bladeDiam = Math.max(b.wext.ex, b.wext.ey);
+    const plateThick = Math.min(b.wext.ex, b.wext.ey, b.wext.ez);
+    let c = clusters.find((x) => Math.hypot(x.wp[0] - bp[0], x.wp[1] - bp[1], x.wp[2] - bp[2]) < 1.6 * bladeDiam);
     if (!c) { c = { wp: [...bp], n: 1, blades: [], mates: [] }; clusters.push(c); } else {
       for (let k = 0; k < 3; k++) c.wp[k] = (c.wp[k] * c.n + bp[k]) / (c.n + 1);
       c.n++;
@@ -214,7 +227,7 @@ function rotorClusters(g) {
     for (const n of g.nodes) {
       if (!n.wext || isDup(n)) continue;
       const np = placedPt(n);
-      if (Math.hypot(np[0] - bp[0], np[1] - bp[1], np[2] - bp[2]) < 0.45 * ringR) c.mates.push(n.name);
+      if (Math.hypot(np[0] - bp[0], np[1] - bp[1], np[2] - bp[2]) < 7 * plateThick) c.mates.push(n.name);
     }
   }
   return clusters.map((c) => ({ ...c, blades: [...new Set(c.blades)], mates: [...new Set(c.mates)].slice(0, 30) }));

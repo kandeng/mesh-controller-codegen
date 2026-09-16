@@ -14,6 +14,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseGlb, bladeCandidates } from '../src/lib/gltf.mjs';
 import { discCoherence, scopeSpread } from '../src/plugins/discovery/tests.mjs';
+import { geometryDiscovery } from '../src/plugins/discovery/geometry.mjs';
 
 let passed = 0; let failed = 0;
 function ok(cond, label) {
@@ -139,6 +140,38 @@ ok(discCoherence(car, monster).pass,
   `R5: ...which the origin-era disc-coherence still passes — division of labour: scope-spread is the killer`);
 ok(scopeSpread(car, sane).pass,
   `R5: scope-spread passes a tight one-wheel scope — ${scopeSpread(car, sane).detail}`);
+
+// R6: regression for the machine-scaled mate radius that swallowed the
+// marussia's front wheels. bladeCandidates matches the marussia's headlight
+// lens plates, and the old 0.45*ringRadius mate radius (4.34 world units)
+// reached from them to the front tire/rim, the Logo and the fender trim,
+// fusing all of it into a 19-node "rotor". Blade-local tolerances (cluster
+// 1.6x blade diameter, mates 7x plate thickness) keep the cluster to the
+// 9-node headlight assembly and leave the wheels to wheelUnits. The drone's
+// accepted scopes must be preserved: 4 rotors including the 55_1_*/56_1_*
+// motor mates (they sit at 6.1 plate thicknesses — the reason the constant
+// is 7x, not 6x), plus the 12-node gimbal.
+const MAR = '/home/robot/drone-navigation-v2/client/assets/mesh/car_marussia_b1.glb';
+const { joints: marJoints } = await geometryDiscovery.api.discover(MAR, null);
+ok(marJoints.length === 3,
+  `R6: the marussia discovers 3 joints (headlight cluster + 2 rear wheels) — got ${marJoints.length}: ${marJoints.map((j) => `${j.id}(${j.nodes.length})`).join(', ')}`);
+ok(marJoints.every((j) => !j.nodes.some((n) => ['tire003', 'tire', 'rim', 'Logo', 'f_plastic'].includes(n))),
+  'R6: NO joint contains the front wheels, logo or fender trim the machine-scaled radius swallowed');
+const hl = marJoints.find((j) => j.nodes.includes('Headlights_Material #148_0'));
+ok(!!hl && hl.nodes.length === 9 && hl.nodes.every((n) => /headlight|f_light/i.test(n)),
+  `R6: the blade cluster is the compact 9-node headlight assembly — ${hl ? `${hl.nodes.length} nodes: ${hl.nodes.join(', ')}` : 'not found'}`);
+const marWheels = marJoints.filter((j) => j.nodes.some((n) => /^tire00[12]$/.test(n)));
+ok(marWheels.length === 2 && marWheels.every((j) => j.nodes.length === 9),
+  `R6: the two rear wheels are proper 9-node wheel joints — ${marWheels.map((j) => `${j.id}(${j.nodes.length})`).join(', ') || 'none'}`);
+const { joints: droneJoints } = await geometryDiscovery.api.discover(new URL('../samples/drone_dji_inspire3.glb', import.meta.url).pathname, null);
+const droneRotors = droneJoints.filter((j) => j.type === 'rotor');
+ok(droneRotors.length === 4 && droneRotors.every((j) => j.nodes.length >= 30),
+  `R6: the drone keeps its 4 accepted rotor scopes — ${droneRotors.map((j) => `${j.id}(${j.nodes.length})`).join(', ')}`);
+ok(droneRotors.every((j) => j.nodes.some((n) => /^55_1_/.test(n)) && j.nodes.some((n) => /^56_1_/.test(n))),
+  'R6: ...each still including its 55_1_*/56_1_* motor mates at 6.1 thicknesses (7x keeps them; 6x would strip them)');
+const droneGimbals = droneJoints.filter((j) => j.type === 'gimbal');
+ok(droneGimbals.length === 1 && droneGimbals[0].nodes.length === 12,
+  `R6: ...and the 12-node gimbal is untouched — ${droneGimbals.map((j) => `${j.id}(${j.nodes.length})`).join(', ') || 'none'}`);
 
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);
