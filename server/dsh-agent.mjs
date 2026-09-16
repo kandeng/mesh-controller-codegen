@@ -364,11 +364,15 @@ export function createDshAgent(kernel) {
     // an explicit vision_model override is configured.
     const model = (images.length && cfg.visionModel) ? cfg.visionModel : cfg.model;
     const human = opts?.origin === 'user';
-    // A MACHINE turn that carries screenshots is the only one worth not thinking
-    // on at all: measured against the real 12-frame discovery prompt, the
-    // reasoning stream was 10,771 tokens and ~244s of a 280s call while the
-    // reply itself was 1,452 tokens — dropping thinking took that turn from
-    // 319s (agentic) to 36s, and the transport was never the cost.
+    // A MACHINE turn never thinks, whatever it carries: thinking is for
+    // understanding a HUMAN's request, and a machine lane's prompt is a strict
+    // machine-written contract that needs compliance, not deliberation. Measured
+    // against the real 12-frame discovery prompt, the reasoning stream was
+    // 10,771 tokens and ~244s of a 280s call while the reply itself was 1,452
+    // tokens — dropping thinking took that turn from 319s (agentic) to 36s, and
+    // the transport was never the cost. This covers the image lanes AND the
+    // text lane: before, a machine turn without images fell through to the
+    // route default (high) and thought anyway.
     //
     // A HUMAN turn runs the HALF policy by default: its FIRST model run thinks
     // (route default high) — that run reads the request, and its reply is what
@@ -378,7 +382,7 @@ export function createDshAgent(kernel) {
     // -> edit) where the thinking added latency, not quality. 'full' restores
     // thinking on every run; 'off' skips it entirely, including run one.
     const policy = cfg.humanReasoningPolicy || 'half';
-    const effort = (!human && images.length) ? 'off' : (human && policy === 'off') ? 'off' : null;
+    const effort = !human ? 'off' : (policy === 'off') ? 'off' : null;
     // Session isolation (see createLaneSession): a human send prompts the
     // persistent human session; anything else prompts a session minted for
     // this one call, so neither history ever sees the other's contract.

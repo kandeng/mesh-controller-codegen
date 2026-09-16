@@ -298,7 +298,12 @@ function resolveNodes(p, frame, g, opts, maxBoxNodes) {
       truncated,
       box: gr.box,
       colors: gr.colors.map((c) => c.color),
+      carved: gr.carves?.[0]?.source || undefined,
     },
+    // The carve spec (evidence form: no triangle list) when the pointed part
+    // was cut out of a fused shell. Persisted on the record so a reload can
+    // re-derive the identical patch with applyCarves.
+    carve: gr.carves?.[0] || null,
     uncertainties,
     warnings,
   };
@@ -395,6 +400,26 @@ export function visionPropose({
       item = { ...p, op: 'new' };
     }
 
+    // HINGE PROPOSALS ARE REFUSED HERE. A hinge is an internal component of an
+    // assembly (a door's, a hood's), not a drivable actuator of its own, and a
+    // region pointed at one is the most error-prone grounding this lane can
+    // produce — so the prompt no longer offers the type, and a hinge item that
+    // arrives anyway (a stale prompt, an expectation hint for a working
+    // machine's arm) is dropped WITHOUT being grounded: another frame cannot
+    // fix a refusal that is about the type, so it earns no suggestView either.
+    // The refusal is still written to `grounded`, keeping one audit entry per
+    // proposal. A confirm of an EXISTING hinge record slips past: it proposes
+    // no scope, it only corroborates one a human already owns. The IR keeps
+    // the type for manual and other producers.
+    if (item.type === 'hinge' && item.op !== 'confirm') {
+      gate.warnings.push(`proposal[${idx}] is a hinge — the vision lane no longer admits hinge joints (a hinge is internal to its assembly and a pointed-at region scopes it badly); the IR keeps the type for manual and other producers`);
+      grounded.push({
+        index: idx, frameId, names: [], grounding: null,
+        uncertainties: ['refused without grounding: the vision lane does not admit hinge proposals'],
+      });
+      return;
+    }
+
     // suggestView is collected BEFORE validation and regardless of outcome: a
     // proposal dropped for bad grounding is the strongest possible argument for
     // spending another frame on that region.
@@ -475,12 +500,14 @@ export function visionPropose({
       anchorSource: anchorSource || undefined,
       axisSource: axisSource || undefined,
       modelAnchor: vec3(p?.anchor) ? p.anchor.map(Number) : undefined,
+      carve: resolved.carve || undefined,
       // ROUTING ONLY. The gate forces `confidence` after spreading this object,
       // so a model's self-assessment can never become a record's confidence.
       modelConfidence: Number.isFinite(p?.confidence) ? Number(p.confidence) : undefined,
       evidence: [
         frameId ? `frame:${frameId}` : null,
         resolved.grounding ? `grounded-by:${resolved.grounding.source}` : null,
+        resolved.carve ? `carved:${resolved.carve.source}` : null,
         convertedFrom ? `confirm-converted:${convertedFrom}` : null,
       ].filter(Boolean),
     };

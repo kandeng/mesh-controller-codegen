@@ -178,8 +178,8 @@ const preset = [{
   colorMap: { [hexOf(0)]: freeName },
 }];
 const replyOne = (loc) => (loc ? J([{
-  op: 'new', type: 'hinge', frameId: loc.frameId, regionColors: [loc.color], axis: [0, 0, 1],
-  reasoning: 'a hinge the node hierarchy never named', uncertainties: ['its extent is unclear'],
+  op: 'new', type: 'gimbal', frameId: loc.frameId, regionColors: [loc.color], axis: [0, 0, 1],
+  reasoning: 'a pivot the node hierarchy never named', uncertainties: ['its extent is unclear'],
 }]) : '[]');
 
 const laneM = clone(geo.manifest).map((r) => ({ ...r, history: [...(r.history || [])] }));
@@ -281,7 +281,7 @@ const admitted = admitCandidates(stageJ, stageM, reconciled);
   ok('S3: the vision-sourced candidate keeps what the model said and what it was unsure about',
     (() => {
       const wire = jointSummary(stageJ.find((j) => j.id === vision.proposals[0].id));
-      return wire.origin === 'L2-vision' && wire.reasoning === 'a hinge the node hierarchy never named'
+      return wire.origin === 'L2-vision' && wire.reasoning === 'a pivot the node hierarchy never named'
         && (wire.uncertainties || []).includes('its extent is unclear');
     })(), J(jointSummary(stageJ.find((j) => j.id === vision.proposals[0].id)).uncertainties));
 }
@@ -662,7 +662,7 @@ const freshStage = () => {
   const laneM = clone(geo.manifest).map((r) => ({ ...r, history: [...(r.history || [])] }));
   const laneJ = clone(joints0);
   const f = fakes(() => J([{
-    op: 'new', type: 'hinge', frameId: 'ref:screenshot.png', regionBox: [0.2, 0.2, 0.4, 0.4],
+    op: 'new', type: 'gimbal', frameId: 'ref:screenshot.png', regionBox: [0.2, 0.2, 0.4, 0.4],
     axis: [0, 0, 1], reasoning: 'the human showed me this part', uncertainties: [],
   }]));
   const bad = await runVisionCampaign(g, laneJ, laneM, {
@@ -833,16 +833,17 @@ const freshStage = () => {
       && /rpc\('session\.prompt', \{ sessionId: sid, mode: 'queue', content \}\)/.test(dshSrc)
       && /f\.sessionId !== \(turnSid \|\| sessionId\)/.test(dshSrc)
       && /rpc\('session\.cancel', \{ sessionId: turnSid \|\| sessionId \}, 5_000\)/.test(dshSrc));
-  // Thinking is switched off ONLY for a machine turn that carries screenshots.
-  // The condition is pinned here because getting it wrong is silent and costly
-  // in both directions: including a human send with an attachment would cost the
-  // human their reasoned answer, and including a lane turn WITHOUT images would
-  // keep paying ~244s of reasoning on the text lane, which never had the
-  // problem. Omitting the effort is not neutral either — DSH then falls back to
+  // Thinking is switched off for EVERY machine turn, images or not. The
+  // condition is pinned here because getting it wrong is silent and costly
+  // in both directions: including a human send would cost the human their
+  // reasoned answer, and exempting a lane turn WITHOUT images (the old rule)
+  // paid ~244s of reasoning on the text lane for nothing — thinking exists to
+  // understand a human's request, and a machine prompt is a strict contract.
+  // Omitting the effort is not neutral either — DSH then falls back to
   // the route default, which is thinking ON (see bailian.patch.yml), so the
   // effort must also be part of what selectModel caches.
-  ok('S9: thinking is off for machine image turns, and for every run after the first of a human turn under the half policy — the text lane keeps it',
-    /const effort = \(!human && images\.length\) \? 'off' : \(human && policy === 'off'\) \? 'off' : null;/.test(dshSrc)
+  ok('S9: thinking is off for every machine turn (image or text), and for every run after the first of a human turn under the half policy',
+    /const effort = !human \? 'off' : \(policy === 'off'\) \? 'off' : null;/.test(dshSrc)
       && /await selectModel\(model, sid, effort\);/.test(dshSrc)
       && /\.\.\.\(effort \? \{ reasoningEffort: effort \} : \{\}\)/.test(dshSrc)
       && /modelBySession\.set\(sid, key\)/.test(dshSrc));
@@ -999,7 +1000,7 @@ const freshStage = () => {
   const texts14 = []; let calls14 = 0;
   const fA = fakes((loc) => {
     calls14 += 1;
-    return calls14 === 1 ? prose14 : (loc ? J([{ op: 'new', type: 'hinge', frameId: loc.frameId, regionColors: [loc.color], axis: [0, 0, 1] }]) : '[]');
+    return calls14 === 1 ? prose14 : (loc ? J([{ op: 'new', type: 'gimbal', frameId: loc.frameId, regionColors: [loc.color], axis: [0, 0, 1] }]) : '[]');
   });
   const beatsA = [];
   const vA = await runVisionCampaign(g, clone(joints0), lane14(), {

@@ -259,10 +259,14 @@ export function buildVisionPrompt({
   }
   lines.push(question || 'TASK: identify the parts of this machine that MOVE RELATIVE to the rest,');
   lines.push('and say what kind of motion each has.');
-  lines.push('  rotor  - spins continuously about one axis (propeller, fan, motor, gimbal roll)');
-  lines.push('  gimbal - pivots about a point over a limited range (camera mount, turret)');
-  lines.push('  hinge  - rotates about an axis over a limited range (folding arm, landing gear,');
-  lines.push('           control surface, bay door)');
+  lines.push('  rotor  - spins continuously about one axis (propeller, fan, motor, wheel)');
+  lines.push('  gimbal - pivots about a point over a limited range (camera mount, turret, mirror)');
+  lines.push('There is no third kind: a hinged panel (door, hood, wiper, hatch) is NOT proposed.');
+  lines.push('Its hinge is an internal component of the assembly, not an actuator of its own,');
+  lines.push('and a panel\'s extent cannot be pointed at reliably enough to rig.');
+  lines.push('If a moving part is FUSED into a larger shell — no seam, no separate node — point');
+  lines.push('at it anyway: the surface is cut out mechanically, and your box tells the cutter');
+  lines.push('where to start. Never name the whole shell as the part to avoid pointing.');
   lines.push('');
   lines.push('PARTS vocabulary — WHAT a part is, as opposed to how it moves. For every proposal');
   lines.push('also name the part with ONE word from this list:');
@@ -287,7 +291,7 @@ export function buildVisionPrompt({
   lines.push('');
   lines.push('Reply with JSON ONLY (no prose, no code fences): an array of at most 6 objects:');
   lines.push('[{ "op": "new|split|confirm", "targetId": "<existing id, for split/confirm only>",');
-  lines.push('   "type": "rotor|gimbal|hinge", "part": "<one word from the PARTS vocabulary, or null>",');
+  lines.push('   "type": "rotor|gimbal", "part": "<one word from the PARTS vocabulary, or null>",');
   lines.push('   "frameId": "<frame id>", "regionBox": [x0,y0,x1,y1], "regionColors": ["#rrggbb"],');
   lines.push('   "nodeIds": ["<only if we gave you names below>"],');
   lines.push('   "axis": [x,y,z], "anchor": [x,y,z],');
@@ -296,8 +300,8 @@ export function buildVisionPrompt({
   lines.push('   "suggestView": { "target": "what to look at", "reason": "why it would settle it" } }]');
   lines.push('');
   lines.push('Rules:');
-  lines.push('- The scene is Z-UP. A rotor\'s spin axis is usually [0,0,1]; a folding arm\'s');
-  lines.push('  hinge is usually horizontal. axis and anchor are in MODEL world units.');
+  lines.push('- The scene is Z-UP. A rotor\'s spin axis is usually [0,0,1]; a gimbal usually');
+  lines.push('  tilts about a horizontal axis. axis and anchor are in MODEL world units.');
   lines.push('- anchor is the point the part rotates ABOUT (a rotor hub, not a blade tip).');
   lines.push('- Report the MOVING GROUP, not one fastener: all blades of one propeller belong');
   lines.push('  to one rotor. Use several regionColors or a box around the whole hub.');

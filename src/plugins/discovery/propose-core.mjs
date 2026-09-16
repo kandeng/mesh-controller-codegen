@@ -90,6 +90,11 @@ export function createProposalGate({
   const warnings = [];
 
   const nodeNames = new Set((g?.nodes || []).map((n) => n.name));
+  // The snapshot above cannot see a CARVE: grounding registers the virtual
+  // node mid-reply, after this gate was created, so its name is missing here
+  // and the first carve proposal would die as "unknown nodes". g.names is the
+  // live vocabulary — registerCarve adds to it — so it is the fallback check.
+  const nodeKnown = (n) => nodeNames.has(n) || (g?.names instanceof Set && g.names.has(n));
   // The one place independence bites. A record a PERSON confirmed is off-limits
   // in every mode; a record another producer guessed is off-limits only when the
   // two producers are allowed to read each other's work.
@@ -146,7 +151,7 @@ export function createProposalGate({
 
     const nodes = names || p.nodeIds;
     if (!Array.isArray(nodes) || !nodes.length) return drop(idx, 'nodeIds missing/empty');
-    const unknown = nodes.filter((n) => !nodeNames.has(n));
+    const unknown = nodes.filter((n) => !nodeKnown(n));
     if (unknown.length) return drop(idx, `unknown nodes: ${unknown.join(', ')}`);
 
     const key = setKey(nodes);

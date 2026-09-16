@@ -76,8 +76,8 @@ console.log('\nProving the actuator dictionary + recognition gate\n');
     entries.every((a) => ACTUATOR_VOCABULARY.has(a.name))
     && ACTUATOR_VOCABULARY.size === new Set(entries.map((a) => a.name)).size);
   ok('D2: names normalize — case, spaces, dashes, and a plural rescued only into a real word',
-    normPartName('Doors') === 'door'
-    && normPartName('landing gear') === 'landing_gear'
+    normPartName('Wheels') === 'wheel'
+    && normPartName('track sprocket') === 'track_sprocket'
     && normPartName('MAIN_ROTOR') === 'main_rotor'
     && normPartName('flux-capacitor') === null
     && normPartName('') === null && normPartName(null) === null,
@@ -100,8 +100,9 @@ console.log('\nProving the actuator dictionary + recognition gate\n');
   ok('D3: a disagreement between the first look and the table is ANNOUNCED, not absorbed',
     rec.warnings.some((w) => /usually has 4 rotor/.test(w) && /first look said 2/.test(w)), J(rec.warnings));
   const gaps = expectationGap(exp, []);
-  ok('D3: the gap check falsifies the DICTIONARY count, not the model\'s run-to-run guess',
-    gaps.find((x) => x.type === 'rotor')?.expected === 4 && gaps.find((x) => x.type === 'hinge')?.expected === 8,
+  ok('D3: the gap check falsifies the DICTIONARY count, not the model\'s run-to-run guess — and a car expects no hinges',
+    gaps.find((x) => x.type === 'rotor')?.expected === 4 && gaps.find((x) => x.type === 'gimbal')?.expected === 4
+      && !gaps.some((x) => x.type === 'hinge'),
     J(gaps));
   ok('D3: a kind the model expected and the table does not list is still looked for',
     expectationGap({ instances: [{ type: 'hinge', count: 2 }], dictCounts: { rotor: 4 } }, [])
@@ -135,9 +136,9 @@ const [n1, n2, n3] = nodeNames;
   const good = run([{ ...base, nodeIds: [n1], part: 'rotor' }]);
   ok('D5: a valid part name lands on the record',
     good.records[0]?.part === 'rotor', J(good.warnings));
-  const plural = run([{ ...base, nodeIds: [n1], part: 'Doors' }]);
+  const plural = run([{ ...base, nodeIds: [n1], part: 'Wheels' }]);
   ok('D5: a plural with different case is rescued into the vocabulary word',
-    plural.records[0]?.part === 'door', J(plural.warnings));
+    plural.records[0]?.part === 'wheel', J(plural.warnings));
   const junk = run([{ ...base, nodeIds: [n1], part: 'flux-capacitor' }]);
   ok('D5: a name outside the vocabulary is NOT rescued — the record stays, unnamed, with a warning',
     junk.records[0] && junk.records[0].part === undefined
@@ -204,7 +205,7 @@ const [n1, n2, n3] = nodeNames;
   const discoveryReply = J([
     { op: 'new', type: 'rotor', part: 'rotor', nodeIds: [n1], axis: [0, 0, 1], anchor: [0, 0, 0], reasoning: 'spins at an arm tip' },
     { op: 'new', type: 'rotor', part: 'turret', nodeIds: [n2], axis: [0, 0, 1], anchor: [0, 0, 0], reasoning: 'a rotating collar' },
-    { op: 'new', type: 'hinge', nodeIds: [n3], axis: [1, 0, 0], anchor: [0, 0, 0], reasoning: 'a folding strut I cannot name' },
+    { op: 'new', type: 'gimbal', nodeIds: [n3], axis: [1, 0, 0], anchor: [0, 0, 0], reasoning: 'a tilting collar I cannot name' },
   ]);
   const res = await runVisionRound(g, [], [], {
     plan: () => bigPlan,

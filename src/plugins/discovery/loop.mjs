@@ -380,10 +380,27 @@ function laneDelta(base, after) {
 // reported on the agreed entry, never silently absorbed.
 export const OVERLAP_MERGE = 0.5;
 
+// Carve kin: a carve id overlaps its SOURCE node and nothing else. The patch
+// was cut out of the shell's surface, so a record claiming the shell and a
+// record claiming the patch are two hypotheses about ONE physical part — they
+// must reconcile (and a dictionary hint supersedes the shell) instead of
+// living side by side as a duplicate the isolation battery can never pass.
+// Two DIFFERENT carves of the same source are NOT kin: they are disjoint
+// surfaces (a front wheel patch and a rear wheel patch), and calling them a
+// duplicate would merge two parts that happen to share a donor shell.
+const CARVE_ID = /^(.*)#carve\d+$/;
+const carveKin = (a, b) => {
+  if (a === b) return true;
+  const ma = CARVE_ID.exec(a); const mb = CARVE_ID.exec(b);
+  if (ma && !mb) return ma[1] === b;
+  if (mb && !ma) return mb[1] === a;
+  return false;
+};
+
 function overlapWith(recordNodes, nodes) {
-  const have = new Set(recordNodes || []);
+  const have = (recordNodes || []).map(String);
   let shared = 0;
-  for (const n of nodes || []) if (have.has(n)) shared += 1;
+  for (const n of nodes || []) if (have.some((a) => carveKin(a, String(n)))) shared += 1;
   const min = Math.min((recordNodes || []).length, (nodes || []).length);
   return { shared, containment: min ? shared / min : 0 };
 }

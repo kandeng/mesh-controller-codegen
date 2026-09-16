@@ -33,16 +33,20 @@
 // motion is the IR's only vocabulary: rotor | gimbal | hinge (propose-core).
 // `soft` marks actuators a 3D model may fuse into the body or skip entirely
 // (lights, mirrors) — expected, but their absence is not a discovery failure.
+//
+// VEHICLES LIST NO HINGE-PANEL ACTUATORS. A hinge is an internal component
+// of an assembly, not a drivable actuator in its own right, and a panel's
+// scope (which nodes belong to the door/hood/wiper) is the most error-prone
+// grounding in the table — removing the class beats mis-scoping every run.
+// Working machines keep their hinge entries because those ARE what you
+// drive on them: a robot arm's elbow, an excavator's boom, an airplane's
+// control surfaces, a tank's gun barrel, a boat's rudder.
 export const DICTIONARY = {
   car: {
     match: ['car', 'sedan', 'coupe', 'sports car', 'sportscar', 'suv', 'hatchback', 'convertible', 'race car', 'racing car', 'supercar'],
     actuators: [
       { name: 'wheel', motion: 'rotor', count: 4, where: 'four corners of chassis', soft: false },
-      { name: 'door', motion: 'hinge', count: 4, where: 'sides of cabin', soft: false },
-      { name: 'hood', motion: 'hinge', count: 1, where: 'front of body', soft: false },
-      { name: 'trunk_lid', motion: 'hinge', count: 1, where: 'rear of body', soft: false },
       { name: 'mirror', motion: 'gimbal', count: 2, where: 'exterior sides of cabin', soft: true },
-      { name: 'wiper', motion: 'hinge', count: 2, where: 'base of windshield', soft: false },
       { name: 'headlight', motion: 'gimbal', count: 2, where: 'front fascia', soft: true },
     ],
   },
@@ -50,29 +54,21 @@ export const DICTIONARY = {
     match: ['truck', 'pickup', 'lorry', 'semi truck', 'box truck', 'van'],
     actuators: [
       { name: 'wheel', motion: 'rotor', count: 6, where: 'axles along chassis', soft: false },
-      { name: 'door', motion: 'hinge', count: 2, where: 'sides of cab', soft: false },
-      { name: 'hood', motion: 'hinge', count: 1, where: 'front of cab', soft: false },
       { name: 'mirror', motion: 'gimbal', count: 2, where: 'exterior sides of cab', soft: true },
-      { name: 'wiper', motion: 'hinge', count: 2, where: 'base of windshield', soft: false },
-      { name: 'tailgate', motion: 'hinge', count: 1, where: 'rear of cargo bed', soft: false },
     ],
   },
   bus: {
     match: ['bus', 'coach', 'minibus'],
     actuators: [
       { name: 'wheel', motion: 'rotor', count: 6, where: 'axles along chassis', soft: false },
-      { name: 'door', motion: 'hinge', count: 2, where: 'sides of body', soft: false },
       { name: 'mirror', motion: 'gimbal', count: 2, where: 'exterior front corners', soft: true },
-      { name: 'wiper', motion: 'hinge', count: 2, where: 'base of windshield', soft: false },
     ],
   },
   motorbike: {
     match: ['motorbike', 'motorcycle', 'scooter', 'moped', 'dirt bike'],
     actuators: [
       { name: 'wheel', motion: 'rotor', count: 2, where: 'front and rear forks', soft: false },
-      { name: 'handlebar', motion: 'hinge', count: 1, where: 'top of front fork', soft: false },
       { name: 'mirror', motion: 'gimbal', count: 2, where: 'ends of handlebars', soft: true },
-      { name: 'kickstand', motion: 'hinge', count: 1, where: 'lower left frame', soft: false },
     ],
   },
   bicycle: {
@@ -80,8 +76,6 @@ export const DICTIONARY = {
     actuators: [
       { name: 'wheel', motion: 'rotor', count: 2, where: 'front and rear forks', soft: false },
       { name: 'pedal', motion: 'rotor', count: 2, where: 'bottom bracket crank arms', soft: false },
-      { name: 'handlebar', motion: 'hinge', count: 1, where: 'top of steerer tube', soft: false },
-      { name: 'kickstand', motion: 'hinge', count: 1, where: 'lower left frame', soft: false },
     ],
   },
   'quadrotor-drone': {
@@ -96,8 +90,6 @@ export const DICTIONARY = {
     actuators: [
       { name: 'main_rotor', motion: 'rotor', count: 1, where: 'top of mast', soft: false },
       { name: 'tail_rotor', motion: 'rotor', count: 1, where: 'end of tail boom', soft: false },
-      { name: 'door', motion: 'hinge', count: 2, where: 'sides of cabin', soft: false },
-      { name: 'skid', motion: 'hinge', count: 2, where: 'under fuselage struts', soft: false },
     ],
   },
   airplane: {
@@ -108,8 +100,6 @@ export const DICTIONARY = {
       { name: 'elevator', motion: 'hinge', count: 2, where: 'trailing edge of tailplane', soft: false },
       { name: 'rudder', motion: 'hinge', count: 1, where: 'trailing edge of fin', soft: false },
       { name: 'flap', motion: 'hinge', count: 2, where: 'inner trailing wing edge', soft: false },
-      { name: 'landing_gear', motion: 'hinge', count: 3, where: 'belly and nose fuselage', soft: false },
-      { name: 'door', motion: 'hinge', count: 2, where: 'sides of fuselage', soft: false },
     ],
   },
   tank: {
@@ -118,7 +108,6 @@ export const DICTIONARY = {
       { name: 'track_sprocket', motion: 'rotor', count: 2, where: 'rear of track assemblies', soft: false },
       { name: 'turret', motion: 'rotor', count: 1, where: 'top of hull', soft: false },
       { name: 'gun_barrel', motion: 'hinge', count: 1, where: 'front of turret', soft: false },
-      { name: 'hatch', motion: 'hinge', count: 3, where: 'top of turret and hull', soft: false },
     ],
   },
   boat: {
@@ -126,8 +115,6 @@ export const DICTIONARY = {
     actuators: [
       { name: 'propeller', motion: 'rotor', count: 1, where: 'stern below waterline', soft: false },
       { name: 'rudder', motion: 'hinge', count: 1, where: 'stern behind propeller', soft: false },
-      { name: 'hatch', motion: 'hinge', count: 2, where: 'deck surface', soft: false },
-      { name: 'door', motion: 'hinge', count: 1, where: 'cabin side or stern', soft: false },
     ],
   },
   'robot-arm': {
@@ -148,7 +135,6 @@ export const DICTIONARY = {
       { name: 'boom', motion: 'hinge', count: 1, where: 'front of cab body', soft: false },
       { name: 'stick', motion: 'hinge', count: 1, where: 'end of boom arm', soft: false },
       { name: 'bucket', motion: 'hinge', count: 1, where: 'end of stick arm', soft: false },
-      { name: 'door', motion: 'hinge', count: 1, where: 'side of cab', soft: false },
     ],
   },
 };

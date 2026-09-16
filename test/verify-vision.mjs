@@ -403,7 +403,7 @@ const manifest = () => [rec()];
     })());
   ok('D: a node set already in the manifest is deduplicated',
     (() => {
-      const r = bad(J([{ op: 'new', type: 'hinge', nodeIds: [other, third], axis: [0, 0, 1] }]), manifest());
+      const r = bad(J([{ op: 'new', type: 'rotor', nodeIds: [other, third], axis: [0, 0, 1] }]), manifest());
       return r.records.length === 0 && r.warnings.some((w) => w.includes('duplicate'));
     })());
   ok('D: hallucinated node names are refused',
@@ -1690,7 +1690,8 @@ function makeFakes(replyOf) {
     exactSup.superseded.length === 1 && exactSup.superseded[0].match === 'exact' && exactSup.superseded[0].laneOnly.length === 0);
 
   // The round, fully faked: a car prior, five pointed boxes (four wheels and a
-  // door), and one extra the discovery turn finds on its own.
+  // door — the hinge no prompt offers any more, faked here to prove the gate
+  // refuses one that arrives anyway), and one extra the discovery turn finds.
   const sv10 = bigPlan.views.find((v) => v.spec?.kind === 'survey');
   const cam10 = sv10.cam;
   const frame10 = {
@@ -1719,6 +1720,9 @@ function makeFakes(replyOf) {
   ok('G10: fixture — six parts whose boxes ground to mutually disjoint node sets exist to point at',
     pointed.length === 6, pointed.map((p) => `${p.nm}:${p.nodes.length}n`).join(', '));
 
+  // The door entry stays a hinge on purpose: the dictionary no longer asks a
+  // car for one, so this is a stale model proposing it anyway — the gate must
+  // refuse it, and only the four wheels land as hints.
   const locReply = J(pointed.slice(0, 5).map((p, i) => ({
     op: 'new', type: i < 4 ? 'rotor' : 'hinge', part: i < 4 ? 'wheel' : 'door',
     frameId: frame10.id, regionBox: p.box,
@@ -1752,8 +1756,9 @@ function makeFakes(replyOf) {
   });
   ok('G10: a dictionary-backed prior runs the three turns in order — category, localization, discovery',
     J(turnsH) === '["category","localization","discovery"]', J(turnsH));
-  ok('G10: all five pointed parts land as candidates — four wheels and a door — plus the discovery turn\'s extra',
-    resh.ok === true && resh.added === 6 && resh.hinted === 5 && manh.length === 6,
+  ok('G10: the four wheels land as hints and the door\'s hinge is REFUSED, announced — plus the discovery turn\'s extra',
+    resh.ok === true && resh.added === 5 && resh.hinted === 4 && manh.length === 5
+    && resh.warnings.some((w) => /is a hinge/.test(w)),
     J({ added: resh.added, hinted: resh.hinted, manifest: manh.length, w: resh.warnings.slice(0, 2) }));
   const wheels = manh.filter((r) => r.part === 'wheel');
   ok('G10: the four wheels are FOUR records — one entry per instance, never one box around all four',
@@ -1764,12 +1769,9 @@ function makeFakes(replyOf) {
     wheels.every((r, i) => (r.nodes || []).includes(pointed[i].nm)),
     J(manh.map((r) => `${r.id}:${(r.nodes || []).length}n`)));
   const door = manh.find((r) => r.part === 'door');
-  ok('G10: the hinge box grounds to the door\'s own nodes only — the pointed part, none of the wheels, capped tight',
-    !!door && door.type === 'hinge' && door.hinted === true
-    && door.nodes.includes(pointed[4].nm)
-    && pointed.slice(0, 4).every((p) => !door.nodes.includes(p.nm))
-    && door.nodes.length <= 8,
-    J(door?.nodes));
+  ok('G10: the hinge box mints NO record and is never grounded — a type refusal at the gate, not a grounding failure',
+    !door && resh.warnings.some((w) => /proposal\[4\] is a hinge/.test(w)),
+    J({ door: door?.id, records: manh.map((r) => `${r.id}:${r.part ?? '?'}:${r.type}`) }));
   ok('G10: a hint whose cloud yields no axis lands anyway, with the gap announced (the steered-wheel case)',
     manh.filter((r) => r.hinted).every((r) => r.axis !== null
       || (r.uncertainties || []).some((u) => u.includes('no axis'))),
@@ -1781,7 +1783,7 @@ function makeFakes(replyOf) {
     manh.every((r) => (r.tests || []).find((t) => t.name === 'isolation')?.pass === true),
     J(manh.map((r) => (r.tests || []).find((t) => t.name === 'isolation')?.detail).filter(Boolean)));
   ok('G10: the recognition gate lists the hints as EXPECTED parts of a car',
-    resh.recognition?.dict === 'car' && resh.recognition?.listed === 6
+    resh.recognition?.dict === 'car' && resh.recognition?.listed === 5
     && manh.filter((r) => r.hinted).every((r) => r.listed === true && r.expected === true && r.extra === false),
     J(resh.recognition && { dict: resh.recognition.dict, listed: resh.recognition.listed }));
   ok('G10: ...and the extra the discovery turn found is still gated — listed, flagged, announced',
@@ -1795,14 +1797,14 @@ function makeFakes(replyOf) {
     && resh.gaps.find((x) => x.type === 'rotor')?.missing === 0
     && resh.gaps.find((x) => x.type === 'rotor')?.surplus === 1,
     J(resh.gaps));
-  ok('G10: the parts nobody pointed at stay missing — the ask list is a falsifiable count, not a rubber stamp',
-    resh.gaps?.find((x) => x.type === 'hinge')?.missing === 7
+  ok('G10: the parts nobody pointed at stay missing — and a car is no longer expected to HAVE hinges at all',
+    !resh.gaps?.some((x) => x.type === 'hinge')
     && resh.gaps?.find((x) => x.type === 'gimbal')?.missing === 4,
     J(resh.gaps));
   const locBeat = beatsH.find((b) => b.kind === 'vision:localize');
   ok('G10: the localization beat carries the dictionary key, the ask count and the landed hints',
-    !!locBeat && locBeat.payload.dictKey === 'car' && locBeat.payload.asked === 16
-    && (locBeat.payload.hints || []).length === 5 && !!locBeat.payload.prompt && !!locBeat.payload.reply,
+    !!locBeat && locBeat.payload.dictKey === 'car' && locBeat.payload.asked === 8
+    && (locBeat.payload.hints || []).length === 4 && !!locBeat.payload.prompt && !!locBeat.payload.reply,
     J(locBeat?.payload && { dictKey: locBeat.payload.dictKey, asked: locBeat.payload.asked, hints: locBeat.payload.hints?.length }));
   const verdictBeatH = beatsH.find((b) => b.kind === 'vision:verdict');
   ok('G10: the verdict beat reports no supersession when the manifest held nothing the hints overlap',
