@@ -13,6 +13,89 @@ import { NodeIO } from '@gltf-transform/core';
 
 const io = new NodeIO();
 
+// ---- lazy geometry decode (carving) ------------------------------------------
+// The parse table keeps only accessor min/max — enough for bboxes, not for
+// cutting a pointed-at surface patch out of a fused shell. Geometry is decoded
+// LAZILY: the raw container stays alive in a closure, and a mesh's
+// POSITION/indices are read out of the buffer on first request and cached. A
+// run that never carves pays nothing; a file whose buffer cannot be resolved
+// (an external .bin) simply has no geometry — readGeometry returns null and
+// carving degrades to the whole-node fallback rather than failing the parse.
+
+const CT_SIZE = { 5120: 1, 5121: 1, 5122: 2, 5123: 2, 5125: 4, 5126: 4 };
+const TYPE_N = { SCALAR: 1, VEC2: 2, VEC3: 3, VEC4: 4, MAT2: 4, MAT3: 9, MAT4: 16 };
+
+// Resolve glTF `buffers[]` entries to bytes. Two sources are supported:
+//   GLB    the BIN chunk — 12B container header, JSON chunk (8B header + clen
+//          bytes), then the BIN chunk's 8B header: data at 20 + clen + 8.
+//   data:  a base64 data URI, the embedding a text .gltf actually uses.
+// An EXTERNAL .bin is deliberately not followed (this parser has no resolved
+// path context for it); the resolver yields null and geometry stays unavailable.
+function bufferResolver(raw, g) {
+  const cache = new Map();
+  const isGlb = raw.length >= 20 && raw.readUInt32LE(0) === 0x46546c67;
+  return (bi) => {
+    const key = bi ?? 0;
+    if (cache.has(key)) return cache.get(key);
+    let out = null;
+    const decl = (g.buffers || [])[key] || {};
+    if (isGlb && decl.uri == null) {
+      try {
+        const clen = raw.readUInt32LE(12);
+        const head = 20 + clen;
+        if (head + 8 <= raw.length && raw.readUInt32LE(head + 4) === 0x004e4942) {
+          const blen = raw.readUInt32LE(head);
+          const off = head + 8;
+          out = new Uint8Array(raw.buffer, raw.byteOffset + off, Math.min(blen, raw.length - off));
+        }
+      } catch { out = null; }
+    } else if (typeof decl.uri === 'string' && decl.uri.startsWith('data:')) {
+      try {
+        const b = Buffer.from(decl.uri.slice(decl.uri.indexOf(',') + 1), 'base64');
+        out = new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
+      } catch { out = null; }
+    }
+    cache.set(key, out);
+    return out;
+  };
+}
+
+// One accessor -> typed array, honoring an interleaved bufferView's byteStride.
+// Only the component types carving consumes are read: float attributes and
+// ubyte/ushort/uint indices. Anything else (normalized, quantized, sparse)
+// returns null — the caller skips that primitive rather than misreading it.
+function readAccessorArray(g, binFor, ai) {
+  const a = (g.accessors || [])[ai];
+  if (!a || a.bufferView == null || a.sparse) return null;
+  const bv = (g.bufferViews || [])[a.bufferView];
+  if (!bv) return null;
+  const bin = binFor(bv.buffer ?? 0);
+  if (!bin) return null;
+  const n = TYPE_N[a.type] || 0;
+  const cs = CT_SIZE[a.componentType] || 0;
+  if (!n || !cs || !a.count) return null;
+  const Ctor = a.componentType === 5126 ? Float32Array
+    : a.componentType === 5125 ? Uint32Array
+      : a.componentType === 5123 ? Uint16Array
+        : a.componentType === 5121 ? Uint8Array
+          : null;
+  if (!Ctor) return null;
+  const read = a.componentType === 5126 ? 'getFloat32'
+    : a.componentType === 5125 ? 'getUint32'
+      : a.componentType === 5123 ? 'getUint16' : 'getUint8';
+  const stride = bv.byteStride || n * cs;
+  const base = (bv.byteOffset || 0) + (a.byteOffset || 0);
+  // A truncated buffer must not become a crash — refuse the accessor.
+  if (base + (a.count - 1) * stride + n * cs > bin.length) return null;
+  const dv = new DataView(bin.buffer, bin.byteOffset, bin.byteLength);
+  const out = new Ctor(a.count * n);
+  for (let i = 0; i < a.count; i++) {
+    const o = base + i * stride;
+    for (let k = 0; k < n; k++) out[i * n + k] = dv[read](o + k * cs, true);
+  }
+  return out;
+}
+
 // Async because the library's binaryToJSON is Promise-based (v4.5.0).
 export async function extractGltfJson(raw) {
   if (raw.length < 20 || raw.readUInt32LE(0) !== 0x46546c67) {
@@ -46,6 +129,54 @@ export async function parseGlb(path) {
   nodes.forEach((n, i) => (n.children || []).forEach((c) => { parent[c] = i; }));
   const meshes = g.meshes || [];
   const accs = g.accessors || [];
+
+  // Triangle soup per mesh, decoded on first ask and cached. The closure keeps
+  // `raw` alive — the whole container is the price of never re-reading it.
+  // Primitives are MERGED into one soup (indices re-based), because carving
+  // thinks in surfaces, not in draw calls; non-triangle primitives (points,
+  // lines) and non-float POSITIONs are skipped.
+  const binFor = bufferResolver(raw, g);
+  const geomCache = new Map();
+  const readGeometry = (mi) => {
+    if (geomCache.has(mi)) return geomCache.get(mi);
+    let out = null;
+    const mesh = meshes[mi];
+    if (mesh) {
+      const posParts = []; const idxParts = [];
+      let nv = 0; let ni = 0;
+      for (const p of mesh.primitives || []) {
+        if ((p.mode ?? 4) !== 4) continue;
+        const pa = (p.attributes || {}).POSITION;
+        if (pa == null) continue;
+        const pos = readAccessorArray(g, binFor, pa);
+        if (!(pos instanceof Float32Array)) continue;
+        const verts = pos.length / 3;
+        let tri;
+        if (p.indices != null) {
+          const idx = readAccessorArray(g, binFor, p.indices);
+          // A half-read primitive would corrupt the soup — skip it whole.
+          if (!idx) continue;
+          tri = new Uint32Array(idx.length);
+          for (let k = 0; k < idx.length; k++) tri[k] = idx[k] + nv;
+        } else {
+          tri = new Uint32Array(verts); // non-indexed -> sequential index
+          for (let k = 0; k < verts; k++) tri[k] = nv + k;
+        }
+        posParts.push(pos); idxParts.push(tri);
+        nv += verts; ni += tri.length;
+      }
+      if (nv) {
+        const positions = new Float32Array(nv * 3);
+        const index = new Uint32Array(ni);
+        let vo = 0; let io = 0;
+        for (const c of posParts) { positions.set(c, vo); vo += c.length; }
+        for (const c of idxParts) { index.set(c, io); io += c.length; }
+        out = { positions, index };
+      }
+    }
+    geomCache.set(mi, out);
+    return out;
+  };
 
   // Local XY extent of this node's OWN mesh (blade vs hub hint). Deliberately NOT
   // the subtree's: a container's extent is inherited from its placed world box
@@ -119,6 +250,7 @@ export async function parseGlb(path) {
       s,
       lm: Array.isArray(n.matrix) && n.matrix.length === 16 ? n.matrix : null, // matrix-form local transform
       mesh: n.mesh != null,
+      mi: n.mesh != null ? n.mesh : null, // mesh INDEX — readGeometry's key
       ext: xyExtent(i),
       box: subtreeBox(i),
     };
@@ -336,6 +468,8 @@ export async function parseGlb(path) {
     count: nodes.length,
     animations: (g.animations || []).length,
     parser,
+    readGeometry,
+    carves: [], // the carve registry — registerCarve (discovery/carve.mjs) appends
   };
 }
 
