@@ -22,6 +22,7 @@ import { buildProposalPrompt } from './context.mjs';
 import { aiPropose } from './ai-propose.mjs';
 import { MAX_VISION_FRAMES, buildVisionPrompt, strictSchemaReminder } from './vision-prompt.mjs';
 import { HINT_GATE_PROFILE, visionPropose } from './vision-propose.mjs';
+import { auditScope } from './scope-audit.mjs';
 import { buildLocalizationPrompt } from './localize.mjs';
 import {
   buildExpectationPrompt, expectationBrief, expectationGap, expectationIsUsable,
@@ -794,6 +795,14 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
     // as a claim on the parts. Two producers agreeing then reconciles into one
     // record instead of one dropped proposal.
     independent = false,
+    // SCOPE AUDIT (the user's rule 2): after geometry carves each dictionary-
+    // named part, LOOK at the cut — solo-render the scope and ask the model
+    // whether everything in it really is that part, and on objection identify
+    // and drop the one impostor node. On by default; it can only fire when a
+    // capture AND a propose effect are wired and a record carries a dictionary
+    // part name, so a headless or geometry-only caller is unaffected. Switch it
+    // off to get the exact pre-audit round.
+    scopeAudit: wantScopeAudit = true,
     // STAGED DISCOVERY seam: stop after step 5 and hand back the round's
     // PROPOSALS — grounded, but not yet judged. The orchestrator lists them as
     // candidates immediately and lets the battery score each joint later, at a
@@ -1274,6 +1283,56 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
       nodes: (r.nodes || []).slice(0, 12),
     })),
   });
+
+  // 5b. SCOPE AUDIT — the eye that inspects the cut (the user's rule 2) -------
+  //
+  // Geometry carved each scope above and kept every node whose box landed
+  // inside the pointed box — correct, but purely geometric: a wheel-face disc
+  // authored at the hub is inside any truthful wheel box, so it survives every
+  // prune and the highlight later shows a skull where a wheel hub should be.
+  // Nothing downstream LOOKS at the cut. This step does, once per dictionary-
+  // named joint, and never carves: it solo-renders the scope, asks the model if
+  // everything in it is really that part, and only on objection identifies the
+  // one impostor node and drops it — a deterministic node removal, announced as
+  // an uncertainty. A record with no dictionary part name has no word to audit
+  // against and is skipped, so a drone's unnamed rotors never pay for this.
+  if (wantScopeAudit && typeof capture === 'function' && typeof propose === 'function') {
+    const viewFor = (frameId) => {
+      const frame = (captured || []).find((f) => f?.id && String(f.id) === String(frameId)) || null;
+      if (!frame) return null;
+      // Reuse the EXACT plan view the box was pointed in when it is still to
+      // hand (it carries the fov/spec the frame was drawn with); otherwise
+      // synthesise one from the frame's own pose, which is all a solo re-render
+      // needs.
+      const planned = (plan?.views || []).find((v) => v.id === (frame.viewId || frame.id)) || null;
+      if (planned?.pose) return planned;
+      return frame.pose ? { id: frame.viewId || frame.id, pose: frame.pose, spec: frame.spec || null } : null;
+    };
+    for (const rec of parsed.records) {
+      if (typeof abort === 'function' && abort()) {
+        warnings.push('scope audit: the project changed mid-audit — the remaining scopes were left as carved');
+        break;
+      }
+      if (!rec?.part || (rec.nodes || []).length < 2) continue;
+      const view = viewFor(rec.frameId);
+      if (!view) {
+        warnings.push(`scope audit: ${rec.id} has no camera pose to re-render its scope from — left as carved`);
+        continue;
+      }
+      const res = await auditScope(rec, { capture, propose, view, emit: say, persist });
+      warnings.push(...res.warnings);
+      if (res.dropped && res.dropped.length) {
+        const drop = new Set(res.dropped);
+        rec.nodes = (rec.nodes || []).filter((n) => !drop.has(String(n)));
+        const note = `scope audit dropped ${res.dropped.join(', ')} — the vision model named ${res.foreign.map((f) => `"${f}"`).join(', ')} inside the carved ${rec.part} and identified this node as it, not part of the ${rec.part}`;
+        rec.uncertainties = [...(rec.uncertainties || []), note];
+        rec.history = [...(rec.history || []), {
+          at: new Date().toISOString(), event: 'scope-audit',
+          note: `dropped ${res.dropped.join(', ')} from the ${rec.part} scope (the model named ${res.foreign.join(', ')})`,
+        }];
+      }
+    }
+  }
 
   const survivors = new Set(parsed.admitted.map((a) => a.index));
   const rejected = parsed.grounded

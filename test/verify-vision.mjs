@@ -63,6 +63,10 @@ import {
   MAX_INSTANCE_COUNT, parseExpectation, surveyPhotos, verifiedInstances,
 } from '../src/plugins/discovery/expectation.mjs';
 import { isLocalizationPrompt } from '../src/plugins/discovery/localize.mjs';
+import {
+  auditScope, buildMemberAuditPrompt, buildScopeAuditPrompt, isScopeAuditPrompt,
+  MIN_AUDIT_NODES, parseMemberAudit, parseScopeAudit,
+} from '../src/plugins/discovery/scope-audit.mjs';
 import { regionsFromExpectations } from '../src/plugins/discovery/grounding.mjs';
 import { frameKey } from '../src/plugins/discovery/observations.mjs';
 // The serializer that stands between a merged record and the browser. Importing
@@ -1808,16 +1812,22 @@ function makeFakes(replyOf) {
   const resh = await runVisionRound(g, jh, manh, {
     plan: fh.plan, capture: fh.capture, persist: fh.persist,
     propose: async (text) => {
-      const kind = isExpectationPrompt(text) ? 'category' : isLocalizationPrompt(text) ? 'localization' : 'discovery';
+      const kind = isExpectationPrompt(text) ? 'category'
+        : isLocalizationPrompt(text) ? 'localization'
+          : isScopeAuditPrompt(text) ? 'audit' : 'discovery';
       turnsH.push(kind);
       if (kind === 'category') return { reply: carReply, model: 'fake-vlm', ms: 3 };
       if (kind === 'localization') return { reply: locReply, model: 'fake-vlm', ms: 4 };
+      // A clean audit: every carved scope passes, so nothing is dropped and the
+      // membership assertions below measure exactly what geometry carved.
+      if (kind === 'audit') return { reply: '{"allPart": true, "notPart": []}', model: 'fake-vlm', ms: 2 };
       return { reply: extraReply, model: 'fake-vlm', ms: 4 };
     },
     expectation: true, emit: (kind, payload) => beatsH.push({ kind, payload }),
   });
-  ok('G10: a dictionary-backed prior runs the three turns in order — category, localization, discovery',
-    J(turnsH) === '["category","localization","discovery"]', J(turnsH));
+  ok('G10: a dictionary-backed prior runs the three turns in order — category, localization, discovery — then audits each carved scope',
+    J(turnsH.slice(0, 3)) === '["category","localization","discovery"]'
+      && turnsH.length > 3 && turnsH.slice(3).every((k) => k === 'audit'), J(turnsH));
   ok('G10: the four wheels and the door land as hints, the stale hinge is REFUSED, announced — plus the discovery turn\'s extra',
     resh.ok === true && resh.added === 6 && resh.hinted === 5 && manh.length === 6
     && resh.warnings.some((w) => /is a hinge/.test(w)),
@@ -1827,6 +1837,9 @@ function makeFakes(replyOf) {
     wheels.length === 4 && wheels.every((r) => r.hinted === true && r.origin === 'expectation-hint'
       && r.type === 'rotor' && (r.evidence || []).includes('dictionary:car')),
     J(wheels.map((r) => r.id)));
+  ok('G10: a wheel hint is NAMED by the dictionary part — "wheel (expectation hint)", never the motion word "rotor"',
+    wheels.every((r) => r.label === 'wheel (expectation hint)'),
+    J(wheels.map((r) => r.label)));
   ok('G10: every wheel hint grounds to the part it was pointed at',
     wheels.every((r, i) => (r.nodes || []).includes(pointed[i].nm)),
     J(manh.map((r) => `${r.id}:${(r.nodes || []).length}n`)));
@@ -1835,6 +1848,8 @@ function makeFakes(replyOf) {
     !!door && door.type === 'gimbal' && door.hinted === true && door.origin === 'expectation-hint'
     && (door.nodes || []).includes(pointed[4].nm) && (door.evidence || []).includes('dictionary:car'),
     J(door && { id: door.id, type: door.type, nodes: (door.nodes || []).length }));
+  ok('G10: ...and its CHIP reads "door (expectation hint)" — the dictionary NAME, not the motion word "gimbal"',
+    !!door && door.label === 'door (expectation hint)', J(door && door.label));
   ok('G10: ...and the SAME part in the stale hinge word mints no record and is never grounded — a type refusal at the gate, not a grounding failure',
     resh.warnings.some((w) => /proposal\[5\] is a hinge/.test(w)) && manh.filter((r) => r.part === 'door').length === 1,
     J({ records: manh.map((r) => `${r.id}:${r.part ?? '?'}:${r.type}`) }));
@@ -2374,6 +2389,122 @@ const wire = (f) => ({ plan: f.plan, capture: f.capture, propose: f.propose, per
     askedRounds.join() === '0,1' && replayed(0) === 0 && replayed(1) === 0
       && res2.roundCount === 2 && res2.frames === 2,
     `preset asked for rounds ${askedRounds.join(',')}; ${replayed(0) + replayed(1)} captures`);
+}
+
+// ---- K) the SCOPE AUDIT — the eye that inspects the cut ----------------------
+//
+// Geometry carves; this step only LOOKS. It solo-renders a carved scope, asks
+// the model if everything in it really is the named part, and on objection
+// identifies and drops the one impostor node. The marussia's front-left wheel
+// carried a skull-face disc (`rim_wheeldark_0`) that every geometric prune
+// correctly kept — these pins prove the audit names it and drops it, and that a
+// clean scope is left untouched for the cost of exactly ONE model call.
+{
+  const auditView = { id: 'p0', pose: { eye: [0, -8, 2], target: [0, 0, 0] }, spec: null };
+  const frame = (id) => ({ id, mode: 'solo', mediaType: 'image/png', dataBase64: PNG });
+
+  // Prompt builders are pure and self-describing.
+  const p2 = buildScopeAuditPrompt({ part: 'wheel', frame: frame('scope') });
+  ok('K: the step-2 prompt carries the audit mark and the dictionary part word',
+    isScopeAuditPrompt(p2.text) && /exactly ONE wheel/.test(p2.text) && p2.images.length === 1);
+  ok('K: the step-2 prompt asks the model to NAME anything that is not the part',
+    /is everything in this picture part of a single wheel/i.test(p2.text) && /notPart/.test(p2.text));
+  ok('K: the step-2 prompt refuses to build with no solo render to show',
+    buildScopeAuditPrompt({ part: 'wheel', frame: null }).text === null);
+
+  // A clean scope and an objection parse apart; an unreadable reply is NOT an
+  // objection (it leaves the scope as carved) and NOT a silent clean bill.
+  const clean = parseScopeAudit('{"allPart": true, "notPart": []}');
+  ok('K: a clean step-2 reply reads as clean with nothing foreign', clean.clean === true && clean.foreign.length === 0);
+  const obj = parseScopeAudit('```json\n{"allPart": false, "notPart": ["a skull"]}\n```');
+  ok('K: an objecting step-2 reply carries the plain-word foreign name',
+    obj.clean === false && J(obj.foreign) === J(['a skull']));
+  const bad = parseScopeAudit('it looks like a wheel to me');
+  ok('K: an unreadable step-2 reply is left as carved (clean) but WARNS, never silently passes',
+    bad.clean === true && bad.warnings.length === 1);
+
+  // Step 3 shows PICTURE NUMBERS only — it must never leak our node names, which
+  // the model does not know and could mistype.
+  const members = [
+    { name: 'tire_tire_mat_0', frame: frame('m1') },
+    { name: 'rim_wheeldark_0', frame: frame('m2') },
+    { name: 'rim_wheellight_0', frame: frame('m3') },
+  ];
+  const p3 = buildMemberAuditPrompt({ part: 'wheel', foreign: 'a skull', members });
+  ok('K: the step-3 prompt attaches one picture per member and asks for a NUMBER',
+    p3.images.length === 3 && /which picture is the "a skull"/i.test(p3.text) && /impostor/.test(p3.text));
+  ok('K: the step-3 prompt NEVER leaks a mesh/node name to the model',
+    !p3.text.includes('rim_wheeldark_0') && !p3.text.includes('tire_tire_mat_0'));
+
+  const names = members.map((m) => m.name);
+  ok('K: a step-3 pick maps the picture number back to the right node',
+    parseMemberAudit('{"impostor": 2}', names).impostor === 'rim_wheeldark_0');
+  ok('K: a step-3 "0" (could not isolate) drops nothing',
+    parseMemberAudit('{"impostor": 0}', names).impostor === null);
+  ok('K: an out-of-range step-3 pick drops nothing rather than guessing',
+    parseMemberAudit('{"impostor": 9}', names).impostor === null
+      && parseMemberAudit('nonsense', names).impostor === null);
+
+  // The orchestrator: a CLEAN scope costs exactly one model call and drops nothing.
+  {
+    const asked = [];
+    const res = await auditScope(
+      { id: 'wheel_hint_1', part: 'wheel', nodes: ['tire_tire_mat_0', 'rim_wheellight_0'] },
+      {
+        capture: async (v, mode, focus) => frame(`solo_${(focus || []).join('+')}`),
+        propose: async (text) => { asked.push(text); return { reply: '{"allPart": true, "notPart": []}', model: 'fake' }; },
+        view: auditView,
+      },
+    );
+    ok('K: a clean scope is audited, drops nothing, and costs exactly ONE model call',
+      res.audited === true && res.clean === true && res.dropped.length === 0 && asked.length === 1,
+      `${asked.length} call(s)`);
+  }
+
+  // The ORCHESTRATED OBJECTION: step 2 names a skull, step 3 picks the disc, the
+  // impostor node is dropped — the exact marussia front-left-wheel case.
+  {
+    const asked = [];
+    let step = 0;
+    const res = await auditScope(
+      { id: 'wheel_hint_0', part: 'wheel', nodes: ['tire_tire_mat_0', 'rim_wheeldark_0', 'rim_wheellight_0', 'brake_Material #149_0'] },
+      {
+        capture: async (v, mode, focus) => frame(`solo_${(focus || []).join('+')}`),
+        propose: async (text) => {
+          asked.push(text); step += 1;
+          return step === 1
+            ? { reply: '{"allPart": false, "notPart": ["a skull"]}', model: 'fake' }
+            : { reply: '{"impostor": 2}', model: 'fake' };
+        },
+        view: auditView,
+      },
+    );
+    ok('K: an objected scope drops EXACTLY the impostor node the model identified',
+      res.audited === true && res.clean === false && J(res.dropped) === J(['rim_wheeldark_0']),
+      J(res.dropped));
+    ok('K: the objection costs one step-2 call plus one step-3 call (members render together)',
+      asked.length === 2 && isScopeAuditPrompt(asked[0]) && isScopeAuditPrompt(asked[1]), `${asked.length} calls`);
+    ok('K: the drop is announced as the foreign thing the model named',
+      res.foreign.length === 1 && res.foreign[0] === 'a skull');
+  }
+
+  // Guard rails: no dictionary name, and a one-node scope, are never dropped from.
+  ok('K: a record with no dictionary part name is never audited',
+    (await auditScope({ id: 'rotor_0', nodes: ['a', 'b'] }, {
+      capture: async () => frame('x'), propose: async () => ({ reply: '{"allPart":false,"notPart":["x"]}' }), view: auditView,
+    })).audited === false);
+  {
+    const res = await auditScope(
+      { id: 'mirror_hint_9', part: 'mirror', nodes: ['Door_L_Glass Mirror_0'] },
+      {
+        capture: async () => frame('x'),
+        propose: async () => ({ reply: '{"allPart": false, "notPart": ["a window"]}' }),
+        view: auditView,
+      },
+    );
+    ok('K: a one-node scope records the objection as doubt but drops nothing (never empties the joint)',
+      res.audited === true && res.clean === false && res.dropped.length === 0 && MIN_AUDIT_NODES === 2);
+  }
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);
