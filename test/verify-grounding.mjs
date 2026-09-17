@@ -283,5 +283,51 @@ const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed
     (() => { const e = groundRegion({}); return e.names.length === 0 && e.source === 'none' && e.agreement.verdict === 'empty'; })());
 }
 
-console.log(`\n${fail === 0 ? 'GROUNDING_PROBE_OK' : 'GROUNDING_PROBE_FAILED'} \u2014 ${pass} passed, ${fail} failed\n`);
+// ---- F) the marussia sliver-behind scope guard -------------------------------
+// The audit case (rule 2): a wheel box on car_marussia_b1 pulled in parts that sit
+// BEHIND the pointed wheel yet share a sliver of the box — the headlight cluster,
+// the rear differential. INSIDE/REL/DEPTH cannot drop them: a baked-origin bbox
+// inflates a candidate's half-diagonal, which WIDENS the depth band enough to let
+// a background part through. So a fourth rule prunes a candidate that is BOTH a
+// sliver of the box AND beyond the subject's OWN view-axis thickness (rectOf dz).
+// A small mate at the subject's depth — a brake fragment in front — is kept: the
+// guard strips background, never the assembly the model actually pointed at.
+{
+  const MAR = '/home/robot/drone-navigation-v2/client/assets/mesh/car_marussia_b1.glb';
+  const mg = await parseGlb(MAR);
+  const mnamed = namedIndex(mg);
+  const mplan = planViews(mg, { maxViews: 4, survey: 0 });
+  const tire = mg.nodes.find((n) => (mnamed.get(n.i) || n.name) === 'tire001_tire_mat_0');
+  // Deterministic: the first planned view whose exact tire box grounds AND where a
+  // behind-part is pruned as a sliver (the guard fires). planViews is pure, so this
+  // is the same view every run.
+  let pick = null;
+  if (tire) {
+    for (const v of mplan.views) {
+      const cam = makeCamera(v.pose.eye, v.pose.target);
+      const r = rectOf(nodeBox(tire), cam);
+      if (!r || r.area < 400) continue;
+      const res = boxToNodes([r.x0 / cam.w, r.y0 / cam.h, r.x1 / cam.w, r.y1 / cam.h], v, mg, { carver: null });
+      if (res.pruned.some((p) => /sliver behind/.test(p.why))) { pick = { v, res }; break; }
+    }
+  }
+  ok('F: a wheel box on the marussia grounds, and the sliver-behind guard fires',
+    !!pick, pick ? `view ${pick.v.id}` : 'no planned view reproduced the sliver case');
+  if (pick) {
+    const kept = pick.res.candidates.map((c) => c.name);
+    ok('F: the carved wheel scope is WHEEL-ONLY — no body, differential or light leaks in',
+      kept.length > 0 && kept.every((nm) => /tire|rim|brake|wheel/i.test(nm)),
+      kept.join(', '));
+    const sliver = pick.res.pruned.find((p) => /sliver behind/.test(p.why));
+    ok('F: the behind-part is pruned WITH the sliver reason, legible for audit',
+      !!sliver && /fill=/.test(sliver.why) && /behind/.test(sliver.why),
+      `${sliver?.name}: ${sliver?.why}`);
+    const mate = pick.res.candidates.find((c) => /brake\d+_Material #149/.test(c.name));
+    ok('F: a small mate at the subject\'s depth survives — the guard strips background, not the assembly',
+      !!mate && mate.fill < 0.15,
+      mate ? `${mate.name} fill=${mate.fill.toFixed(2)} (a sliver, but IN FRONT — kept)` : 'no small mate in this scope');
+  }
+}
+
+console.log(`\n${fail === 0 ? 'GROUNDING_PROBE_OK' : 'GROUNDING_PROBE_FAILED'} — ${pass} passed, ${fail} failed\n`);
 process.exit(fail === 0 ? 0 : 1);

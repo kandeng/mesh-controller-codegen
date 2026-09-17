@@ -180,6 +180,13 @@ export function normPartName(v) {
   if (!s) return null;
   if (ACTUATOR_VOCABULARY.has(s)) return s;
   if (s.endsWith('s') && ACTUATOR_VOCABULARY.has(s.slice(0, -1))) return s.slice(0, -1);
+  // A phrase the model wrote despite the VERBATIM rule ("wheel 1 of 4",
+  // "front wheel"): rescued only when EXACTLY ONE vocabulary word appears in it
+  // as a whole word. Two different vocabulary words ("door mirror") are an
+  // ambiguous answer, and an ambiguous name is worse than no name — the record
+  // then reads as UNRECOGNIZED to the listing gate instead of wearing a guess.
+  const hits = [...new Set(s.split('_').filter((w) => ACTUATOR_VOCABULARY.has(w)))];
+  if (hits.length === 1) return hits[0];
   return null;
 }
 

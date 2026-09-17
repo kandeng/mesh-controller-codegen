@@ -96,6 +96,17 @@ console.log('\nProving the actuator dictionary + recognition gate\n');
     `bus -> ${J(normPartName('bus'))} (a plural rule that fired here would mangle it)`);
   ok('D2: a word ending in s that is NOT a plural of a vocabulary word is left alone',
     normPartName('bus') === null && normPartName('glass') === null);
+  // The model is told to write the part name VERBATIM, but it still narrates
+  // ("wheel 1 of 4", "front left wheel"). A phrase is rescued only when EXACTLY
+  // ONE vocabulary word appears in it — a lone legal name worn as a chip, never
+  // a guess stitched from two.
+  ok('D2: a phrase carrying exactly ONE vocabulary word is rescued to that word',
+    normPartName('wheel 1 of 4') === 'wheel' && normPartName('front left wheel') === 'wheel'
+    && normPartName('Wheels') === 'wheel',
+    `"wheel 1 of 4" -> ${J(normPartName('wheel 1 of 4'))}, "front left wheel" -> ${J(normPartName('front left wheel'))}`);
+  ok('D2: a phrase carrying TWO vocabulary words is ambiguous and stays unnamed, not guessed',
+    normPartName('door mirror') === null && normPartName('headlight and mirror') === null,
+    `"door mirror" -> ${J(normPartName('door mirror'))}`);
 }
 
 // ---- D3) reconciliation drives the counts -------------------------------------

@@ -16,6 +16,7 @@
 //   - id allocation must see the ids already taken, or they collide
 // So a producer creates one gate per reply and drives it proposal by proposal.
 import { claimedNodeSet } from './manifest.mjs';
+import { normPartName } from './actuator-dictionary.mjs';
 
 export const OPS = new Set(['new', 'split', 'merge', 'confirm']);
 export const TYPES = new Set(['rotor', 'gimbal', 'hinge']);
@@ -252,7 +253,11 @@ export function createProposalGate({
     const extraEv = Array.isArray(extra?.evidence) ? extra.evidence.map((e) => String(e).slice(0, 160)) : [];
     records.push({
       id,
-      label: label(p.type),
+      // The human-readable NAME is the dictionary's part name when the proposal
+      // carries one — "wheel (expectation hint)", never "rotor (expectation
+      // hint)": the motion type is the controller's vocabulary, the part name
+      // (actuator-dictionary.json actuators[].name) is the machine's.
+      label: label(normPartName(p.part) || p.type),
       type: p.type,
       ...(extra || {}),
       nodes: [...nodes],

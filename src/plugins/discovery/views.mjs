@@ -144,6 +144,7 @@ export function rectOf(b, cam) {
   if (!b) return null;
   const [hx, hy, hz] = b.h;
   let x0 = Infinity; let y0 = Infinity; let x1 = -Infinity; let y1 = -Infinity;
+  let dmin = Infinity; let dmax = -Infinity;
   let seen = 0;
   for (let i = 0; i < 8; i += 1) {
     const p = project([
@@ -155,6 +156,7 @@ export function rectOf(b, cam) {
     seen += 1;
     if (p.x < x0) x0 = p.x; if (p.x > x1) x1 = p.x;
     if (p.y < y0) y0 = p.y; if (p.y > y1) y1 = p.y;
+    if (p.depth < dmin) dmin = p.depth; if (p.depth > dmax) dmax = p.depth;
   }
   if (!seen) return null;
   // Clip to the frame: a node hanging off the edge is only partly visible.
@@ -166,6 +168,12 @@ export function rectOf(b, cam) {
     x0: cx0, y0: cy0, x1: cx1, y1: cy1, w, h, area: w * h,
     cx: (cx0 + cx1) / 2, cy: (cy0 + cy1) / 2,
     depth: Math.hypot(b.c[0] - cam.eye[0], b.c[1] - cam.eye[1], b.c[2] - cam.eye[2]),
+    // Half of the box's extent ALONG the view axis: how thick the part is in
+    // the direction the camera looks. Grounding's sliver-behind prune needs the
+    // subject's own thickness to say "behind the pointed surface" — a 3D
+    // half-diagonal cannot, because a baked-vertex export's degenerate bboxes
+    // inflate it to several times the part's real size.
+    dz: (dmax - dmin) / 2,
   };
 }
 

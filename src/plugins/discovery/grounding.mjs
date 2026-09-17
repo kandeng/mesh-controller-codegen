@@ -50,8 +50,19 @@ export const MAX_CANDIDATES = 24;
 //           the door glass grounded as part of the wheel until this band
 //           existed. The band is the sum of the two parts' box half-diagonals,
 //           so it scales with the parts, not with the model.
+//   SLIVER  a part the pointed box barely FILLS, sitting behind the subject's
+//           own depth band, is background the box happens to cover: on
+//           baked-vertex exports a degenerate bbox projects a tiny rect inside
+//           the pointed box several units back (headlight fragments inside a
+//           wheel box), and its inflated half-diagonal widens the DEPTH band
+//           above until it passes. This band uses the SUBJECT's sizes only, so
+//           a candidate's degenerate bbox cannot widen it.
 export const SUBJECT_MIN_INSIDE = 0.5;
 export const SUBJECT_MIN_REL_SCORE = 0.5;
+// Below this share of the box's own area a candidate is a sliver, not the
+// surface the model pointed at — unless it sits at the subject's depth, where
+// it reads as a small mate of the same assembly (a brake caliper fragment).
+export const SUBJECT_MIN_FILL = 0.15;
 
 // Fused-shell trigger: the subject's box half-diagonal is at least 45% of the
 // model's (the subject IS the shell) and the pointed box covers under 40% of
@@ -216,6 +227,9 @@ export function boxToNodes(box, view, g, {
       if (c.inside < SUBJECT_MIN_INSIDE) why = `mostly outside the box (inside=${c.inside.toFixed(2)}) — background, not the subject`;
       else if (c.score < SUBJECT_MIN_REL_SCORE * subject.score) why = `score ${c.score.toFixed(2)} is less than half the subject's ${subject.score.toFixed(2)}`;
       else if (c.depth > subject.depth + subject.hd + c.hd) why = 'sits behind the subject — the box denotes the visible surface';
+      else if (c.fill < SUBJECT_MIN_FILL && c.depth > subject.depth + (subject.rect?.dz || 0) + subject.hd) {
+        why = `a sliver behind the pointed surface (fill=${c.fill.toFixed(2)}, ${(c.depth - subject.depth).toFixed(1)} behind) — background, not the subject`;
+      }
       if (why) pruned.push({ name: c.name, why }); else candidates.push(c);
     }
   }
