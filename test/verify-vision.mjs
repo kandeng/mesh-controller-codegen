@@ -64,9 +64,13 @@ import {
 } from '../src/plugins/discovery/expectation.mjs';
 import { isLocalizationPrompt } from '../src/plugins/discovery/localize.mjs';
 import {
-  auditScope, buildMemberAuditPrompt, buildScopeAuditPrompt, isScopeAuditPrompt,
-  MIN_AUDIT_NODES, parseMemberAudit, parseScopeAudit,
+  auditScope, buildMemberAddPrompt, buildMemberAuditPrompt, buildScopeAuditPrompt,
+  isScopeAuditPrompt, MIN_AUDIT_NODES, parseMemberAdd, parseMemberAudit, parseScopeAudit,
 } from '../src/plugins/discovery/scope-audit.mjs';
+import {
+  exclusivityPass, isContainerNode, modelBox, nameMap, neighborsOf, reconcileSlots,
+  sideSign, slotKeyOf,
+} from '../src/plugins/discovery/scope-slots.mjs';
 import { regionsFromExpectations } from '../src/plugins/discovery/grounding.mjs';
 import { frameKey } from '../src/plugins/discovery/observations.mjs';
 // The serializer that stands between a merged record and the browser. Importing
@@ -2504,6 +2508,187 @@ const wire = (f) => ({ plan: f.plan, capture: f.capture, propose: f.propose, per
     );
     ok('K: a one-node scope records the objection as doubt but drops nothing (never empties the joint)',
       res.audited === true && res.clean === false && res.dropped.length === 0 && MIN_AUDIT_NODES === 2);
+  }
+}
+
+// ---- L) SCOPE RECONCILE — the deterministic cleanup before the eye looks -----
+//
+// These pins reproduce the five marussia scope bugs on a HERMETIC synthetic car
+// geometry (no glb): four wheel clusters at the corners, a both-sides headlight
+// bar and a whole-machine shell/interior as containers, a left door split across
+// a glass node and panel nodes, and a right door. Every rule reads PLACED boxes
+// (n.wb), exactly as the baked-vertex export forces.
+const SG = (() => {
+  // A node builder: a box centred at (x,y,z) with half-extents (hx,hy,hz).
+  const N = (name, x, y, z, hx = 0.3, hy = 0.3, hz = 0.3) => ({
+    name,
+    wb: { min: [x - hx, y - hy, z - hz], max: [x + hx, y + hy, z + hz] },
+  });
+  const nodes = [
+    // wheels: four corners (LR = x, FB = z)
+    N('tire_FL', -4, 1, 7, 0.6, 0.6, 0.6), N('rim_FL', -4, 1, 7, 0.4, 0.4, 0.4), N('brake_FL', -4, 1, 7),
+    N('tire_FR', 4, 1, 7, 0.6, 0.6, 0.6), N('rim_FR', 4, 1, 7, 0.4, 0.4, 0.4), N('brake_FR', 4, 1, 7),
+    N('tire_BL', -4, 1, -7, 0.6, 0.6, 0.6), N('rim_BL', -4, 1, -7, 0.4, 0.4, 0.4), N('brake_BL', -4, 1, -7),
+    N('tire_BR', 4, 1, -7, 0.6, 0.6, 0.6), N('rim_BR', 4, 1, -7, 0.4, 0.4, 0.4), N('brake_BR', 4, 1, -7),
+    // containers: a light bar spanning BOTH sides, the shell, the interior
+    { name: 'Headlights_bar', wb: { min: [-4, 1.8, 8.8], max: [4, 2.2, 9.2] } },
+    { name: 'Body', wb: { min: [-5, 0, -10], max: [5, 4, 10] } },
+    { name: 'interior', wb: { min: [-4, 0.5, -8], max: [4, 3, 8] } },
+    // left door: glass + mirror (one producer) and panels (another), co-located
+    N('Door_L_Glass', -5, 1.8, 0.5, 0.1, 0.6, 0.1), N('Door_L_Mirror', -5, 1.8, -0.5, 0.1, 0.6, 0.1),
+    N('Door_L_Front', -5, 1.8, 1.2, 0.1, 0.7, 0.3), N('Door_L_Rear', -5, 1.8, -1.2, 0.1, 0.7, 0.3),
+    N('Door_L_interior', -4.9, 1.8, 0, 0.1, 0.6, 1.2),
+    // right door
+    N('Door_R_Glass', 5, 1.8, 0.5, 0.1, 0.6, 0.1), N('Door_R_Front', 5, 1.8, 1.2, 0.1, 0.7, 0.3),
+    N('Door_R_Rear', 5, 1.8, -1.2, 0.1, 0.7, 0.3),
+    // two distinct same-quadrant clusters for the no-over-merge pin
+    N('spread_A', 4, 1, 7), N('spread_B', 2, 1, 4), N('spread_C', 4.3, 1, 7.4),
+  ];
+  return { nodes, ringAxes: [2, 0], ringCenter: [0, 0], ringRadius: 8 };
+})();
+const sgBy = nameMap(SG);
+const srec = (id, part, nodes, over = {}) => ({ id, part, type: part === 'wheel' ? 'rotor' : 'gimbal', nodes: [...nodes], confidence: 0.8, ...over });
+
+{
+  const mb = modelBox(SG);
+  ok('L: modelBox reads the machine extent from PLACED boxes, not node origins',
+    mb && J(mb.span.map((v) => Math.round(v))) === J([10, 4, 20]), J(mb && mb.span));
+  ok('L: the container predicate flags the both-sides light bar and the whole-machine shell, but NOT a side part',
+    isContainerNode(sgBy.get('Headlights_bar'), SG) === true && isContainerNode(sgBy.get('Body'), SG) === true
+      && isContainerNode(sgBy.get('interior'), SG) === true
+      && isContainerNode(sgBy.get('Door_R_Front'), SG) === false && isContainerNode(sgBy.get('tire_FL'), SG) === false);
+  ok('L: sideSign reads the left/right side from the ring LR axis',
+    sideSign([-5, 1.8, 0], SG) === -1 && sideSign([5, 1.8, 0], SG) === 1);
+
+  // BUG 1 — the FL wheel swallowed the headlight bar (a container). It is dropped.
+  const r1 = reconcileSlots([srec('wheel_FL', 'wheel', ['tire_FL', 'rim_FL', 'brake_FL', 'Headlights_bar'])], SG, { byName: sgBy });
+  ok('L/bug1: a wheel scope that swallowed the both-sides light bar keeps ONLY its wheel nodes',
+    r1.records.length === 1 && J(r1.records[0].nodes) === J(['tire_FL', 'rim_FL', 'brake_FL'])
+      && r1.changes.some((c) => c.kind === 'container' && c.dropped.includes('Headlights_bar')), J(r1.records[0].nodes));
+
+  // BUG 5 — the left door arrived twice (glass from one producer, panels from
+  // another), same slot, co-located: they merge into ONE left door.
+  const r5 = reconcileSlots([
+    srec('door_L_hint', 'door', ['Door_L_Glass', 'Door_L_Mirror']),
+    srec('door_L_vis', 'door', ['Door_L_Front', 'Door_L_Rear', 'Door_L_interior'], { confidence: 0.75 }),
+  ], SG, { byName: sgBy });
+  ok('L/bug5: two co-located records of the SAME door slot merge into one, union of nodes',
+    r5.records.length === 1 && r5.records[0].nodes.length === 5
+      && r5.changes.some((c) => c.kind === 'slot-merge'), J(r5.records.map((r) => r.id)));
+
+  // The merge is a COINCIDENCE test, not a slot test: a spread cluster beside a
+  // near-point record in the same quadrant does NOT absorb it (geometric-mean
+  // reach of a zero-radius record is zero).
+  const rNoMerge = reconcileSlots([
+    srec('spread_big', 'wheel', ['spread_A', 'spread_B']),
+    srec('spread_point', 'wheel', ['spread_C']),
+  ], SG, { byName: sgBy });
+  ok('L: same-slot records that do NOT coincide stay separate — a bloated scope never swallows a distinct neighbour',
+    rNoMerge.records.length === 2 && !rNoMerge.changes.some((c) => c.kind === 'slot-merge'), J(rNoMerge.records.map((r) => r.id)));
+
+  // BUG 2/4 — a left-door scope holding the right-door slab sheds it, and moves
+  // it to the right door when one exists.
+  const rSplit = reconcileSlots([
+    srec('door_L', 'door', ['Door_L_Front', 'Door_L_Rear', 'Door_R_Front']),
+    srec('door_R', 'door', ['Door_R_Glass', 'Door_R_Rear']),
+  ], SG, { byName: sgBy });
+  const dl = rSplit.records.find((r) => r.id === 'door_L');
+  const dr = rSplit.records.find((r) => r.id === 'door_R');
+  ok('L/bug2+4: a cross-side slab is shed from the left door and MOVED to the right door',
+    dl && !dl.nodes.includes('Door_R_Front') && dr && dr.nodes.includes('Door_R_Front')
+      && rSplit.changes.some((c) => c.kind === 'side-split' && c.moved.includes('Door_R_Front')), J({ dl: dl?.nodes, dr: dr?.nodes }));
+
+  // A whole-machine grab (majority containers) is NOT rescued by stripping — it
+  // is left intact so the battery's spread ruler still rejects it.
+  const rGrab = reconcileSlots([srec('grab', 'wheel', ['Body', 'interior', 'tire_FL'])], SG, { byName: sgBy });
+  ok('L: a shell-dominated whole-machine grab is left intact (not cleaned into a plausible remnant)',
+    rGrab.records.length === 1 && rGrab.records[0].nodes.length === 3
+      && rGrab.changes.some((c) => c.kind === 'shell-grab'), J(rGrab.records[0]?.nodes));
+
+  // Exclusivity: a node claimed by two scopes is kept by the nearer centre.
+  const ex = exclusivityPass([
+    srec('near', 'wheel', ['tire_FL', 'rim_FL']),
+    srec('far', 'wheel', ['rim_FL', 'tire_FR']),
+  ], SG, sgBy);
+  const near = ex.records.find((r) => r.id === 'near');
+  const far = ex.records.find((r) => r.id === 'far');
+  ok('L: a node in two scopes is kept by the nearer scope centre and removed from the other',
+    near.nodes.includes('rim_FL') && !far.nodes.includes('rim_FL')
+      && ex.changes.some((c) => c.kind === 'exclusivity' && c.node === 'rim_FL'), J({ near: near.nodes, far: far.nodes }));
+}
+
+// ---- M) the ADD DIRECTION — the refine loop can also GROW a scope ------------
+//
+// The drop direction (K) removes an impostor; the add direction offers unclaimed
+// same-side neighbours beside the cut and lets the model recognise a missing
+// member. This is how a door caught as glass-only grows its panel back (bug 3).
+{
+  const frame = (id) => ({ id, mode: 'solo', mediaType: 'image/png', dataBase64: PNG });
+  const addView = { id: 'p0', pose: { eye: [0, -8, 2], target: [0, 0, 0] }, spec: null };
+
+  const cand = [{ name: 'Door_L_Front', frame: frame('n1') }, { name: 'Door_L_Rear', frame: frame('n2') }];
+  const p4 = buildMemberAddPrompt({ part: 'door', scopeFrame: frame('scope'), neighbours: cand });
+  ok('M: the add prompt carries the audit mark, shows picture NUMBERS, and puts the cut first',
+    isScopeAuditPrompt(p4.text) && /Picture 1 = the cut/.test(p4.text) && p4.images.length === 3);
+  ok('M: the add prompt NEVER leaks a mesh/node name to the model',
+    !p4.text.includes('Door_L_Front') && !p4.text.includes('Door_L_Rear') && /belongs/.test(p4.text));
+  ok('M: the add prompt refuses to build with no candidates or no scope frame',
+    buildMemberAddPrompt({ part: 'door', scopeFrame: frame('s'), neighbours: [] }).text === null
+      && buildMemberAddPrompt({ part: 'door', scopeFrame: null, neighbours: cand }).text === null);
+
+  const names = ['Door_L_Front', 'Door_L_Rear'];
+  ok('M: a belongs pick maps picture numbers (>=2) back to node names',
+    J(parseMemberAdd('{"belongs":[2]}', names).belongs) === J(['Door_L_Front'])
+      && J(parseMemberAdd('{"belongs":[3,2]}', names).belongs) === J(['Door_L_Rear', 'Door_L_Front']));
+  ok('M: picture 1 (the cut), out-of-range numbers and unreadable replies add NOTHING',
+    parseMemberAdd('{"belongs":[1]}', names).belongs.length === 0
+      && parseMemberAdd('{"belongs":[9]}', names).belongs.length === 0
+      && parseMemberAdd('sorry', names).belongs.length === 0);
+
+  // Orchestrated: a glass-only left door, its panels unclaimed. The model
+  // recognises the first neighbour; the add turn returns it and NEVER a
+  // right-door or container node.
+  {
+    const record = srec('door_L_glassonly', 'door', ['Door_L_Glass', 'Door_L_Mirror']);
+    const claimed = new Set(['Door_L_Glass', 'Door_L_Mirror']);
+    const asked = [];
+    const res = await auditScope(record, {
+      capture: async (v, mode, focus) => frame(`solo_${(focus || []).join('+')}`),
+      propose: async (text) => {
+        asked.push(text);
+        return /belongs/.test(text)
+          ? { reply: '{"belongs":[2]}', model: 'fake' } // first candidate
+          : { reply: '{"allPart": true, "notPart": []}', model: 'fake' };
+      },
+      view: addView, g: SG, claimed,
+    });
+    ok('M/bug3: an incomplete scope GROWS by the neighbour the model recognised — same side, never a container',
+      res.audited === true && res.added.length === 1 && res.added[0].startsWith('Door_L_')
+        && !res.added.some((n) => n.startsWith('Door_R')), J(res.added));
+    ok('M: the add turn costs one step-4 call after the clean step-2 call',
+      asked.length === 2 && isScopeAuditPrompt(asked[1]), `${asked.length} calls`);
+  }
+
+  // With every neighbour already claimed there is nothing to offer.
+  {
+    const record = srec('door_L_full', 'door', ['Door_L_Glass', 'Door_L_Mirror']);
+    const claimed = new Set(['Door_L_Glass', 'Door_L_Mirror', 'Door_L_Front', 'Door_L_Rear', 'Door_L_interior']);
+    const res = await auditScope(record, {
+      capture: async (v, mode, focus) => frame(`solo_${(focus || []).join('+')}`),
+      propose: async () => ({ reply: '{"allPart": true, "notPart": []}', model: 'fake' }),
+      view: addView, g: SG, claimed,
+    });
+    ok('M: when every same-side neighbour is claimed the add turn offers nothing',
+      res.audited === true && res.added.length === 0, J(res.added));
+  }
+
+  // neighboursOf itself: same side, unclaimed, non-container, within reach.
+  {
+    const rec = srec('door_L', 'door', ['Door_L_Glass', 'Door_L_Mirror']);
+    const nb = neighborsOf(rec, SG, sgBy, new Set(['Door_L_Glass', 'Door_L_Mirror']));
+    ok('M: neighboursOf offers same-side unclaimed non-container nodes and never the opposite side',
+      nb.includes('Door_L_Front') && nb.includes('Door_L_interior')
+        && !nb.some((n) => n.startsWith('Door_R')) && !nb.includes('Body'), J(nb));
   }
 }
 

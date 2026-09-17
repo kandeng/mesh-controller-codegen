@@ -40,6 +40,7 @@ import { buildVisionPrompt } from '../src/plugins/discovery/vision-prompt.mjs';
 import { visionPropose } from '../src/plugins/discovery/vision-propose.mjs';
 import { admitCandidates, reconcileLanes, runVisionRound } from '../src/plugins/discovery/loop.mjs';
 import { frameKey } from '../src/plugins/discovery/observations.mjs';
+import { isContainerNode } from '../src/plugins/discovery/scope-slots.mjs';
 
 const GLB = 'samples/drone_dji_inspire3.glb';
 const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
@@ -223,6 +224,13 @@ const [n1, n2, n3] = nodeNames;
 
 // ---- D8) one whole round, end to end -------------------------------------------
 {
+  // Real peripheral geometry, NOT the whole-machine merged/root nodes at the
+  // head of the parse table (Sketchfab_model, root, ARM_MAIN_L — each spans
+  // most of the craft): the scope reconcile correctly treats those as
+  // containers and would (rightly) drop a record scoped to nothing but one.
+  // The recognition gate this section proves needs records that are real parts.
+  const d8nodes = g.nodes.filter((n) => n.name && n.wb && !isContainerNode(n, g)).map((n) => n.name);
+  const [d8n1, d8n2, d8n3] = d8nodes;
   const bigPlan = planViews(g, { maxViews: 8, allowGhost: true, ghostViews: 2 });
   const beats = [];
   const catReply = (images) => J({
@@ -232,9 +240,9 @@ const [n1, n2, n3] = nodeNames;
     doubts: [], alternatives: ['helicopter'],
   });
   const discoveryReply = J([
-    { op: 'new', type: 'rotor', part: 'rotor', nodeIds: [n1], axis: [0, 0, 1], anchor: [0, 0, 0], reasoning: 'spins at an arm tip' },
-    { op: 'new', type: 'rotor', part: 'turret', nodeIds: [n2], axis: [0, 0, 1], anchor: [0, 0, 0], reasoning: 'a rotating collar' },
-    { op: 'new', type: 'gimbal', nodeIds: [n3], axis: [1, 0, 0], anchor: [0, 0, 0], reasoning: 'a tilting collar I cannot name' },
+    { op: 'new', type: 'rotor', part: 'rotor', nodeIds: [d8n1], axis: [0, 0, 1], anchor: [0, 0, 0], reasoning: 'spins at an arm tip' },
+    { op: 'new', type: 'rotor', part: 'turret', nodeIds: [d8n2], axis: [0, 0, 1], anchor: [0, 0, 0], reasoning: 'a rotating collar' },
+    { op: 'new', type: 'gimbal', nodeIds: [d8n3], axis: [1, 0, 0], anchor: [0, 0, 0], reasoning: 'a tilting collar I cannot name' },
   ]);
   const res = await runVisionRound(g, [], [], {
     plan: () => bigPlan,
