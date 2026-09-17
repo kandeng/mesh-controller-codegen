@@ -23,6 +23,7 @@ import { aiPropose } from './ai-propose.mjs';
 import { MAX_VISION_FRAMES, buildVisionPrompt, strictSchemaReminder } from './vision-prompt.mjs';
 import { HINT_GATE_PROFILE, visionPropose } from './vision-propose.mjs';
 import { auditScope } from './scope-audit.mjs';
+import { reconcileSlots, exclusivityPass, nameMap } from './scope-slots.mjs';
 import { buildLocalizationPrompt } from './localize.mjs';
 import {
   buildExpectationPrompt, expectationBrief, expectationGap, expectationIsUsable,
@@ -1284,6 +1285,26 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
     })),
   });
 
+  // 5a½. SCOPE RECONCILE — the deterministic cleanup before the eye looks -----
+  //
+  // Box grounding on a baked-vertex export hands back a COARSE candidate set,
+  // and on that mesh class it routinely contains nodes no joint may own: a
+  // CONTAINER (one node whose placed bbox is the whole machine or a both-sides
+  // band — Body, interior, a light bar spanning left AND right) and CROSS-SIDE
+  // slabs (the right door inside a left-door scope). It also produces two
+  // records for one physical actuator when two producers describe it with
+  // disjoint node sets (an expectation hint and a vision proposal both meaning
+  // "the left door"), which a node-overlap merge cannot see. reconcileSlots
+  // fixes all of it from PLACED boxes alone — drop containers, merge duplicate
+  // slots (part@quadrant), shed the other side, then enforce one owner per
+  // node — so the visual audit below inspects scopes that are already sane,
+  // and every change is announced as an uncertainty, never silent.
+  {
+    const rec = reconcileSlots(parsed.records, g, { byName: nameMap(g) });
+    parsed = { ...parsed, records: rec.records };
+    warnings.push(...rec.warnings);
+  }
+
   // 5b. SCOPE AUDIT — the eye that inspects the cut (the user's rule 2) -------
   //
   // Geometry carved each scope above and kept every node whose box landed
@@ -1308,18 +1329,22 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
       if (planned?.pose) return planned;
       return frame.pose ? { id: frame.viewId || frame.id, pose: frame.pose, spec: frame.spec || null } : null;
     };
+    const claimed = new Set((parsed.records || []).flatMap((r) => r.nodes || []).map(String));
     for (const rec of parsed.records) {
       if (typeof abort === 'function' && abort()) {
         warnings.push('scope audit: the project changed mid-audit — the remaining scopes were left as carved');
         break;
       }
-      if (!rec?.part || (rec.nodes || []).length < 2) continue;
+      // A one-node record is still auditable: the drop direction guards itself
+      // (nothing to drop without emptying the joint), and the add turn is
+      // exactly how a scope that caught one node too few grows its body back.
+      if (!rec?.part || !(rec.nodes || []).length) continue;
       const view = viewFor(rec.frameId);
       if (!view) {
         warnings.push(`scope audit: ${rec.id} has no camera pose to re-render its scope from — left as carved`);
         continue;
       }
-      const res = await auditScope(rec, { capture, propose, view, emit: say, persist });
+      const res = await auditScope(rec, { capture, propose, view, emit: say, persist, claimed, g });
       warnings.push(...res.warnings);
       if (res.dropped && res.dropped.length) {
         const drop = new Set(res.dropped);
@@ -1331,7 +1356,25 @@ export async function runVisionRound(g, joints, manifest, effects = {}) {
           note: `dropped ${res.dropped.join(', ')} from the ${rec.part} scope (the model named ${res.foreign.join(', ')})`,
         }];
       }
+      if (res.added && res.added.length) {
+        const fresh = res.added.filter((n) => !claimed.has(String(n)));
+        if (fresh.length) {
+          rec.nodes = [...(rec.nodes || []), ...fresh];
+          fresh.forEach((n) => claimed.add(String(n)));
+          const note = `scope audit added ${fresh.join(', ')} — the vision model recognised them, rendered alone beside the carved ${rec.part}, as missing members of it`;
+          rec.uncertainties = [...(rec.uncertainties || []), note];
+          rec.history = [...(rec.history || []), {
+            at: new Date().toISOString(), event: 'scope-audit-add',
+            note: `added ${fresh.join(', ')} to the ${rec.part} scope (the model recognised them as missing members)`,
+          }];
+        }
+      }
     }
+    // The add turn can hand a neighbour to a record that another record also
+    // owns; re-assert one-owner-per-node over the audited scopes.
+    const ex = exclusivityPass(parsed.records, g, nameMap(g));
+    parsed = { ...parsed, records: ex.records };
+    for (const c of ex.changes) warnings.push(`exclusivity: ${c.node} kept by ${c.kept}, removed from ${c.droppedFrom}`);
   }
 
   const survivors = new Set(parsed.admitted.map((a) => a.index));

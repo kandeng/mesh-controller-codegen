@@ -23,14 +23,21 @@
 //           that node. The drop is geometric and deterministic again — vision
 //           picked a node, the code removes it — and it is announced as an
 //           uncertainty, never applied silently.
+//   STEP 4  the ADD direction: the carve can also be too SMALL (a door scope
+//           holding only the glass). Unclaimed neighbour nodes near the scope
+//           are solo-rendered ALONGSIDE the scope and the model is asked which
+//           pictures are missing members of the <part>; the picks are added by
+//           the caller, deterministically, announced as uncertainties.
 //
 // The prompt builders and parsers are PURE (no capture, no model) so they are
 // testable headless with a faked reply; `auditScope` is the thin orchestrator
 // that injects the same `capture`/`propose` effects every other turn uses.
 //
-// Cost: ONE vision call per dictionary-named joint, plus one per member ONLY
-// when step 2 objects. A record with no dictionary part name is never audited —
-// there is no word to audit it against.
+// Cost: ONE vision call per dictionary-named joint for step 2, one more when
+// step 4 has neighbour candidates, plus member renders ONLY when step 2
+// objects or step 4 runs. A record with no dictionary part name is never
+// audited — there is no word to audit it against.
+import { neighborsOf } from './scope-slots.mjs';
 
 export const SCOPE_AUDIT_MARK = 'SCOPE AUDIT step';
 export const isScopeAuditPrompt = (text) => String(text || '').includes(SCOPE_AUDIT_MARK);
@@ -205,19 +212,118 @@ export function parseMemberAudit(reply, names = []) {
   return { impostor: list[idx - 1], index: idx, warnings };
 }
 
+// STEP 4 — the add direction. `neighbours` is [{ name, frame }]: unclaimed
+// nodes sitting just outside the carved scope, each rendered ALONE. Picture 1
+// is ALWAYS the current scope (rendered whole) so the model knows what it is
+// looking at; pictures 2..N are the candidates. Like step 3 the model sees
+// PICTURE NUMBERS only and never our node names; we map its picks back, which
+// is what keeps the add deterministic.
+// Returns { text, images, warnings }.
+export function buildMemberAddPrompt({ part, scopeFrame = null, neighbours = [] } = {}) {
+  const warnings = [];
+  const word = String(part || 'part');
+  const usable = (neighbours || []).filter((m) => m?.frame?.dataBase64);
+  if (!usable.length) {
+    return { text: null, images: [], warnings: ['no neighbour solo renders to offer'] };
+  }
+  if (!scopeFrame?.dataBase64) {
+    return { text: null, images: [], warnings: ['no solo render of the scope to offer beside the candidates'] };
+  }
+  const lines = [];
+  lines.push(`You are the ${SCOPE_AUDIT_MARK} of a rigged-mesh joint-discovery loop, continuing.`);
+  lines.push(`We cut what we believe is ONE ${word} out of a 3D CAD assembly. The cut may be`);
+  lines.push('INCOMPLETE: mesh nodes are often split (a panel in one node, its window trim in');
+  lines.push('another), and geometry alone can leave a genuine piece outside the cut.');
+  lines.push('');
+  lines.push('  Picture 1 = the cut we have so far, rendered ALONE (everything else hidden).');
+  usable.forEach((m, i) => lines.push(`  Picture ${i + 2} = a neighbouring piece that is NOT in the cut, rendered ALONE.`));
+  lines.push('');
+  lines.push(`QUESTION: which of the neighbouring pieces (pictures 2 to ${usable.length + 1}) are`);
+  lines.push(`missing members of the SAME single ${word} shown in picture 1?`);
+  lines.push('');
+  lines.push('Reply with JSON ONLY (no prose, no code fences):');
+  lines.push(`{ "belongs": [<picture numbers, each an integer from 2 to ${usable.length + 1}>] }`);
+  lines.push('');
+  lines.push('Rules:');
+  lines.push(`- Include a piece ONLY if it is physically part of the SAME single ${word} —`);
+  lines.push('  the same door as the door, the same wheel as the wheel. When in doubt, leave');
+  lines.push('  it out: a missing piece is cheaper than a wrong one.');
+  lines.push('- NEVER include picture 1 in "belongs"; it is the cut itself, not a candidate.');
+  lines.push('- If no piece belongs, reply { "belongs": [] }.');
+  lines.push('- Judge only the SOLID geometry; ignore transparency, background and render style.');
+  return {
+    text: lines.join('\n'),
+    images: [
+      image(scopeFrame, scopeFrame.id || 'scope'),
+      ...usable.map((m, i) => image(m.frame, m.frame.id || `candidate_${i + 1}`)),
+    ],
+    warnings,
+  };
+}
+
+// Parse the step-4 reply. `names` is the candidate node names in the SAME order
+// the candidate pictures were attached (picture 2 = names[0], …). Returns
+// { belongs: name[], warnings }. Unreadable replies, non-integers, out-of-range
+// numbers and picture 1 all yield nothing: we add only what the model pointed
+// at, exactly.
+export function parseMemberAdd(reply, names = []) {
+  const warnings = [];
+  const list = (names || []).map(String);
+  const { obj, warning } = firstObject(reply);
+  if (!obj) {
+    warnings.push(`the add-turn reply was unreadable (${warning}) — nothing was added`);
+    return { belongs: [], warnings };
+  }
+  if (!Array.isArray(obj.belongs)) {
+    warnings.push('the add turn returned no "belongs" list — nothing was added');
+    return { belongs: [], warnings };
+  }
+  const belongs = [];
+  for (const raw of obj.belongs) {
+    const idx = Math.trunc(Number(raw));
+    if (!Number.isFinite(idx)) continue;
+    if (idx < 2 || idx > list.length + 1) {
+      warnings.push(`the add turn picked picture ${idx}, which is not a candidate (2..${list.length + 1}) — that pick was ignored`);
+      continue;
+    }
+    const name = list[idx - 2];
+    if (name && !belongs.includes(name)) belongs.push(name);
+  }
+  return { belongs, warnings };
+}
+
 // The orchestrator: steps 2 and 3 over one carved scope, with the capture and
 // propose effects injected exactly as every other turn injects them.
 //
 // `record`  a grounded proposal/record carrying `.part`, `.nodes`, `.id`.
 // `view`    the camera to re-render the scope from — the pose the box was
 //           pointed in, so the audit sees the cut from the angle it was found.
-// Returns { audited, clean, foreign[], dropped[], reason, warnings }.
-//   audited=false  the audit could not run (no part name, one node, no capture/
+// `g`       the parsed geometry and `claimed` the set of node names already
+//           owned by ANY record — both required for the step-4 add turn; when
+//           absent only the drop direction runs.
+// Returns { audited, clean, foreign[], dropped[], added[], reason, warnings }.
+//   audited=false  the audit could not run (no part name, no capture/
 //                  propose, no pose, a failed render) — the scope is untouched.
-//   dropped        the node names removed (0 or 1); the CALLER applies the drop
+//   dropped        the node names removed (0 or 1); added  the neighbour node
+//                  names step 4 recognised (0..cap). The CALLER applies both
 //                  to record.nodes and records the uncertainty, so this stays a
 //                  pure read of the model plus a deterministic pick.
 export async function auditScope(record, {
+  capture = null, propose = null, view = null, emit = null, persist = null,
+  g = null, claimed = null,
+} = {}) {
+  const res = await dropPass(record, { capture, propose, view, emit, persist });
+  res.added = [];
+  if (!res.audited) return res;
+  const add = await addTurn(record, res, { capture, propose, view, emit, persist, g, claimed });
+  res.added = add.added;
+  res.warnings.push(...add.warnings);
+  return res;
+}
+
+// Steps 2–3: the drop direction, exactly as before — solo-render the scope,
+// ask the one question, and only on objection isolate and drop the impostor.
+async function dropPass(record, {
   capture = null, propose = null, view = null, emit = null, persist = null,
 } = {}) {
   const say = typeof emit === 'function' ? emit : () => {};
@@ -327,4 +433,87 @@ export async function auditScope(record, {
   }
   say('vision:scope-objection', { id, part, foreign: a2.foreign, dropped });
   return { audited: true, clean: false, foreign: a2.foreign, dropped, reason: null, warnings };
+}
+
+// STEP 4 — the add direction. The carve can be too small as well as too big:
+// on the marussia a door scope held only the glass nodes while the door panel
+// sat unclaimed beside it. Unclaimed neighbours within reach of the scope are
+// solo-rendered, shown beside the cut, and the model picks which are missing
+// members. Neighbours are OFFERED IN ONE TURN (no fixed iteration count): each
+// pass re-reads the claimed set, so a node handed to an earlier record is
+// never offered again, and a record only ever grows by what the model
+// recognises — a wrong add stays legible as an uncertainty, exactly like a
+// wrong drop.
+async function addTurn(record, dropRes, {
+  capture = null, propose = null, view = null, emit = null, persist = null,
+  g = null, claimed = null,
+} = {}) {
+  const say = typeof emit === 'function' ? emit : () => {};
+  const warnings = [];
+  const none = () => ({ added: [], warnings });
+  if (!g || !(claimed instanceof Set)) return none();
+  const id = record?.id || '(record)';
+  const part = record?.part || null;
+
+  // The effective scope: what the record holds AFTER the drop direction ran.
+  const effNodes = (record?.nodes || []).map(String)
+    .filter((n) => !(dropRes.dropped || []).includes(n));
+  if (!effNodes.length) return none();
+
+  const eff = { ...record, nodes: effNodes };
+  const neighbours = neighborsOf(eff, g, null, claimed);
+  if (!neighbours.length) return none();
+
+  // Re-render the effective scope solo: the step-2 frame predates any drop and
+  // would show the impostor as a member.
+  let scopeFrame = null;
+  try {
+    scopeFrame = await capture(view, 'solo', effNodes);
+  } catch { scopeFrame = null; }
+  if (!scopeFrame?.dataBase64) {
+    warnings.push(`scope audit: the add turn could not re-render the scope of ${id} — nothing was offered for addition`);
+    return none();
+  }
+
+  const cands = [];
+  for (const name of neighbours) {
+    let f = null;
+    try {
+      f = await capture(view, 'solo', [name]);
+    } catch { f = null; }
+    if (f?.dataBase64) cands.push({ name, frame: f });
+    else warnings.push(`scope audit: the add turn could not render neighbour "${name}" of ${id} alone — it was not offered`);
+  }
+  if (!cands.length) return none();
+
+  const p4 = buildMemberAddPrompt({ part, scopeFrame, neighbours: cands });
+  warnings.push(...p4.warnings.map((w) => `scope audit: ${w}`));
+  if (!p4.text) return none();
+  say('vision:scope-audit', { id, part, step: 4, candidates: cands.map((m) => m.name) });
+
+  let turn4 = null;
+  try {
+    turn4 = await propose(p4.text, p4.images);
+  } catch (e) {
+    warnings.push(`scope audit: the step-4 model call for ${id} failed (${e.message}) — nothing was added`);
+    return none();
+  }
+  const a4 = parseMemberAdd(turn4?.reply || '', cands.map((m) => m.name));
+  warnings.push(...a4.warnings.map((w) => `scope audit: ${w}`));
+  persist?.scopeAudit?.({
+    id, part, step: 4,
+    candidates: cands.map((m) => ({ name: m.name, frameId: m.frame.id || null })),
+    prompt: { text: p4.text, images: p4.images.length },
+    reply: turn4?.reply ?? null, model: turn4?.model ?? null,
+    added: a4.belongs,
+  });
+
+  // A pick the caller cannot use (claimed by another record mid-audit) is not
+  // ours to hand out.
+  const added = a4.belongs.filter((n) => !claimed.has(String(n)));
+  if (added.length) {
+    warnings.push(`scope audit: the model recognised ${added.join(', ')} as missing member(s) of the ${part} scope of ${id} — offered to the caller for addition`);
+    say('vision:scope-add', { id, part, added });
+  }
+  return { added, warnings };
 }
