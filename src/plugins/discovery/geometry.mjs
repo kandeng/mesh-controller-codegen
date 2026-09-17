@@ -18,6 +18,7 @@ const AXNAME = ['x', 'y', 'z'];
 const placedPt = (n) => (n?.wb
   ? [0, 1, 2].map((k) => (n.wb.min[k] + n.wb.max[k]) / 2)
   : n.wp);
+export { placedPt };
 
 // ---- general machines: ground-hugging spinners (wheels, road wheels) --------
 // The two heuristics below are drone-shaped: the rotor path starts from blade
@@ -238,7 +239,7 @@ function rotorClusters(g) {
 // as front/back. FB = first ring axis, LR = second; diagonal pairing (FL+BR
 // vs FR+BL) is invariant under axis swap or sign flip, so the counter-
 // rotation assignment below is unaffected by the relabelling.
-function quadrantLabel(wp, g) {
+export function quadrantLabel(wp, g) {
   const ax = g.ringAxes || [0, 1];
   const c = g.ringCenter || g.center;
   const fb = wp[ax[0]] - c[0] >= 0 ? 'F' : 'B';
